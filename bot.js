@@ -10,10 +10,10 @@ const SERVER_HOST = 'parseapi.back4app.com';
 
 const EMB_DIM = 64;
 const WINDOW = 5;
-const MIN_WORD_FREQ = 2;
+const MIN_WORD_FREQ = 1;
 const MIN_COOC = 2;
 const SIM_THRESHOLD = 0.72;
-const MIN_SIM = 0.55;
+const MIN_SIM = 0.30;
 const LIST_PAGE = 20;
 const MAX_BRAINS = 200;
 const PAGE_SIZE = 100;
