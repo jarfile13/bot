@@ -7,652 +7,553 @@ const APP_ID = process.env.B4A_APP_ID;
 const JS_KEY = process.env.B4A_JS_KEY;
 const MASTER_KEY = process.env.B4A_MASTER_KEY;
 
-const BM25_K1 = 1.5;
-const BM25_B = 0.6;
-const MIN_SCORE = 0.6;
-const MIN_MARGIN = 0.15;
-const MIN_COVERAGE = 0.34;
-const MIN_SINGLE_LEN = 2;
-const MAX_PAIRS_PER_USER = 5000;
-const CACHE_LIMIT = 300;
-const CANDIDATE_LIMIT = 800;
-const MAX_ACTIVE_BRAINS = 200;
-const TEACH_RATE_LIMIT = 20;
-const TEACH_RATE_WINDOW = 60 * 1000;
-const LIST_PAGE_SIZE = 20;
+const MIN_SCORE = 0.35;
+const MIN_GEN_LEN = 2;
+const MAX_GEN_LEN = 25;
+const MAX_PAIRS = 5000;
+const MAX_SYN = 30;
+const LIST_PAGE = 20;
+const MAX_BRAINS = 200;
 
-const healthServer = http.createServer((req, res) => {
+const health = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
 });
-healthServer.listen(3000, () => console.log('Health check server on port 3000'));
+health.listen(3000, () => console.log('Health on 3000'));
 
 Parse.initialize(APP_ID, JS_KEY, MASTER_KEY);
 Parse.serverURL = 'https://parseapi.back4app.com/';
 
 const brains = new Map();
 const brainOrder = [];
-
 let offset = 0;
 
-const SUFFIXES = [
-  'иями','ями','ами','ией','иях','ях','ов','ев','ий','ый','ой','ая','ое','ые','ыми','ими',
-  'ешь','ишь','ете','ите','ешься','ишься','ется','ится','ются','атся','ться','тся',
-  'ого','его','ому','ему','ыми','ими','ать','ять','еть','ить','ыть','уть',
-  'ах','ях','ам','ям','ом','ем','ой','ей','ую','юю','ии','ия','ие','ые','ая','яя',
-  'ть','ся','ла','ло','ли','ны','на','но','ет','ут','ют','ат','ят','ал','ил','ел',
-  'а','я','у','ю','о','е','ы','и','й','ь'
-];
-
 function lc(s) {
-  return String(s)
-    .toLowerCase()
-    .replace(/ё/g, 'е')
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function stem(w) {
-  if (w.length <= 3) return w;
-  for (const suf of SUFFIXES) {
-    if (w.length - suf.length >= 3 && w.endsWith(suf)) {
-      return w.slice(0, w.length - suf.length);
-    }
-  }
-  return w;
+  return String(s).toLowerCase().replace(/ё/g, 'е')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function words(s) {
-  const n = lc(s);
-  if (!n) return [];
-  const out = [];
-  for (const w of n.split(' ')) if (w.length > 0) out.push(w);
-  return out;
+  return lc(s).split(' ').filter(w => w.length > 0);
 }
 
-function terms(text) {
-  const ws = words(text);
-  const out = [];
-  for (let i = 0; i < ws.length; i++) {
-    out.push(stem(ws[i]));
-    if (i + 1 < ws.length) out.push(stem(ws[i]) + '_' + stem(ws[i + 1]));
-  }
-  return out;
-}
+function dbKey(owner, q) { return owner + ':' + lc(q); }
+function synKey(owner, w) { return owner + ':@syn:' + lc(w); }
 
-function levenshtein(a, b) {
-  if (a === b) return 0;
-  const al = a.length, bl = b.length;
-  if (!al) return bl;
-  if (!bl) return al;
-  if (Math.abs(al - bl) > 2) return Infinity;
-  let prev = new Array(bl + 1);
-  let cur = new Array(bl + 1);
-  for (let j = 0; j <= bl; j++) prev[j] = j;
-  for (let i = 1; i <= al; i++) {
-    cur[0] = i;
-    const ca = a.charCodeAt(i - 1);
-    for (let j = 1; j <= bl; j++) {
-      const cost = ca === b.charCodeAt(j - 1) ? 0 : 1;
-      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
-    }
-    const t = prev; prev = cur; cur = t;
-  }
-  return prev[bl];
-}
-
-function makeBrain(ownerId) {
+function makeBrain(owner) {
   return {
-    ownerId,
+    owner,
     pairs: [],
-    wordToPairs: new Map(),
-    docFreq: new Map(),
-    byLen: new Map(),
-    vocab: new Set(),
-    cache: new Map(),
-    totalDocLen: 0,
-    cacheHits: 0,
-    cacheMiss: 0,
+    syn: new Map(),
+    wordIndex: new Map(),
+    df: new Map(),
+    markov: new Map(),
+    starters: [],
     loaded: false,
     loading: null,
-    teachTimestamps: [],
   };
 }
 
-function touchBrain(ownerId) {
-  const idx = brainOrder.indexOf(ownerId);
-  if (idx >= 0) brainOrder.splice(idx, 1);
-  brainOrder.push(ownerId);
-  while (brainOrder.length > MAX_ACTIVE_BRAINS) {
+function touchBrain(owner) {
+  const i = brainOrder.indexOf(owner);
+  if (i >= 0) brainOrder.splice(i, 1);
+  brainOrder.push(owner);
+  while (brainOrder.length > MAX_BRAINS) {
     const drop = brainOrder.shift();
-    if (drop !== ownerId) brains.delete(drop);
+    if (drop !== owner) brains.delete(drop);
   }
 }
 
-function getBrain(ownerId) {
-  let b = brains.get(ownerId);
-  if (!b) {
-    b = makeBrain(ownerId);
-    brains.set(ownerId, b);
-  }
-  touchBrain(ownerId);
+function getBrain(owner) {
+  let b = brains.get(owner);
+  if (!b) { b = makeBrain(owner); brains.set(owner, b); }
+  touchBrain(owner);
   return b;
 }
 
-function registerWord(brain, w) {
-  if (!brain.vocab.has(w)) {
-    brain.vocab.add(w);
-    if (!brain.byLen.has(w.length)) brain.byLen.set(w.length, new Set());
-    brain.byLen.get(w.length).add(w);
-  }
+function expand(brain, word) {
+  const out = new Set([word]);
+  const s = brain.syn.get(word);
+  if (s) for (const x of s) out.add(x);
+  return out;
 }
 
-function findClosestKnown(brain, word) {
-  if (brain.vocab.has(word)) return { word, dist: 0 };
-  if (word.length < 3) return null;
-  let best = null;
-  let bestDist = Infinity;
-  const maxDist = word.length <= 5 ? 1 : word.length <= 8 ? 2 : 3;
-  for (let len = word.length - 2; len <= word.length + 2; len++) {
-    const bucket = brain.byLen.get(len);
-    if (!bucket) continue;
-    for (const k of bucket) {
-      const d = levenshtein(word, k);
-      if (d < bestDist) {
-        bestDist = d;
-        best = k;
-        if (d === 1) return { word: best, dist: 1 };
-      }
+function idf(brain, w) {
+  const df = brain.df.get(w) || 0;
+  if (df === 0) return 0;
+  return Math.log(1 + brain.pairs.length / df);
+}
+
+function indexPair(brain, idx, question, answer) {
+  const qw = words(question);
+  brain.pairs[idx].qWords = qw;
+  const seen = new Set();
+  for (const w of qw) {
+    if (!brain.wordIndex.has(w)) brain.wordIndex.set(w, new Set());
+    brain.wordIndex.get(w).add(idx);
+    if (!seen.has(w)) {
+      seen.add(w);
+      brain.df.set(w, (brain.df.get(w) || 0) + 1);
     }
   }
-  if (best && bestDist <= maxDist) return { word: best, dist: bestDist };
-  return null;
+  indexMarkov(brain, answer);
 }
 
-function idf(brain, term) {
-  const df = brain.docFreq.get(term) || 0;
-  if (df === 0) return 0;
-  return Math.log(1 + (brain.pairs.length - df + 0.5) / (df + 0.5));
-}
-
-function indexPair(brain, idx, question) {
-  const ts = terms(question);
-  brain.pairs[idx].tokens = ts;
-  brain.pairs[idx].len = ts.length;
-  brain.totalDocLen += ts.length;
-  const seen = new Set();
-  for (const t of ts) {
-    registerWord(brain, t);
-    if (!brain.wordToPairs.has(t)) brain.wordToPairs.set(t, new Set());
-    brain.wordToPairs.get(t).add(idx);
-    if (!seen.has(t)) {
-      seen.add(t);
-      brain.docFreq.set(t, (brain.docFreq.get(t) || 0) + 1);
+function indexMarkov(brain, text) {
+  const ws = words(text);
+  if (!ws.length) return;
+  brain.starters.push(ws[0]);
+  for (let i = 0; i < ws.length; i++) {
+    const cur = ws[i];
+    const next = ws[i + 1] || null;
+    if (!brain.markov.has(cur)) brain.markov.set(cur, new Map());
+    if (next) {
+      const m = brain.markov.get(cur);
+      m.set(next, (m.get(next) || 0) + 1);
     }
   }
 }
 
 function unindexPair(brain, idx) {
   const p = brain.pairs[idx];
-  if (!p || !p.tokens) return;
-  brain.totalDocLen -= p.len;
+  if (!p || !p.qWords) return;
   const seen = new Set();
-  for (const t of p.tokens) {
-    const s = brain.wordToPairs.get(t);
-    if (s) {
-      s.delete(idx);
-      if (!s.size) brain.wordToPairs.delete(t);
-    }
-    if (!seen.has(t)) {
-      seen.add(t);
-      const df = (brain.docFreq.get(t) || 0) - 1;
-      if (df <= 0) brain.docFreq.delete(t);
-      else brain.docFreq.set(t, df);
+  for (const w of p.qWords) {
+    const s = brain.wordIndex.get(w);
+    if (s) { s.delete(idx); if (!s.size) brain.wordIndex.delete(w); }
+    if (!seen.has(w)) {
+      seen.add(w);
+      const d = (brain.df.get(w) || 0) - 1;
+      if (d <= 0) brain.df.delete(w);
+      else brain.df.set(w, d);
     }
   }
-  p.tokens = null;
+  p.qWords = null;
 }
 
-function avgDocLen(brain) {
-  return brain.pairs.length ? brain.totalDocLen / brain.pairs.length : 1;
+function rebuildMarkov(brain) {
+  brain.markov.clear();
+  brain.starters = [];
+  for (const p of brain.pairs) {
+    if (p.answer) indexMarkov(brain, p.answer);
+  }
 }
 
-function scoreBM25(brain, inputTerms, pairIdx) {
+function rebuildIndex(brain) {
+  brain.wordIndex.clear();
+  brain.df.clear();
+  for (let i = 0; i < brain.pairs.length; i++) {
+    brain.pairs[i].qWords = null;
+    indexPair(brain, i, brain.pairs[i].question, brain.pairs[i].answer);
+  }
+  rebuildMarkov(brain);
+}
+
+function addSyn(brain, a, b) {
+  if (a === b) return;
+  if (!brain.syn.has(a)) brain.syn.set(a, new Set());
+  if (!brain.syn.has(b)) brain.syn.set(b, new Set());
+  const sa = brain.syn.get(a), sb = brain.syn.get(b);
+  if (sa.size < MAX_SYN) sa.add(b);
+  if (sb.size < MAX_SYN) sb.add(a);
+}
+
+function delSyn(brain, a, b) {
+  const sa = brain.syn.get(a), sb = brain.syn.get(b);
+  if (sa) sa.delete(b);
+  if (sb) sb.delete(a);
+}
+
+function scorePair(brain, queryWords, pairIdx) {
   const pair = brain.pairs[pairIdx];
-  if (!pair || !pair.tokens) return { score: 0, matched: 0 };
-
-  const qCount = new Map();
-  for (const t of inputTerms) qCount.set(t, (qCount.get(t) || 0) + 1);
-
-  const docCount = new Map();
-  for (const t of pair.tokens) docCount.set(t, (docCount.get(t) || 0) + 1);
-
-  const avgdl = avgDocLen(brain) || 1;
-  let score = 0;
-  let matched = 0;
-
-  for (const [t, qc] of qCount) {
-    const f = docCount.get(t);
-    if (!f) continue;
-    matched++;
-    const w = idf(brain, t);
-    const denom = f + BM25_K1 * (1 - BM25_B + BM25_B * (pair.len / avgdl));
-    score += w * (f * (BM25_K1 + 1)) / denom * Math.min(qc, 2);
+  if (!pair || !pair.qWords || !pair.qWords.length) return 0;
+  const qSet = new Set();
+  for (const w of queryWords) for (const v of expand(brain, w)) qSet.add(v);
+  const pairSet = new Set(pair.qWords);
+  let dot = 0, qNorm = 0, pNorm = 0;
+  for (const w of qSet) {
+    const i = idf(brain, w);
+    qNorm += i * i;
+    if (pairSet.has(w)) dot += i * i;
   }
-
-  const norm = Math.sqrt(inputTerms.length) || 1;
-  return { score: score / norm, matched };
+  for (const w of pairSet) {
+    const i = idf(brain, w);
+    pNorm += i * i;
+  }
+  if (!qNorm || !pNorm) return 0;
+  return dot / (Math.sqrt(qNorm) * Math.sqrt(pNorm));
 }
 
-function resolveInput(brain, input) {
-  const rawTerms = terms(input);
-  if (!rawTerms.length) return null;
-
-  const resolved = [];
-  for (const t of rawTerms) {
-    if (brain.vocab.has(t)) {
-      resolved.push({ term: t, penalty: 1 });
-      continue;
-    }
-    const hit = findClosestKnown(brain, t);
-    if (hit) {
-      resolved.push({ term: hit.word, penalty: hit.dist === 0 ? 1 : hit.dist === 1 ? 0.85 : 0.7 });
-      continue;
-    }
-    if (t.includes('_')) {
-      const parts = t.split('_');
-      let ok = true;
-      const mapped = [];
-      for (const p of parts) {
-        if (brain.vocab.has(p)) mapped.push(p);
-        else {
-          const h = findClosestKnown(brain, p);
-          if (h) mapped.push(h.word);
-          else { ok = false; break; }
-        }
-      }
-      if (ok && mapped.length) {
-        resolved.push({ term: mapped.join('_'), penalty: 0.7 });
-        continue;
-      }
-    }
-    if (t.length >= MIN_SINGLE_LEN) {
-      resolved.push({ term: t, penalty: 0.4 });
+function findBestPairs(brain, queryWords, limit) {
+  const candidates = new Set();
+  for (const w of queryWords) {
+    for (const v of expand(brain, w)) {
+      const idxs = brain.wordIndex.get(v);
+      if (idxs) for (const i of idxs) candidates.add(i);
     }
   }
+  const scored = [];
+  for (const i of candidates) {
+    const s = scorePair(brain, queryWords, i);
+    if (s > 0) scored.push({ idx: i, score: s });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit);
+}
 
-  return resolved.length ? resolved : null;
+function pickNext(brain, word) {
+  const m = brain.markov.get(word);
+  if (!m || !m.size) return null;
+  let total = 0;
+  for (const c of m.values()) total += c;
+  let r = Math.random() * total;
+  for (const [next, count] of m) {
+    r -= count;
+    if (r <= 0) return next;
+  }
+  return null;
+}
+
+function generateFromSeed(brain, seed) {
+  if (!brain.markov.has(seed)) return null;
+  const out = [seed];
+  let cur = seed;
+  for (let i = 0; i < MAX_GEN_LEN; i++) {
+    const next = pickNext(brain, cur);
+    if (!next) break;
+    out.push(next);
+    cur = next;
+    if (out.length >= MIN_GEN_LEN && Math.random() < 0.15) break;
+  }
+  if (out.length < MIN_GEN_LEN) return null;
+  return out.join(' ');
+}
+
+function pickSeedFromPairs(brain, bestPairs) {
+  const seeds = [];
+  for (const bp of bestPairs) {
+    const ans = brain.pairs[bp.idx].answer;
+    const ws = words(ans);
+    if (ws.length) seeds.push({ word: ws[0], score: bp.score });
+  }
+  if (!seeds.length) return null;
+  seeds.sort((a, b) => b.score - a.score);
+  return seeds[0].word;
+}
+
+function generateAnswer(brain, queryWords, bestPairs) {
+  const seed = pickSeedFromPairs(brain, bestPairs);
+  if (!seed) return null;
+  const gen = generateFromSeed(brain, seed);
+  if (gen) return gen;
+  return null;
+}
+
+function glueFromPairs(brain, bestPairs) {
+  const parts = [];
+  for (const bp of bestPairs.slice(0, 2)) {
+    const ans = brain.pairs[bp.idx].answer;
+    if (ans && !parts.includes(ans)) parts.push(ans);
+  }
+  if (!parts.length) return null;
+  return parts.join(' ');
 }
 
 function answerFor(brain, input) {
   if (!brain.pairs.length) return null;
-  const key = lc(input);
+  const qWords = words(input);
+  if (!qWords.length) return null;
 
-  if (brain.cache.has(key)) {
-    brain.cacheHits++;
-    const v = brain.cache.get(key);
-    brain.cache.delete(key);
-    brain.cache.set(key, v);
-    return v;
-  }
-  brain.cacheMiss++;
+  const bestPairs = findBestPairs(brain, qWords, 5);
 
-  const resolved = resolveInput(brain, input);
-  if (!resolved) {
-    if (brain.cache.size >= CACHE_LIMIT) brain.cache.delete(brain.cache.keys().next().value);
-    brain.cache.set(key, null);
-    return null;
-  }
-
-  const inputTerms = resolved.map(r => r.term);
-  const penaltyMap = new Map();
-  for (const r of resolved) {
-    const prev = penaltyMap.get(r.term) || 0;
-    if (r.penalty > prev) penaltyMap.set(r.term, r.penalty);
-  }
-
-  const candidates = new Set();
-  for (const t of inputTerms) {
-    const idxs = brain.wordToPairs.get(t);
-    if (idxs) for (const i of idxs) {
-      candidates.add(i);
-      if (candidates.size > CANDIDATE_LIMIT) break;
+  if (bestPairs.length) {
+    const top = bestPairs[0];
+    if (top.score >= 0.65) {
+      return { answer: brain.pairs[top.idx].answer, kind: 'exact', score: top.score };
     }
-    if (candidates.size > CANDIDATE_LIMIT) break;
-  }
-
-  if (!candidates.size) {
-    if (brain.cache.size >= CACHE_LIMIT) brain.cache.delete(brain.cache.keys().next().value);
-    brain.cache.set(key, null);
-    return null;
-  }
-
-  const scored = [];
-  for (const i of candidates) {
-    const { score, matched } = scoreBM25(brain, inputTerms, i);
-    if (score <= 0) continue;
-    const coverage = matched / inputTerms.length;
-    if (coverage < MIN_COVERAGE) continue;
-    let final = score;
-    for (const t of inputTerms) {
-      const p = penaltyMap.get(t);
-      if (p && p < 1) final *= p;
+    if (top.score >= MIN_SCORE) {
+      const gen = generateAnswer(brain, qWords, bestPairs);
+      if (gen) return { answer: gen, kind: 'generated', score: top.score };
+      const glue = glueFromPairs(brain, bestPairs);
+      if (glue) return { answer: glue, kind: 'glued', score: top.score };
+      return { answer: brain.pairs[top.idx].answer, kind: 'exact', score: top.score };
     }
-    scored.push({ idx: i, score: final, coverage });
   }
 
-  if (!scored.length) {
-    if (brain.cache.size >= CACHE_LIMIT) brain.cache.delete(brain.cache.keys().next().value);
-    brain.cache.set(key, null);
-    return null;
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-  const best = scored[0];
-  const second = scored[1];
-
-  let result = null;
-  if (best.score >= MIN_SCORE && (!second || best.score - second.score >= MIN_MARGIN)) {
-    result = { pair: brain.pairs[best.idx], score: best.score, coverage: best.coverage };
-  } else if (best.score >= MIN_SCORE && second && best.score - second.score < MIN_MARGIN) {
-    result = { ambiguous: scored.slice(0, 3).map(s => brain.pairs[s.idx]) };
-  }
-
-  if (brain.cache.size >= CACHE_LIMIT) brain.cache.delete(brain.cache.keys().next().value);
-  brain.cache.set(key, result);
-  return result;
+  const gen = generateFromRandomSeed(brain);
+  if (gen) return { answer: gen, kind: 'random', score: 0 };
+  return null;
 }
 
-function addPairLocal(brain, q, a) {
-  const idx = brain.pairs.length;
-  brain.pairs.push({ question: q, answer: a, tokens: null, len: 0 });
-  indexPair(brain, idx, q);
-  return idx;
+function generateFromRandomSeed(brain) {
+  if (!brain.starters.length) return null;
+  const seed = brain.starters[Math.floor(Math.random() * brain.starters.length)];
+  return generateFromSeed(brain, seed);
 }
 
-function updatePairLocal(brain, idx, q, a) {
-  unindexPair(brain, idx);
-  brain.pairs[idx].question = q;
-  brain.pairs[idx].answer = a;
-  indexPair(brain, idx, q);
-}
-
-function rebuildLocalIndex(brain) {
-  brain.wordToPairs.clear();
-  brain.docFreq.clear();
-  brain.byLen.clear();
-  brain.vocab.clear();
-  brain.totalDocLen = 0;
-  brain.cache.clear();
-  for (let i = 0; i < brain.pairs.length; i++) {
-    brain.pairs[i].tokens = null;
-    brain.pairs[i].len = 0;
-    indexPair(brain, i, brain.pairs[i].question);
-  }
-}
-
-async function savePairToDb(ownerId, question, answer) {
-  const Knowledge = Parse.Object.extend('Knowledge');
-  const query = new Parse.Query(Knowledge);
-  query.equalTo('ownerId', ownerId);
-  query.equalTo('question', lc(question));
+async function dbSavePair(owner, q, a) {
+  const K = Parse.Object.extend('Knowledge');
+  const query = new Parse.Query(K);
+  query.equalTo('question', dbKey(owner, q));
   let obj = await query.first({ useMasterKey: true });
   if (!obj) {
-    obj = new Knowledge();
-    obj.set('ownerId', ownerId);
-    obj.set('question', lc(question));
+    obj = new K();
+    obj.set('question', dbKey(owner, q));
   }
-  obj.set('answer', answer);
-  obj.set('originalQuestion', question);
+  obj.set('answer', a);
+  obj.set('originalQuestion', q);
   return obj.save(null, { useMasterKey: true });
 }
 
-async function deletePairFromDb(ownerId, question) {
-  const Knowledge = Parse.Object.extend('Knowledge');
-  const query = new Parse.Query(Knowledge);
-  query.equalTo('ownerId', ownerId);
-  query.equalTo('question', lc(question));
+async function dbDeletePair(owner, q) {
+  const K = Parse.Object.extend('Knowledge');
+  const query = new Parse.Query(K);
+  query.equalTo('question', dbKey(owner, q));
   const obj = await query.first({ useMasterKey: true });
   if (obj) await obj.destroy({ useMasterKey: true });
 }
 
-async function loadPairsForOwner(ownerId) {
-  const Knowledge = Parse.Object.extend('Knowledge');
-  const query = new Parse.Query(Knowledge);
-  query.equalTo('ownerId', ownerId);
-  query.limit(10000);
-  const results = await query.find({ useMasterKey: true });
-  return results.map((r) => ({
-    question: r.get('originalQuestion') || r.get('question'),
-    answer: r.get('answer'),
-  }));
+async function dbSaveSyn(owner, word, set) {
+  const K = Parse.Object.extend('Knowledge');
+  const query = new Parse.Query(K);
+  query.equalTo('question', synKey(owner, word));
+  let obj = await query.first({ useMasterKey: true });
+  if (!obj) {
+    obj = new K();
+    obj.set('question', synKey(owner, word));
+  }
+  obj.set('answer', [...set].join(','));
+  obj.set('originalQuestion', word);
+  return obj.save(null, { useMasterKey: true });
 }
 
-async function ensureBrainLoaded(brain) {
+async function dbLoadAll(owner) {
+  const K = Parse.Object.extend('Knowledge');
+  const query = new Parse.Query(K);
+  query.startsWith('question', owner + ':');
+  query.limit(10000);
+  const results = await query.find({ useMasterKey: true });
+  const prefix = owner + ':';
+  const synPrefix = owner + ':@syn:';
+  const pairs = [];
+  const syn = new Map();
+  for (const r of results) {
+    const raw = r.get('question') || '';
+    if (raw.startsWith(synPrefix)) {
+      const word = raw.slice(synPrefix.length);
+      const ans = r.get('answer') || '';
+      const set = new Set();
+      for (const s of ans.split(',')) {
+        const t = s.trim();
+        if (t) set.add(t);
+      }
+      syn.set(word, set);
+    } else if (raw.startsWith(prefix)) {
+      const clean = raw.slice(prefix.length);
+      pairs.push({
+        question: r.get('originalQuestion') || clean,
+        answer: r.get('answer'),
+      });
+    }
+  }
+  return { pairs, syn };
+}
+
+async function ensureLoaded(brain) {
   if (brain.loaded) return brain;
   if (brain.loading) return brain.loading;
   brain.loading = (async () => {
-    const rows = await loadPairsForOwner(brain.ownerId);
-    brain.pairs = rows.map(r => ({ question: r.question, answer: r.answer, tokens: null, len: 0 }));
-    rebuildLocalIndex(brain);
+    const { pairs, syn } = await dbLoadAll(brain.owner);
+    brain.pairs = pairs.map(p => ({ question: p.question, answer: p.answer, qWords: null }));
+    brain.syn = new Map();
+    for (const [w, set] of syn) brain.syn.set(w, new Set(set));
+    rebuildIndex(brain);
     brain.loaded = true;
-    console.log('Brain loaded for', brain.ownerId, 'pairs:', brain.pairs.length);
+    console.log('Loaded', brain.owner, 'pairs:', brain.pairs.length, 'syn:', brain.syn.size, 'markov:', brain.markov.size);
     return brain;
   })();
-  try {
-    return await brain.loading;
-  } finally {
-    brain.loading = null;
-  }
-}
-
-function checkTeachRate(brain) {
-  const now = Date.now();
-  brain.teachTimestamps = brain.teachTimestamps.filter(t => now - t < TEACH_RATE_WINDOW);
-  if (brain.teachTimestamps.length >= TEACH_RATE_LIMIT) return false;
-  brain.teachTimestamps.push(now);
-  return true;
+  try { return await brain.loading; }
+  finally { brain.loading = null; }
 }
 
 function api(method, payload) {
   return new Promise((resolve, reject) => {
-    if (!BOT_TOKEN) return reject(new Error('BOT_TOKEN not set'));
+    if (!BOT_TOKEN) return reject(new Error('no token'));
     const data = JSON.stringify(payload || {});
-    const req = https.request(
-      {
-        hostname: 'api.telegram.org',
-        path: `/bot${BOT_TOKEN}/${method}`,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(data),
-        },
-      },
-      (res) => {
-        let body = '';
-        res.on('data', (c) => (body += c));
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(body));
-          } catch (e) {
-            reject(e);
-          }
-        });
-      }
-    );
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${BOT_TOKEN}/${method}`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+    }, (res) => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => { try { resolve(JSON.parse(body)); } catch (e) { reject(e); } });
+    });
     req.on('error', reject);
     req.write(data);
     req.end();
   });
 }
 
-async function send(chatId, text) {
-  try {
-    await api('sendMessage', { chat_id: chatId, text });
-  } catch (e) {
-    console.error('send error:', e.message);
-  }
+async function send(chat, text) {
+  try { await api('sendMessage', { chat_id: chat, text }); }
+  catch (e) { console.error('send', e.message); }
 }
 
 const HELP = [
-  'Личный бот. У каждого свой список.',
+  'Свой генеративный бот. У каждого свой мозг.',
   '',
-  'Команды:',
-  '/help - справка',
-  '/teach вопрос = ответ - научить',
-  '/delete вопрос - забыть',
-  '/list [страница] - что знаю (по 20 на стр.)',
-  '/stats - статистика',
+  '/teach вопрос = ответ — научить',
+  '/learn слово = синоним1, синоним2',
+  '/delete вопрос',
+  '/forget слово = синоним',
+  '/list [стр]',
+  '/synonyms слово',
+  '/stats',
   '',
-  'Пример: /list 3 — третья страница.',
+  'Если точного ответа нет — бот сам сгенерирует из выученного.',
 ].join('\n');
 
-function buildListPage(brain, page) {
-  const total = brain.pairs.length;
-  const totalPages = Math.max(1, Math.ceil(total / LIST_PAGE_SIZE));
-  const p = Math.min(Math.max(1, page), totalPages);
-  const start = (p - 1) * LIST_PAGE_SIZE;
-  const end = Math.min(start + LIST_PAGE_SIZE, total);
-  const slice = brain.pairs.slice(start, end);
-
-  const header = `Стр. ${p} из ${totalPages} (всего ${total} пар)\n\n`;
-  let body = '';
-  for (let i = 0; i < slice.length; i++) {
-    const n = start + i + 1;
-    const q = slice[i].question.length > 80 ? slice[i].question.slice(0, 77) + '...' : slice[i].question;
-    const a = slice[i].answer.length > 120 ? slice[i].answer.slice(0, 117) + '...' : slice[i].answer;
-    body += `${n}. ${q} = ${a}\n`;
-  }
-
-  let text = header + body;
-  if (text.length > 3900) text = text.slice(0, 3900) + '\n...';
-  return { text, page: p, totalPages };
-}
-
-async function handle(chatId, text) {
+async function handle(chat, text) {
   const t = text.trim();
-  const ownerId = String(chatId);
-  const brain = getBrain(ownerId);
+  const owner = String(chat);
+  const brain = getBrain(owner);
 
-  if (t === '/start' || t === '/help') {
-    await send(chatId, HELP);
-    return;
-  }
+  if (t === '/start' || t === '/help') return send(chat, HELP);
 
   if (t === '/stats') {
-    await ensureBrainLoaded(brain);
-    const top = [...brain.docFreq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
-      .map(([w, c]) => `${w}(${c})`).join(', ');
-    const hitRate = brain.cacheHits + brain.cacheMiss
-      ? (brain.cacheHits / (brain.cacheHits + brain.cacheMiss) * 100).toFixed(1)
-      : '0.0';
-    await send(
-      chatId,
-      `Твоих пар: ${brain.pairs.length}\nСлов: ${brain.vocab.size}\nСр.длина: ${avgDocLen(brain).toFixed(1)}\nКэш: ${brain.cache.size} (hit ${hitRate}%)\nТоп: ${top || '-'}`
-    );
-    return;
+    await ensureLoaded(brain);
+    const links = [...brain.syn.values()].reduce((s, set) => s + set.size, 0);
+    return send(chat, `Пар: ${brain.pairs.length}\nСлов с синонимами: ${brain.syn.size}\nСвязей: ${links}\nСлов в цепи Маркова: ${brain.markov.size}`);
   }
 
   if (t === '/list' || t.startsWith('/list ')) {
-    await ensureBrainLoaded(brain);
-    if (!brain.pairs.length) {
-      await send(chatId, 'У тебя пусто.');
-      return;
-    }
-    const arg = t.slice('/list'.length).trim();
+    await ensureLoaded(brain);
+    if (!brain.pairs.length) return send(chat, 'Пусто.');
+    const arg = t.slice(5).trim();
+    const totalPages = Math.max(1, Math.ceil(brain.pairs.length / LIST_PAGE));
     let page = 1;
     if (arg) {
       const n = parseInt(arg, 10);
-      if (!Number.isFinite(n) || n < 1) {
-        const totalPages = Math.ceil(brain.pairs.length / LIST_PAGE_SIZE);
-        await send(chatId, `Формат: /list <номер страницы>\nВсего страниц: ${totalPages}`);
-        return;
-      }
-      page = n;
+      if (!Number.isFinite(n) || n < 1) return send(chat, `Всего страниц: ${totalPages}`);
+      page = Math.min(n, totalPages);
     }
-    const { text: out } = buildListPage(brain, page);
-    await send(chatId, out);
-    return;
+    const start = (page - 1) * LIST_PAGE;
+    const slice = brain.pairs.slice(start, start + LIST_PAGE);
+    let out = `Стр. ${page} из ${totalPages} (всего ${brain.pairs.length})\n\n`;
+    for (let i = 0; i < slice.length; i++) {
+      out += `${start + i + 1}. ${slice[i].question} = ${slice[i].answer}\n`;
+    }
+    if (out.length > 3900) out = out.slice(0, 3900) + '...';
+    return send(chat, out);
+  }
+
+  if (t === '/synonyms' || t.startsWith('/synonyms ')) {
+    await ensureLoaded(brain);
+    const w = lc(t.slice(9).trim());
+    if (!w) return send(chat, 'Формат: /synonyms слово');
+    const s = brain.syn.get(w);
+    if (!s || !s.size) return send(chat, `У "${w}" нет синонимов.`);
+    return send(chat, `${w} ↔ ${[...s].join(', ')}`);
   }
 
   if (t.startsWith('/teach')) {
-    const rest = t.slice('/teach'.length).trim();
+    const rest = t.slice(6).trim();
     const parts = rest.split('=');
-    if (parts.length < 2) {
-      await send(chatId, 'Формат: /teach вопрос = ответ');
-      return;
-    }
+    if (parts.length < 2) return send(chat, 'Формат: /teach вопрос = ответ');
     const q = parts[0].trim();
     const a = parts.slice(1).join('=').trim();
-    if (!q || !a) {
-      await send(chatId, 'Пусто.');
-      return;
-    }
-    await ensureBrainLoaded(brain);
-    if (!checkTeachRate(brain)) {
-      await send(chatId, 'Слишком часто. Подожди минуту.');
-      return;
-    }
+    if (!q || !a) return send(chat, 'Пусто.');
+    await ensureLoaded(brain);
     try {
-      await savePairToDb(ownerId, q, a);
+      await dbSavePair(owner, q, a);
       const key = lc(q);
-      const existingIdx = brain.pairs.findIndex((p) => lc(p.question) === key);
-      if (existingIdx >= 0) {
-        updatePairLocal(brain, existingIdx, q, a);
+      const idx = brain.pairs.findIndex(p => lc(p.question) === key);
+      if (idx >= 0) {
+        unindexPair(brain, idx);
+        brain.pairs[idx].question = q;
+        brain.pairs[idx].answer = a;
+        indexPair(brain, idx, q, a);
+        rebuildMarkov(brain);
       } else {
-        if (brain.pairs.length >= MAX_PAIRS_PER_USER) {
-          await send(chatId, 'У тебя слишком много пар, удали что-нибудь.');
-          return;
-        }
-        addPairLocal(brain, q, a);
+        if (brain.pairs.length >= MAX_PAIRS) return send(chat, 'Слишком много пар.');
+        const newIdx = brain.pairs.length;
+        brain.pairs.push({ question: q, answer: a, qWords: null });
+        indexPair(brain, newIdx, q, a);
       }
-      brain.cache.clear();
-      await send(chatId, `Запомнил: ${q} = ${a}`);
+      return send(chat, `Запомнил: ${q} = ${a}`);
     } catch (e) {
-      console.error('teach error:', e.message);
-      await send(chatId, 'Ошибка сохранения.');
+      console.error('teach', e.message);
+      return send(chat, 'Ошибка сохранения.');
     }
-    return;
   }
 
   if (t.startsWith('/delete')) {
-    const rest = t.slice('/delete'.length).trim();
-    if (!rest) {
-      await send(chatId, 'Формат: /delete вопрос');
-      return;
-    }
-    await ensureBrainLoaded(brain);
+    const rest = t.slice(7).trim();
+    if (!rest) return send(chat, 'Формат: /delete вопрос');
+    await ensureLoaded(brain);
     const key = lc(rest);
-    const idx = brain.pairs.findIndex((p) => lc(p.question) === key);
-    if (idx < 0) {
-      await send(chatId, `Не нашёл у тебя: ${key}`);
-      return;
-    }
+    const idx = brain.pairs.findIndex(p => lc(p.question) === key);
+    if (idx < 0) return send(chat, `Не нашёл: ${key}`);
     try {
-      await deletePairFromDb(ownerId, brain.pairs[idx].question);
+      await dbDeletePair(owner, brain.pairs[idx].question);
+      unindexPair(brain, idx);
       brain.pairs.splice(idx, 1);
-      rebuildLocalIndex(brain);
-      await send(chatId, `Удалил: ${rest}`);
+      rebuildIndex(brain);
+      return send(chat, `Удалил: ${rest}`);
     } catch (e) {
-      console.error('delete error:', e.message);
-      await send(chatId, 'Ошибка удаления.');
+      console.error('delete', e.message);
+      return send(chat, 'Ошибка удаления.');
     }
-    return;
   }
 
-  await ensureBrainLoaded(brain);
+  if (t.startsWith('/learn')) {
+    const rest = t.slice(6).trim();
+    const parts = rest.split('=');
+    if (parts.length < 2) return send(chat, 'Формат: /learn слово = синоним1, синоним2');
+    const main = lc(parts[0].trim());
+    const others = parts[1].split(',').map(s => lc(s.trim())).filter(Boolean);
+    if (!main || !others.length) return send(chat, 'Пусто.');
+    await ensureLoaded(brain);
+    for (const o of others) addSyn(brain, main, o);
+    try {
+      await dbSaveSyn(owner, main, brain.syn.get(main) || new Set());
+      for (const o of others) {
+        const s = brain.syn.get(o);
+        if (s) await dbSaveSyn(owner, o, s);
+      }
+      return send(chat, `Связал: ${main} ↔ ${others.join(', ')}`);
+    } catch (e) {
+      console.error('learn', e.message);
+      return send(chat, 'Ошибка сохранения.');
+    }
+  }
+
+  if (t.startsWith('/forget')) {
+    const rest = t.slice(7).trim();
+    const parts = rest.split('=');
+    if (parts.length < 2) return send(chat, 'Формат: /forget слово = синоним');
+    const a = lc(parts[0].trim());
+    const b = lc(parts[1].trim());
+    if (!a || !b) return send(chat, 'Пусто.');
+    await ensureLoaded(brain);
+    delSyn(brain, a, b);
+    try {
+      const sa = brain.syn.get(a), sb = brain.syn.get(b);
+      if (sa) await dbSaveSyn(owner, a, sa);
+      if (sb) await dbSaveSyn(owner, b, sb);
+      return send(chat, `Разъединил: ${a} ✕ ${b}`);
+    } catch (e) {
+      console.error('forget', e.message);
+      return send(chat, 'Ошибка.');
+    }
+  }
+
+  await ensureLoaded(brain);
   const res = answerFor(brain, t);
-  if (!res) {
-    await send(chatId, 'Не знаю. Научи: /teach вопрос = ответ');
-    return;
-  }
-  if (res.ambiguous) {
-    const opts = res.ambiguous.map((p, i) => `${i + 1}. ${p.answer}`).join('\n');
-    await send(chatId, `Уточни, я знаю несколько вариантов:\n${opts}`);
-    return;
-  }
-  await send(chatId, res.pair.answer);
+  if (!res) return send(chat, 'Не знаю. Научи: /teach вопрос = ответ');
+  return send(chat, res.answer);
 }
 
 async function poll() {
@@ -664,31 +565,21 @@ async function poll() {
           offset = u.update_id + 1;
           const m = u.message;
           if (!m || !m.text) continue;
-          try {
-            await handle(m.chat.id, m.text);
-          } catch (e) {
-            console.error('handle error:', e.message);
-          }
+          try { await handle(m.chat.id, m.text); }
+          catch (e) { console.error('handle', e.message); }
         }
       }
     } catch (e) {
-      console.error('poll error:', e.message);
-      await new Promise((res) => setTimeout(res, 3000));
+      console.error('poll', e.message);
+      await new Promise(r => setTimeout(r, 3000));
     }
   }
 }
 
 async function start() {
-  if (!BOT_TOKEN) {
-    console.error('BOT_TOKEN not set');
-    process.exit(1);
-  }
-  if (!APP_ID || !JS_KEY || !MASTER_KEY) {
-    console.error('Back4App keys not set');
-    process.exit(1);
-  }
-
-  console.log('Bot started, multi-tenant mode');
+  if (!BOT_TOKEN) { console.error('BOT_TOKEN not set'); process.exit(1); }
+  if (!APP_ID || !JS_KEY || !MASTER_KEY) { console.error('B4A keys not set'); process.exit(1); }
+  console.log('Generative bot started');
   poll();
 }
 
