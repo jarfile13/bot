@@ -14,13 +14,9 @@ const MIN_WORD_FREQ = 2;
 const MIN_COOC = 2;
 const SIM_THRESHOLD = 0.72;
 const MIN_SIM = 0.55;
-const SHARED_WEIGHT = 0.85;
-const MAX_PAIRS = 5000;
-const MAX_SYN = 30;
 const LIST_PAGE = 20;
 const MAX_BRAINS = 200;
 const PAGE_SIZE = 100;
-const SHARED_SCOPE = 'shared';
 const DATA_DIR = process.env.DATA_DIR || './data';
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -184,7 +180,7 @@ function svdPowerIter(sparse, V, k, iters) {
 
     for (let it = 0; it < iters; it++) {
       const u = new Float64Array(V);
-      for (const [r, vec] of residualRows) {
+      for (const [, vec] of residualRows) {
         let dot = 0;
         for (const [c, val] of vec) dot += val * v[c];
         if (dot === 0) continue;
@@ -199,7 +195,7 @@ function svdPowerIter(sparse, V, k, iters) {
     let sigma = 0;
     {
       const u = new Float64Array(V);
-      for (const [r, vec] of residualRows) {
+      for (const [, vec] of residualRows) {
         let dot = 0;
         for (const [c, val] of vec) dot += val * v[c];
         if (dot === 0) continue;
@@ -215,9 +211,7 @@ function svdPowerIter(sparse, V, k, iters) {
       let vr = 0;
       for (const [c, val] of vec) vr += val * v[c];
       const updated = [];
-      for (const [c, val] of vec) {
-        updated.push([c, val - sigma * vr * v[c]]);
-      }
+      for (const [c, val] of vec) updated.push([c, val - sigma * vr * v[c]]);
       newResidual.set(r, updated);
     }
     residualRows = newResidual;
@@ -285,9 +279,7 @@ function findBestPairs(brain, queryVec, limit) {
     if (!p.vector) continue;
     const sim = cosine(queryVec, p.vector);
     if (sim < MIN_SIM) continue;
-    let weighted = sim;
-    if (p.scope === SHARED_SCOPE) weighted *= SHARED_WEIGHT;
-    scored.push({ idx: i, score: weighted, raw: sim });
+    scored.push({ idx: i, score: sim, raw: sim });
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit);
@@ -316,12 +308,7 @@ function b4aRequest(method, urlPath, body) {
       headers['Content-Type'] = 'application/json';
       headers['Content-Length'] = Buffer.byteLength(data);
     }
-    const req = https.request({
-      hostname: SERVER_HOST,
-      path: urlPath,
-      method,
-      headers,
-    }, (res) => {
+    const req = https.request({ hostname: SERVER_HOST, path: urlPath, method, headers }, (res) => {
       let buf = '';
       res.on('data', c => buf += c);
       res.on('end', () => {
@@ -346,17 +333,9 @@ async function dbFind(scope, q) {
 
 async function dbSavePair(scope, q, a) {
   const existing = await dbFind(scope, q);
-  const body = {
-    question: dbKey(scope, q),
-    answer: a,
-    originalQuestion: q,
-    scope,
-  };
-  if (existing) {
-    await b4aRequest('PUT', `/classes/Knowledge/${existing.objectId}`, body);
-  } else {
-    await b4aRequest('POST', '/classes/Knowledge', body);
-  }
+  const body = { question: dbKey(scope, q), answer: a, originalQuestion: q, scope };
+  if (existing) await b4aRequest('PUT', `/classes/Knowledge/${existing.objectId}`, body);
+  else await b4aRequest('POST', '/classes/Knowledge', body);
 }
 
 async function dbDeletePair(scope, q) {
@@ -366,17 +345,9 @@ async function dbDeletePair(scope, q) {
 
 async function dbSaveSyn(scope, word, set) {
   const existing = await dbFind(scope, '@syn:' + word);
-  const body = {
-    question: synKey(scope, word),
-    answer: [...set].join(','),
-    originalQuestion: word,
-    scope,
-  };
-  if (existing) {
-    await b4aRequest('PUT', `/classes/Knowledge/${existing.objectId}`, body);
-  } else {
-    await b4aRequest('POST', '/classes/Knowledge', body);
-  }
+  const body = { question: synKey(scope, word), answer: [...set].join(','), originalQuestion: word, scope };
+  if (existing) await b4aRequest('PUT', `/classes/Knowledge/${existing.objectId}`, body);
+  else await b4aRequest('POST', '/classes/Knowledge', body);
 }
 
 async function dbLoadScope(scope) {
@@ -405,31 +376,13 @@ async function dbLoadScope(scope) {
         syn.set(word, set);
       } else if (raw.startsWith(prefix)) {
         const clean = raw.slice(prefix.length);
-        pairs.push({
-          question: obj.originalQuestion || clean,
-          answer: obj.answer,
-          scope,
-        });
+        pairs.push({ question: obj.originalQuestion || clean, answer: obj.answer, scope });
       }
     }
     if (results.length < PAGE_SIZE) break;
     skip += PAGE_SIZE;
   }
   return { pairs, syn };
-}
-
-async function dbLoadAll(scopes) {
-  const allPairs = [];
-  const allSyn = new Map();
-  for (const scope of scopes) {
-    const { pairs, syn } = await dbLoadScope(scope);
-    for (const p of pairs) allPairs.push(p);
-    for (const [w, set] of syn) {
-      if (!allSyn.has(w)) allSyn.set(w, new Set());
-      for (const s of set) allSyn.get(w).add(s);
-    }
-  }
-  return { pairs: allPairs, syn: allSyn };
 }
 
 async function persistLocal(brain) {
@@ -450,9 +403,7 @@ async function loadLocal(brain) {
     brain.syn = new Map();
     for (const [w, arr] of (data.syn || [])) brain.syn.set(w, new Set(arr));
     return true;
-  } catch (e) {
-    return false;
-  }
+  } catch (e) { return false; }
 }
 
 async function ensureLoaded(brain) {
@@ -465,8 +416,7 @@ async function ensureLoaded(brain) {
     try {
       const local = await loadLocal(brain);
       if (!local) {
-        const scopes = [brain.scope, SHARED_SCOPE];
-        const { pairs, syn } = await dbLoadAll(scopes);
+        const { pairs, syn } = await dbLoadScope(brain.scope);
         brain.pairs = pairs;
         brain.syn = new Map();
         for (const [w, set] of syn) brain.syn.set(w, new Set(set));
@@ -510,22 +460,57 @@ async function send(chat, text) {
   catch (e) { console.error('send', e.message); }
 }
 
+async function sendDocument(chat, filename, content) {
+  return new Promise((resolve, reject) => {
+    const boundary = '----bot' + Date.now();
+    const head = `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chat}\r\n--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename}"\r\nContent-Type: application/json\r\n\r\n`;
+    const tail = `\r\n--${boundary}--\r\n`;
+    const body = Buffer.concat([Buffer.from(head, 'utf8'), Buffer.from(content, 'utf8'), Buffer.from(tail, 'utf8')]);
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${BOT_TOKEN}/sendDocument`,
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
+    }, (res) => {
+      let b = '';
+      res.on('data', c => b += c);
+      res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function downloadFile(fileId) {
+  const r = await api('getFile', { file_id: fileId });
+  if (!r || !r.ok) throw new Error('getFile failed');
+  const filePath = r.result.file_path;
+  return new Promise((resolve, reject) => {
+    https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`, (res) => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => resolve(body));
+    }).on('error', reject);
+  });
+}
+
 const HELP = [
-  'Бот с самообучающимися эмбеддингами (чистый JS, без SDK).',
+  'Бот с самообучающимися эмбеддингами (чистый JS).',
   '',
   '/teach вопрос = ответ',
-  '/teach shared вопрос = ответ',
   '/learn слово = синоним1, синоним2',
-  '/learn shared слово = синоним1, синоним2',
   '/delete вопрос',
   '/forget слово = синоним',
   '/list [стр]',
   '/synonyms слово',
   '/stats',
   '/reindex — пересчитать эмбеддинги',
+  '/export — выгрузить свой мозг',
+  '/import (реплай на JSON) — залить мозг',
 ].join('\n');
 
-async function handle(chat, text, isGroup) {
+async function handle(chat, text, isGroup, replyTo) {
   const t = text.trim();
   const scope = scopeOf(chat, isGroup);
   const brain = getBrain(scope);
@@ -561,8 +546,7 @@ async function handle(chat, text, isGroup) {
     const slice = brain.pairs.slice(start, start + LIST_PAGE);
     let out = `Стр. ${page} из ${totalPages} (всего ${brain.pairs.length})\n\n`;
     for (let i = 0; i < slice.length; i++) {
-      const tag = slice[i].scope === SHARED_SCOPE ? ' [shared]' : '';
-      out += `${start + i + 1}. ${slice[i].question} = ${slice[i].answer}${tag}\n`;
+      out += `${start + i + 1}. ${slice[i].question} = ${slice[i].answer}\n`;
     }
     if (out.length > 3900) out = out.slice(0, 3900) + '...';
     return send(chat, out);
@@ -577,34 +561,77 @@ async function handle(chat, text, isGroup) {
     return send(chat, `${w} ↔ ${[...s].join(', ')}`);
   }
 
-  if (t.startsWith('/teach')) {
-    let rest = t.slice(6).trim();
-    let target = scope;
-    if (rest.startsWith('shared')) {
-      rest = rest.slice(6).trim();
-      target = SHARED_SCOPE;
-    }
-    const parts = rest.split('=');
-    if (parts.length < 2) return send(chat, 'Формат: /teach [shared] вопрос = ответ');
-    const q = parts[0].trim();
-    const a = parts.slice(1).join('=').trim();
-    if (!q || !a) return send(chat, 'Пусто.');
+  if (t === '/export') {
     await ensureLoaded(brain);
+    const data = {
+      scope,
+      exportedAt: new Date().toISOString(),
+      pairs: brain.pairs.filter(p => p.scope === scope).map(p => ({ q: p.question, a: p.answer })),
+      syn: [...brain.syn.entries()].filter(([, set]) => set.size).map(([w, set]) => ({ w, s: [...set] })),
+    };
+    const filename = `brain_${safeName(scope)}.json`;
+    try { await sendDocument(chat, filename, JSON.stringify(data, null, 2)); }
+    catch (e) { console.error('export', e.message); return send(chat, 'Ошибка экспорта.'); }
+    return;
+  }
+
+  if (t === '/import' || t.startsWith('/import')) {
+    if (!replyTo || !replyTo.document) return send(chat, 'Ответь /import на JSON-файл.');
     try {
-      await dbSavePair(target, q, a);
-      const key = lc(q);
-      const idx = brain.pairs.findIndex(p => p.scope === target && lc(p.question) === key);
-      const newPair = { question: q, answer: a, scope: target };
-      if (idx >= 0) brain.pairs[idx] = newPair;
-      else {
-        if (brain.pairs.length >= MAX_PAIRS) return send(chat, 'Слишком много пар.');
-        brain.pairs.push(newPair);
+      const content = await downloadFile(replyTo.document.file_id);
+      const data = JSON.parse(content);
+      const pairs = Array.isArray(data.pairs) ? data.pairs : [];
+      const syn = Array.isArray(data.syn) ? data.syn : [];
+      await ensureLoaded(brain);
+      let added = 0;
+      for (const p of pairs) {
+        if (!p || !p.q || !p.a) continue;
+        const key = lc(p.q);
+        const idx = brain.pairs.findIndex(x => lc(x.question) === key);
+        if (idx >= 0) continue;
+        await dbSavePair(scope, p.q, p.a);
+        brain.pairs.push({ question: p.q, answer: p.a, scope });
+        added++;
+      }
+      for (const item of syn) {
+        if (!item || !item.w || !Array.isArray(item.s)) continue;
+        const w = lc(item.w);
+        if (!brain.syn.has(w)) brain.syn.set(w, new Set());
+        const target = brain.syn.get(w);
+        for (const s of item.s) target.add(lc(s));
+        await dbSaveSyn(scope, w, target);
       }
       brain.dirty = true;
       rebuildEmbeddings(brain);
       reindexVectors(brain);
       await persistLocal(brain);
-      return send(chat, `Запомнил [${target}]: ${q} = ${a}`);
+      return send(chat, `Импортировано пар: ${added}, синонимов: ${syn.length}`);
+    } catch (e) {
+      console.error('import', e.message);
+      return send(chat, 'Ошибка импорта.');
+    }
+  }
+
+  if (t.startsWith('/teach')) {
+    const rest = t.slice(6).trim();
+    const parts = rest.split('=');
+    if (parts.length < 2) return send(chat, 'Формат: /teach вопрос = ответ');
+    const q = parts[0].trim();
+    const a = parts.slice(1).join('=').trim();
+    if (!q || !a) return send(chat, 'Пусто.');
+    await ensureLoaded(brain);
+    try {
+      await dbSavePair(scope, q, a);
+      const key = lc(q);
+      const idx = brain.pairs.findIndex(p => lc(p.question) === key);
+      const newPair = { question: q, answer: a, scope };
+      if (idx >= 0) brain.pairs[idx] = newPair;
+      else brain.pairs.push(newPair);
+      brain.dirty = true;
+      rebuildEmbeddings(brain);
+      reindexVectors(brain);
+      await persistLocal(brain);
+      return send(chat, `Запомнил: ${q} = ${a}`);
     } catch (e) {
       console.error('teach', e.message);
       return send(chat, 'Ошибка сохранения.');
@@ -616,10 +643,10 @@ async function handle(chat, text, isGroup) {
     if (!rest) return send(chat, 'Формат: /delete вопрос');
     await ensureLoaded(brain);
     const key = lc(rest);
-    const idx = brain.pairs.findIndex(p => lc(p.question) === key && (p.scope === scope || p.scope === SHARED_SCOPE));
+    const idx = brain.pairs.findIndex(p => lc(p.question) === key);
     if (idx < 0) return send(chat, `Не нашёл: ${key}`);
     try {
-      await dbDeletePair(brain.pairs[idx].scope, brain.pairs[idx].question);
+      await dbDeletePair(scope, brain.pairs[idx].question);
       brain.pairs.splice(idx, 1);
       brain.dirty = true;
       rebuildEmbeddings(brain);
@@ -633,14 +660,9 @@ async function handle(chat, text, isGroup) {
   }
 
   if (t.startsWith('/learn')) {
-    let rest = t.slice(6).trim();
-    let target = scope;
-    if (rest.startsWith('shared')) {
-      rest = rest.slice(6).trim();
-      target = SHARED_SCOPE;
-    }
+    const rest = t.slice(6).trim();
     const parts = rest.split('=');
-    if (parts.length < 2) return send(chat, 'Формат: /learn [shared] слово = синоним1, синоним2');
+    if (parts.length < 2) return send(chat, 'Формат: /learn слово = синоним1, синоним2');
     const main = lc(parts[0].trim());
     const others = parts[1].split(',').map(s => lc(s.trim())).filter(Boolean);
     if (!main || !others.length) return send(chat, 'Пусто.');
@@ -648,20 +670,19 @@ async function handle(chat, text, isGroup) {
     if (!brain.syn.has(main)) brain.syn.set(main, new Set());
     const sa = brain.syn.get(main);
     for (const o of others) {
-      if (sa.size < MAX_SYN) sa.add(o);
+      sa.add(o);
       if (!brain.syn.has(o)) brain.syn.set(o, new Set());
-      const sb = brain.syn.get(o);
-      if (sb.size < MAX_SYN) sb.add(main);
+      brain.syn.get(o).add(main);
     }
     try {
-      await dbSaveSyn(target, main, sa);
+      await dbSaveSyn(scope, main, sa);
       for (const o of others) {
         const s = brain.syn.get(o);
-        if (s) await dbSaveSyn(target, o, s);
+        if (s) await dbSaveSyn(scope, o, s);
       }
       reindexVectors(brain);
       await persistLocal(brain);
-      return send(chat, `Связал [${target}]: ${main} ↔ ${others.join(', ')}`);
+      return send(chat, `Связал: ${main} ↔ ${others.join(', ')}`);
     } catch (e) {
       console.error('learn', e.message);
       return send(chat, 'Ошибка сохранения.');
@@ -707,7 +728,7 @@ async function poll() {
           const m = u.message;
           if (!m || !m.text) continue;
           const isGroup = m.chat.type === 'group' || m.chat.type === 'supergroup';
-          try { await handle(m.chat.id, m.text, isGroup); }
+          try { await handle(m.chat.id, m.text, isGroup, m.reply_to_message); }
           catch (e) { console.error('handle', e.message); }
         }
       }
@@ -721,7 +742,7 @@ async function poll() {
 async function start() {
   if (!BOT_TOKEN) { console.error('BOT_TOKEN not set'); process.exit(1); }
   if (!APP_ID || !MASTER_KEY) { console.error('B4A keys not set'); process.exit(1); }
-  console.log('Pure-JS bot without SDK started');
+  console.log('Bot started');
   poll();
 }
 
