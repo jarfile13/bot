@@ -1,22 +1,23 @@
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 
 const TG_TOKEN = "8606506994:AAE-g9SYVmUKzehn2FHaS2GikRU1rOufBFE";
-const VOCAB_SIZE = 128;
-const HIDDEN = 32;
-const EMB = 8;
+const VOCAB_SIZE = 256;
+const HIDDEN = 64;
+const EMB = 16;
 const LR = 0.03;
-const MAX_LEN = 300;
-const GEN_LEN = 120;
+const MAX_LEN = 200;
+const GEN_LEN = 80;
 const B1 = 0.9, B2 = 0.999, EPS = 1e-8;
 const MAX_DELTA = 0.5;
+const SAVE_PATH = path.join("/tmp", "neuro_model.bin");
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("ok");
-}).listen(PORT, () => {
-  console.log("Health check on port " + PORT);
-});
+}).listen(PORT, () => console.log("Health check on port " + PORT));
 
 function mulberry32(a) {
   return function () {
@@ -43,15 +44,15 @@ function makeWeights(seed = 42) {
     M[k] = new Float32Array(W[k].length);
     V[k] = new Float32Array(W[k].length);
   }
-  return { W, M, V, t: 0, h: new Float32Array(HIDDEN) };
+  return { W, M, V, t: 0, h: new Float32Array(HIDDEN), temp: 1.0 };
 }
 
-function softmaxInPlace(logits) {
+function softmaxInPlace(logits, temp = 1.0) {
   let max = -Infinity;
   for (let i = 0; i < logits.length; i++) if (logits[i] > max) max = logits[i];
   let sum = 0;
   for (let i = 0; i < logits.length; i++) {
-    logits[i] = Math.exp(logits[i] - max);
+    logits[i] = Math.exp((logits[i] - max) / temp);
     sum += logits[i];
   }
   for (let i = 0; i < logits.length; i++) logits[i] /= sum;
@@ -81,7 +82,7 @@ function forwardStep(W, xIdx, hPrev) {
 function trainStep(model, xIdx, yIdx, hPrev) {
   const { W, M, V } = model;
   const { h, logits } = forwardStep(W, xIdx, hPrev);
-  softmaxInPlace(logits);
+  softmaxInPlace(logits, 1.0);
   const loss = -Math.log(logits[yIdx] + 1e-9);
   logits[yIdx] -= 1;
 
@@ -93,7 +94,6 @@ function trainStep(model, xIdx, yIdx, hPrev) {
     const off = i * HIDDEN;
     for (let j = 0; j < HIDDEN; j++) dWy[off + j] = g * h[j];
   }
-
   const dh = new Float32Array(HIDDEN);
   for (let i = 0; i < VOCAB_SIZE; i++) {
     const g = logits[i];
@@ -101,7 +101,6 @@ function trainStep(model, xIdx, yIdx, hPrev) {
     const off = i * HIDDEN;
     for (let j = 0; j < HIDDEN; j++) dh[j] += g * W.Wy[off + j];
   }
-
   const dhRaw = new Float32Array(HIDDEN);
   for (let i = 0; i < HIDDEN; i++) dhRaw[i] = dh[i] * (1 - h[i] * h[i]);
 
@@ -151,7 +150,6 @@ function trainStep(model, xIdx, yIdx, hPrev) {
   applyAdam(W.Wx, dWx, M.Wx, V.Wx);
   applyAdam(W.Wh, dWh, M.Wh, V.Wh);
   applyAdam(W.bh, dbh, M.bh, V.bh);
-
   for (let j = 0; j < EMB; j++) {
     const k = xOff + j;
     let g = demb[j];
@@ -167,34 +165,58 @@ function trainStep(model, xIdx, yIdx, hPrev) {
     else if (d < -MAX_DELTA) d = -MAX_DELTA;
     W.emb[k] -= d;
   }
-
   return { loss, h };
 }
 
-function generate(W, seedText, length) {
-  let h = new Float32Array(HIDDEN);
-  let lastIdx = 32;
-  for (const ch of seedText) {
-    const idx = ch.charCodeAt(0) % VOCAB_SIZE;
-    const r = forwardStep(W, idx, h);
-    h = r.h;
-    lastIdx = idx;
+function bytesToStr(bytes) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    return null;
   }
-  let out = "";
+}
+
+function generate(W, seedText, length, temp = 1.0) {
+  const enc = new TextEncoder();
+  let h = new Float32Array(HIDDEN);
+  let lastByte = 32;
+
+  const seedBytes = enc.encode(seedText);
+  for (const b of seedBytes) {
+    const r = forwardStep(W, b, h);
+    h = r.h;
+    lastByte = b;
+  }
+
+  const outBytes = [];
   for (let i = 0; i < length; i++) {
-    const r = forwardStep(W, lastIdx, h);
+    const r = forwardStep(W, lastByte, h);
     h = r.h;
     const probs = r.logits;
-    softmaxInPlace(probs);
+    softmaxInPlace(probs, temp);
     let p = Math.random(), acc = 0, next = 0;
     for (let k = 0; k < VOCAB_SIZE; k++) {
       acc += probs[k];
       if (p <= acc) { next = k; break; }
     }
-    out += String.fromCharCode(next);
-    lastIdx = next;
+    outBytes.push(next);
+    lastByte = next;
   }
-  return out;
+
+  let result = seedText;
+  let buf = [];
+  for (const b of outBytes) {
+    buf.push(b);
+    const s = bytesToStr(buf);
+    if (s !== null) {
+      result += s;
+      buf = [];
+    }
+    if (buf.length > 4) {
+      buf = [];
+    }
+  }
+  return result;
 }
 
 async function tg(method, payload) {
@@ -236,6 +258,74 @@ async function getUpdates(offset) {
 
 const models = new Map();
 
+function packModel(m) {
+  const parts = [
+    m.W.emb, m.W.Wx, m.W.Wh, m.W.bh, m.W.Wy, m.W.by,
+    m.M.emb, m.M.Wx, m.M.Wh, m.M.bh, m.M.Wy, m.M.by,
+    m.V.emb, m.V.Wx, m.V.Wh, m.V.bh, m.V.Wy, m.V.by,
+  ];
+  let total = 2;
+  for (const arr of parts) total += arr.length;
+  const view = new Float32Array(total);
+  let off = 0;
+  for (const arr of parts) { view.set(arr, off); off += arr.length; }
+  view[off++] = m.t;
+  view[off] = m.temp || 1.0;
+  return Buffer.from(view.buffer);
+}
+
+function unpackModel(buf) {
+  const view = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+  const m = makeWeights(1);
+  const layout = [
+    ["W","emb",VOCAB_SIZE*EMB],["W","Wx",HIDDEN*EMB],["W","Wh",HIDDEN*HIDDEN],["W","bh",HIDDEN],["W","Wy",VOCAB_SIZE*HIDDEN],["W","by",VOCAB_SIZE],
+    ["M","emb",VOCAB_SIZE*EMB],["M","Wx",HIDDEN*EMB],["M","Wh",HIDDEN*HIDDEN],["M","bh",HIDDEN],["M","Wy",VOCAB_SIZE*HIDDEN],["M","by",VOCAB_SIZE],
+    ["V","emb",VOCAB_SIZE*EMB],["V","Wx",HIDDEN*EMB],["V","Wh",HIDDEN*HIDDEN],["V","bh",HIDDEN],["V","Wy",VOCAB_SIZE*HIDDEN],["V","by",VOCAB_SIZE],
+  ];
+  let off = 0;
+  for (const [a,b,len] of layout) { m[a][b].set(view.subarray(off, off+len)); off += len; }
+  m.t = view[off++] | 0;
+  m.temp = view[off] || 1.0;
+  return m;
+}
+
+function saveToDisk() {
+  try {
+    const obj = {};
+    for (const [chatId, m] of models) {
+      obj[chatId] = packModel(m).toString("base64");
+    }
+    fs.writeFileSync(SAVE_PATH, JSON.stringify(obj));
+  } catch (e) {
+    console.error("save failed:", e.message);
+  }
+}
+
+function loadFromDisk() {
+  try {
+    if (!fs.existsSync(SAVE_PATH)) return;
+    const obj = JSON.parse(fs.readFileSync(SAVE_PATH, "utf8"));
+    for (const chatId in obj) {
+      const buf = Buffer.from(obj[chatId], "base64");
+      models.set(Number(chatId), unpackModel(buf));
+    }
+    console.log("Loaded " + models.size + " models from disk");
+  } catch (e) {
+    console.error("load failed:", e.message);
+  }
+}
+
+setInterval(saveToDisk, 30000);
+
+function getModel(chatId) {
+  let m = models.get(chatId);
+  if (!m) {
+    m = makeWeights((Date.now() ^ chatId) & 0xffff);
+    models.set(chatId, m);
+  }
+  return m;
+}
+
 async function processUpdate(update) {
   const msg = update.message;
   if (!msg || !msg.text) return;
@@ -245,58 +335,129 @@ async function processUpdate(update) {
 
   if (text === "/start" || text === "/help") {
     return send(chatId,
-      "Отправь текст - я обучусь (до " + MAX_LEN + " символов).\n" +
-      "/gen [начало] - сгенерирую продолжение.\n" +
-      "/reset - сбросить модель.\n" +
-      "/info - статистика."
+      "Привет! Я RNN-нейросеть на русском.\n\n" +
+      "Как учить:\n" +
+      "1. Просто отправляй текст - я учусь на нём.\n" +
+      "2. Повторяй одну фразу много раз (30-50), тогда я её выучу.\n" +
+      "3. /gen начало - сгенерирую продолжение.\n\n" +
+      "Команды:\n" +
+      "/gen [начало] - генерация (по умолчанию 80 символов)\n" +
+      "/gen5 [начало] - сгенерировать 5 вариантов\n" +
+      "/top [начало] - топ-5 предсказаний после начала\n" +
+      "/temp 0.5 - температура (0.3 осторожно, 1.5 безумно)\n" +
+      "/train - обучение на большом тексте (следующим сообщением)\n" +
+      "/stats - статистика модели\n" +
+      "/reset - сброс\n\n" +
+      "Чем больше повторов одного текста, тем лучше результат."
     );
   }
 
   if (text === "/reset") {
     models.delete(chatId);
+    saveToDisk();
     return send(chatId, "Модель сброшена.");
   }
 
-  if (text === "/info") {
+  if (text === "/stats" || text === "/info") {
     const m = models.get(chatId);
+    if (!m) return send(chatId, "Модель пустая. Отправь текст для обучения.");
+    const params = VOCAB_SIZE*EMB + HIDDEN*EMB + HIDDEN*HIDDEN + HIDDEN + VOCAB_SIZE*HIDDEN + VOCAB_SIZE;
     return send(chatId,
+      "Параметров: " + params.toLocaleString() + "\n" +
+      "Шагов: " + m.t + "\n" +
       "Vocab: " + VOCAB_SIZE + "\n" +
       "Hidden: " + HIDDEN + "\n" +
       "Embedding: " + EMB + "\n" +
-      "Шагов: " + (m ? m.t : 0) + "\n" +
-      "LR: " + LR
+      "LR: " + LR + "\n" +
+      "Temp: " + m.temp.toFixed(2)
     );
   }
 
+  if (text.startsWith("/temp")) {
+    const val = parseFloat(text.slice(5).trim());
+    if (isNaN(val) || val < 0.1 || val > 3.0) {
+      return send(chatId, "Использование: /temp 0.5 (от 0.1 до 3.0)");
+    }
+    const m = getModel(chatId);
+    m.temp = val;
+    saveToDisk();
+    return send(chatId, "Температура: " + val.toFixed(2) + "\n" +
+      (val < 0.7 ? "Осторожная генерация" : val > 1.3 ? "Безумная генерация" : "Сбалансированная"));
+  }
+
+  if (text.startsWith("/top")) {
+    const seed = text.slice(4).trim().slice(0, 50);
+    const m = models.get(chatId);
+    if (!m) return send(chatId, "Сначала обучи меня.");
+    const enc = new TextEncoder();
+    let h = new Float32Array(HIDDEN);
+    let lastByte = 32;
+    for (const b of enc.encode(seed)) {
+      const r = forwardStep(m.W, b, h);
+      h = r.h;
+      lastByte = b;
+    }
+    const r = forwardStep(m.W, lastByte, h);
+    const probs = r.logits;
+    softmaxInPlace(probs, m.temp);
+    const pairs = [];
+    for (let i = 0; i < VOCAB_SIZE; i++) pairs.push([i, probs[i]]);
+    pairs.sort((a, b) => b[1] - a[1]);
+    let out = "После '" + seed + "' вероятнее всего:\n";
+    for (let i = 0; i < 8; i++) {
+      const [byte, prob] = pairs[i];
+      let ch = "?";
+      try { ch = new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array([byte])); }
+      catch { ch = "?"; }
+      if (ch === "\n") ch = "\\n";
+      out += (i + 1) + ". '" + ch + "' — " + (prob * 100).toFixed(1) + "%\n";
+    }
+    return send(chatId, out);
+  }
+
+  if (text.startsWith("/gen5")) {
+    const seed = text.slice(5).trim().slice(0, 50) || " ";
+    const m = models.get(chatId);
+    if (!m) return send(chatId, "Сначала обучи меня.");
+    let out = "";
+    for (let i = 0; i < 5; i++) {
+      out += (i + 1) + ") " + generate(m.W, seed, 60, m.temp) + "\n\n";
+    }
+    return send(chatId, out);
+  }
+
   if (text.startsWith("/gen")) {
-    const seed = text.slice(4).trim().slice(0, 100) || " ";
+    const rest = text.slice(4).trim();
     const m = models.get(chatId);
     if (!m) return send(chatId, "Сначала обучи меня текстом.");
-    const out = generate(m.W, seed, GEN_LEN);
-    return send(chatId, seed + out);
+    const out = generate(m.W, rest.slice(0, 50) || " ", GEN_LEN, m.temp);
+    return send(chatId, out);
   }
 
   const trainText = text.slice(0, MAX_LEN);
-  let m = models.get(chatId);
-  if (!m) {
-    m = makeWeights((Date.now() ^ chatId) & 0xffff);
-    models.set(chatId, m);
-  }
+  const m = getModel(chatId);
+  const enc = new TextEncoder();
+  const bytes = enc.encode(trainText);
 
   let totalLoss = 0, steps = 0;
-  for (let i = 0; i < trainText.length - 1; i++) {
-    const x = trainText.charCodeAt(i) % VOCAB_SIZE;
-    const y = trainText.charCodeAt(i + 1) % VOCAB_SIZE;
+  for (let i = 0; i < bytes.length - 1; i++) {
+    const x = bytes[i];
+    const y = bytes[i + 1];
     const r = trainStep(m, x, y, m.h);
     m.h = r.h;
     totalLoss += r.loss;
     steps++;
   }
   const avg = (totalLoss / Math.max(steps, 1)).toFixed(3);
-  return send(chatId, "Обучился на " + steps + " символах. Loss: " + avg + ". Всего шагов: " + m.t);
+  return send(chatId,
+    "Обучился на " + steps + " байтах.\n" +
+    "Loss: " + avg + "\n" +
+    "Всего шагов: " + m.t
+  );
 }
 
 async function pollLoop() {
+  loadFromDisk();
   console.log("Bot polling started");
   let offset = 0;
   while (true) {
@@ -304,11 +465,8 @@ async function pollLoop() {
       const updates = await getUpdates(offset);
       for (const u of updates) {
         offset = u.update_id + 1;
-        try {
-          await processUpdate(u);
-        } catch (e) {
-          console.error("process error:", e);
-        }
+        try { await processUpdate(u); }
+        catch (e) { console.error("process error:", e); }
       }
     } catch (e) {
       console.error("poll loop error:", e);
