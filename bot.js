@@ -95,6 +95,45 @@ function expand(brain, word) {
   return out;
 }
 
+function buildSynGroups(brain) {
+  const parent = new Map();
+  const find = (x) => {
+    if (!parent.has(x)) parent.set(x, x);
+    let r = x;
+    while (parent.get(r) !== r) r = parent.get(r);
+    while (parent.get(x) !== r) { const n = parent.get(x); parent.set(x, r); x = n; }
+    return r;
+  };
+  const union = (a, b) => {
+    const ra = find(a), rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  };
+
+  for (const [w, set] of brain.syn) {
+    find(w);
+    for (const s of set) {
+      find(s);
+      union(w, s);
+    }
+  }
+
+  const clusters = new Map();
+  for (const w of parent.keys()) {
+    const r = find(w);
+    if (!clusters.has(r)) clusters.set(r, []);
+    clusters.get(r).push(w);
+  }
+
+  const groups = [];
+  for (const [, members] of clusters) {
+    if (members.length < 2) continue;
+    const sorted = members.slice().sort((a, b) => a.length - b.length || a.localeCompare(b));
+    const main = sorted[0];
+    groups.push({ main, members: members.slice().sort() });
+  }
+  return groups;
+}
+
 function buildVocab(brain) {
   const df = new Map();
   for (const p of brain.pairs) {
@@ -574,15 +613,15 @@ async function handle(chat, text, isGroup, replyTo) {
 
       if (arg && !/^\d+$/.test(arg)) {
         const w = lc(arg);
-        const s = brain.syn.get(w);
-        if (!s || !s.size) return send(chat, `У "${w}" нет синонимов.`);
-        return send(chat, `${w} ↔ ${[...s].join(', ')}`);
+        const group = buildSynGroups(brain).find(g => g.members.includes(w));
+        if (!group) return send(chat, `У "${w}" нет синонимов.`);
+        return send(chat, `${group.main} = ${group.members.filter(m => m !== group.main).join(', ')}`);
       }
 
-      const entries = [...brain.syn.entries()].filter(([, set]) => set.size);
-      if (!entries.length) return send(chat, 'Синонимов нет.');
-      entries.sort((a, b) => a[0].localeCompare(b[0]));
-      const totalPages = Math.max(1, Math.ceil(entries.length / LIST_PAGE));
+      const groups = buildSynGroups(brain);
+      if (!groups.length) return send(chat, 'Синонимов нет.');
+      groups.sort((a, b) => a.main.localeCompare(b.main));
+      const totalPages = Math.max(1, Math.ceil(groups.length / LIST_PAGE));
       let page = 1;
       if (arg) {
         const n = parseInt(arg, 10);
@@ -590,10 +629,10 @@ async function handle(chat, text, isGroup, replyTo) {
         page = Math.min(n, totalPages);
       }
       const start = (page - 1) * LIST_PAGE;
-      const slice = entries.slice(start, start + LIST_PAGE);
-      let out = `Синонимы. Стр. ${page} из ${totalPages} (всего ${entries.length})\n\n`;
+      const slice = groups.slice(start, start + LIST_PAGE);
+      let out = `Синонимы. Стр. ${page} из ${totalPages} (всего ${groups.length} групп)\n\n`;
       for (let i = 0; i < slice.length; i++) {
-        out += `${start + i + 1}. ${slice[i][0]} ↔ ${[...slice[i][1]].join(', ')}\n`;
+        out += `${start + i + 1}. ${slice[i].main} = ${slice[i].members.filter(m => m !== slice[i].main).join(', ')}\n`;
       }
       if (out.length > 3900) out = out.slice(0, 3900) + '...';
       return send(chat, out);
