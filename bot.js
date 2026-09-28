@@ -502,8 +502,9 @@ const HELP = [
   '/learn слово = синоним1, синоним2',
   '/delete вопрос',
   '/forget слово = синоним',
-  '/list [стр]',
-  '/synonyms слово',
+  '/list [стр] — список пар',
+  '/syn [стр] — список синонимов',
+  '/syn слово — синонимы конкретного слова',
   '/stats',
   '/reindex — пересчитать эмбеддинги',
   '/export — выгрузить свой мозг',
@@ -552,13 +553,35 @@ async function handle(chat, text, isGroup, replyTo) {
     return send(chat, out);
   }
 
-  if (t === '/synonyms' || t.startsWith('/synonyms ')) {
+  if (t === '/syn' || t.startsWith('/syn ')) {
     await ensureLoaded(brain);
-    const w = lc(t.slice(9).trim());
-    if (!w) return send(chat, 'Формат: /synonyms слово');
-    const s = brain.syn.get(w);
-    if (!s || !s.size) return send(chat, `У "${w}" нет синонимов.`);
-    return send(chat, `${w} ↔ ${[...s].join(', ')}`);
+    const arg = t.slice(4).trim();
+
+    if (arg && !/^\d+$/.test(arg)) {
+      const w = lc(arg);
+      const s = brain.syn.get(w);
+      if (!s || !s.size) return send(chat, `У "${w}" нет синонимов.`);
+      return send(chat, `${w} ↔ ${[...s].join(', ')}`);
+    }
+
+    const entries = [...brain.syn.entries()].filter(([, set]) => set.size);
+    if (!entries.length) return send(chat, 'Синонимов нет.');
+    entries.sort((a, b) => a[0].localeCompare(b[0]));
+    const totalPages = Math.max(1, Math.ceil(entries.length / LIST_PAGE));
+    let page = 1;
+    if (arg) {
+      const n = parseInt(arg, 10);
+      if (!Number.isFinite(n) || n < 1) return send(chat, `Всего страниц: ${totalPages}`);
+      page = Math.min(n, totalPages);
+    }
+    const start = (page - 1) * LIST_PAGE;
+    const slice = entries.slice(start, start + LIST_PAGE);
+    let out = `Синонимы. Стр. ${page} из ${totalPages} (всего ${entries.length})\n\n`;
+    for (let i = 0; i < slice.length; i++) {
+      out += `${start + i + 1}. ${slice[i][0]} ↔ ${[...slice[i][1]].join(', ')}\n`;
+    }
+    if (out.length > 3900) out = out.slice(0, 3900) + '...';
+    return send(chat, out);
   }
 
   if (t === '/export') {
