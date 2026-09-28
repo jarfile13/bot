@@ -1,1 +1,8 @@
-
+{
+  "name": "tg-ai-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "dependencies": {
+    "parse": "^5.0.0"
+  }
+}
