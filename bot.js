@@ -486,3 +486,5 @@ async function start() {
     console.error('start error:', e.message);
   }
 }
+
+start();
