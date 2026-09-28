@@ -1,6 +1,14 @@
 const https = require('https');
+const Parse = require('parse/node');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
+
+const APP_ID = process.env.B4A_APP_ID;
+const JS_KEY = process.env.B4A_JS_KEY;
+const MASTER_KEY = process.env.B4A_MASTER_KEY;
+
+Parse.initialize(APP_ID, JS_KEY, MASTER_KEY);
+Parse.serverURL = 'https://parseapi.back4app.com/';
 
 const MAX_NEIGHBORS = 20;
 const DECAY_THRESHOLD = 0.05;
@@ -67,10 +75,10 @@ function indexWord(word, pairIndex) {
   wordToPairs.get(word).add(pairIndex);
 }
 
-function teach(question, answer) {
+function teachGraph(question, answer) {
   const qw = words(question);
   const aw = words(answer);
-  if (!qw.length || !aw.length) return false;
+  if (!qw.length || !aw.length) return;
 
   for (const q of qw) {
     charge(q, 1.0);
@@ -81,25 +89,6 @@ function teach(question, answer) {
     for (let j = i + 1; j < qw.length; j++) link(qw[i], qw[j], 0.5);
   for (let i = 0; i < aw.length; i++)
     for (let j = i + 1; j < aw.length; j++) link(aw[i], aw[j], 0.5);
-
-  const existing = pairs.findIndex((p) => lc(p.question) === lc(question));
-  let idx;
-  if (existing >= 0) {
-    pairs[existing] = { question, answer };
-    idx = existing;
-  } else {
-    pairs.push({ question, answer });
-    idx = pairs.length - 1;
-  }
-
-  for (const q of qw) indexWord(q, idx);
-
-  teachesSinceDecay++;
-  if (teachesSinceDecay >= DECAY_EVERY) {
-    decay();
-    teachesSinceDecay = 0;
-  }
-  return true;
 }
 
 function decay() {
@@ -224,19 +213,56 @@ function answerFor(input) {
   return null;
 }
 
-function reinforce(pair, positive) {
-  const qw = words(pair.question);
-  const aw = words(pair.answer);
-  const factor = positive ? 1.15 : 0.85;
-  for (const q of qw) {
-    ensureNode(q);
-    nodes.set(q, Math.min(1, nodes.get(q) * factor));
-    const ea = edges.get(q);
-    if (!ea) continue;
-    for (const a of aw) {
-      if (ea.has(a)) ea.set(a, Math.min(1, ea.get(a) * factor));
+async function savePairToDb(question, answer) {
+  const Knowledge = Parse.Object.extend('Knowledge');
+  const query = new Parse.Query(Knowledge);
+  query.equalTo('question', lc(question));
+  let obj = await query.first({ useMasterKey: true });
+
+  if (!obj) {
+    obj = new Knowledge();
+    obj.set('question', lc(question));
+  }
+  obj.set('answer', answer);
+  obj.set('originalQuestion', question);
+  return obj.save(null, { useMasterKey: true });
+}
+
+async function deletePairFromDb(question) {
+  const Knowledge = Parse.Object.extend('Knowledge');
+  const query = new Parse.Query(Knowledge);
+  query.equalTo('question', lc(question));
+  const obj = await query.first({ useMasterKey: true });
+  if (obj) await obj.destroy({ useMasterKey: true });
+}
+
+async function loadAllFromDb() {
+  const Knowledge = Parse.Object.extend('Knowledge');
+  const query = new Parse.Query(Knowledge);
+  query.limit(10000);
+  const results = await query.find({ useMasterKey: true });
+  return results.map((r) => ({
+    id: r.id,
+    question: r.get('originalQuestion') || r.get('question'),
+    answer: r.get('answer'),
+  }));
+}
+
+async function rebuildFromDb() {
+  pairs.length = 0;
+  wordToPairs.clear();
+
+  const dbPairs = await loadAllFromDb();
+  for (let i = 0; i < dbPairs.length; i++) {
+    const p = dbPairs[i];
+    pairs.push({ question: p.question, answer: p.answer });
+    const qw = words(p.question);
+    for (const q of qw) {
+      indexWord(q, i);
+      teachGraph(p.question, p.answer);
     }
   }
+  console.log('Loaded from DB:', pairs.length, 'pairs');
 }
 
 function api(method, payload) {
@@ -285,11 +311,10 @@ const HELP = [
   '/delete вопрос - забыть',
   '/list - что знаю',
   '/stats - статистика',
-  '/save - сколько сейчас в памяти',
   '+ - ответ понравился',
   '- - ответ не понравился',
   '',
-  'Бот сам сближает похожие слова, учить можно без ограничений.',
+  'Данные хранятся в Back4App, перезапуск не страшен.',
 ].join('\n');
 
 async function handle(chatId, text) {
@@ -300,11 +325,11 @@ async function handle(chatId, text) {
     return;
   }
 
-  if (t === '/stats' || t === '/save') {
+  if (t === '/stats') {
     const totalEdges = [...edges.values()].reduce((s, m) => s + m.size, 0) / 2;
     await send(
       chatId,
-      `Пар: ${pairs.length}\nСлов: ${nodes.size}\nСвязей: ${Math.floor(totalEdges)}\nИндекс: ${wordToPairs.size} слов`
+      `Пар: ${pairs.length}\nСлов: ${nodes.size}\nСвязей: ${Math.floor(totalEdges)}`
     );
     return;
   }
@@ -340,8 +365,31 @@ async function handle(chatId, text) {
       await send(chatId, 'Пусто.');
       return;
     }
-    teach(q, a);
-    await send(chatId, `Запомнил: ${q} = ${a}`);
+    try {
+      await savePairToDb(q, a);
+
+      const existingIdx = pairs.findIndex((p) => lc(p.question) === lc(q));
+      if (existingIdx >= 0) {
+        pairs[existingIdx] = { question: q, answer: a };
+      } else {
+        pairs.push({ question: q, answer: a });
+      }
+      teachGraph(q, a);
+
+      const idx = pairs.length - 1;
+      for (const w of words(q)) indexWord(w, idx);
+
+      teachesSinceDecay++;
+      if (teachesSinceDecay >= DECAY_EVERY) {
+        decay();
+        teachesSinceDecay = 0;
+      }
+
+      await send(chatId, `Запомнил: ${q} = ${a}`);
+    } catch (e) {
+      console.error('teach error:', e.message);
+      await send(chatId, 'Ошибка сохранения в базу.');
+    }
     return;
   }
 
@@ -354,22 +402,15 @@ async function handle(chatId, text) {
     const key = lc(rest);
     const idx = pairs.findIndex((p) => lc(p.question) === key);
     if (idx >= 0) {
-      const removed = pairs.splice(idx, 1)[0];
-      for (const w of words(removed.question)) {
-        const s = wordToPairs.get(w);
-        if (s) {
-          s.delete(idx);
-          if (!s.size) wordToPairs.delete(w);
-        }
+      try {
+        await deletePairFromDb(pairs[idx].question);
+        pairs.splice(idx, 1);
+        await rebuildFromDb();
+        await send(chatId, `Удалил: ${rest}`);
+      } catch (e) {
+        console.error('delete error:', e.message);
+        await send(chatId, 'Ошибка удаления.');
       }
-      await send(chatId, `Удалил: ${removed.question}`);
-      return;
-    }
-    const res = answerFor(rest);
-    if (res && res.score >= 0.6) {
-      const rmIdx = pairs.indexOf(res.pair);
-      if (rmIdx >= 0) pairs.splice(rmIdx, 1);
-      await send(chatId, `Удалил: ${res.pair.question}`);
       return;
     }
     await send(chatId, `Не нашёл: ${key}`);
@@ -377,13 +418,7 @@ async function handle(chatId, text) {
   }
 
   if (t === '+' || t === '-') {
-    const last = lastPairForChat.get(chatId);
-    if (!last) {
-      await send(chatId, 'Нет последнего ответа.');
-      return;
-    }
-    reinforce(last, t === '+');
-    await send(chatId, t === '+' ? 'Усилил.' : 'Ослабил.');
+    await send(chatId, 'Обратная связь работает только в памяти, при рестарте сбросится.');
     return;
   }
 
@@ -415,15 +450,39 @@ async function poll() {
   }
 }
 
-if (!BOT_TOKEN) {
-  console.error('BOT_TOKEN not set');
-  process.exit(1);
+async function start() {
+  if (!BOT_TOKEN) {
+    console.error('BOT_TOKEN not set');
+    process.exit(1);
+  }
+  if (!APP_ID || !JS_KEY || !MASTER_KEY) {
+    console.error('Back4App keys not set');
+    process.exit(1);
+  }
+
+  try {
+    await rebuildFromDb();
+
+    if (pairs.length === 0) {
+      console.log('Empty DB, seeding...');
+      const seeds = [
+        ['привет', 'Здорово друг'],
+        ['здравствуй', 'Здорово друг'],
+        ['как дела', 'Отлично а у тебя'],
+        ['пока', 'До встречи'],
+      ];
+      for (const [q, a] of seeds) {
+        await savePairToDb(q, a);
+      }
+      await rebuildFromDb();
+    }
+
+    console.log('Bot started');
+    poll();
+  } catch (e) {
+    console.error('start error:', e.message);
+    process.exit(1);
+  }
 }
 
-teach('привет', 'Здорово друг');
-teach('здравствуй', 'Здорово друг');
-teach('как дела', 'Отлично а у тебя');
-teach('пока', 'До встречи');
-
-console.log('Bot started');
-poll();
+start();
