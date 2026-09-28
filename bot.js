@@ -7,11 +7,15 @@ const APP_ID = process.env.B4A_APP_ID;
 const JS_KEY = process.env.B4A_JS_KEY;
 const MASTER_KEY = process.env.B4A_MASTER_KEY;
 
-const MIN_SCORE = 0.35;
-const MIN_SINGLE_LEN = 5;
-const MIN_IDF_FOR_INPUT = 0.8;
+const BM25_K1 = 1.5;
+const BM25_B = 0.6;
+const MIN_SCORE = 0.6;
+const MIN_MARGIN = 0.15;
+const MIN_COVERAGE = 0.34;
+const MIN_SINGLE_LEN = 2;
 const MAX_PAIRS = 20000;
 const CACHE_LIMIT = 500;
+const CANDIDATE_LIMIT = 800;
 
 const healthServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -27,16 +31,39 @@ const wordToPairs = new Map();
 const docFreq = new Map();
 const byLen = new Map();
 const vocab = new Set();
-const answerCache = new Map();
+const cache = new Map();
 
+let totalDocLen = 0;
 let offset = 0;
+let cacheHits = 0;
+let cacheMiss = 0;
+
+const SUFFIXES = [
+  'иями','ями','ами','ией','иях','ях','ов','ев','ий','ый','ой','ая','ое','ые','ыми','ими',
+  'ешь','ишь','ете','ите','ешься','ишься','ется','ится','ются','атся','ться','тся',
+  'ого','его','ому','ему','ыми','ими','ать','ять','еть','ить','ыть','уть',
+  'ах','ях','ам','ям','ом','ем','ой','ей','ую','юю','ии','ия','ие','ые','ая','яя',
+  'ть','ся','ла','ло','ли','ны','на','но','ет','ут','ют','ат','ят','ал','ил','ел',
+  'а','я','у','ю','о','е','ы','и','й','ь'
+];
 
 function lc(s) {
   return String(s)
     .toLowerCase()
+    .replace(/ё/g, 'е')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function stem(w) {
+  if (w.length <= 3) return w;
+  for (const suf of SUFFIXES) {
+    if (w.length - suf.length >= 3 && w.endsWith(suf)) {
+      return w.slice(0, w.length - suf.length);
+    }
+  }
+  return w;
 }
 
 function words(s) {
@@ -44,7 +71,17 @@ function words(s) {
   if (!n) return [];
   const out = [];
   for (const w of n.split(' ')) {
-    if (w.length > 1) out.push(w);
+    if (w.length > 0) out.push(w);
+  }
+  return out;
+}
+
+function terms(text) {
+  const ws = words(text);
+  const out = [];
+  for (let i = 0; i < ws.length; i++) {
+    out.push(stem(ws[i]));
+    if (i + 1 < ws.length) out.push(stem(ws[i]) + '_' + stem(ws[i + 1]));
   }
   return out;
 }
@@ -63,8 +100,7 @@ function levenshtein(a, b) {
     const ca = a.charCodeAt(i - 1);
     for (let j = 1; j <= bl; j++) {
       const cost = ca === b.charCodeAt(j - 1) ? 0 : 1;
-      const v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
-      cur[j] = v;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
     }
     const t = prev; prev = cur; cur = t;
   }
@@ -80,159 +116,221 @@ function registerWord(w) {
 }
 
 function findClosestKnown(word) {
-  if (vocab.has(word)) return word;
+  if (vocab.has(word)) return { word, dist: 0 };
   if (word.length < 3) return null;
   let best = null;
   let bestDist = Infinity;
-  const maxDist = Math.max(1, Math.floor(word.length / 3));
+  const maxDist = word.length <= 5 ? 1 : word.length <= 8 ? 2 : 3;
   for (let len = word.length - 2; len <= word.length + 2; len++) {
     const bucket = byLen.get(len);
     if (!bucket) continue;
     for (const k of bucket) {
+      if (Math.abs(k.charCodeAt(0) - word.charCodeAt(0)) > 0 && k[0] !== word[0] && bestDist > 0) {
+        // быстрый префиксный отсев, но не блокируем полностью
+      }
       const d = levenshtein(word, k);
       if (d < bestDist) {
         bestDist = d;
         best = k;
-        if (d === 1) return best;
+        if (d === 1) return { word: best, dist: 1 };
       }
     }
   }
-  if (best && bestDist <= maxDist) return best;
+  if (best && bestDist <= maxDist) return { word: best, dist: bestDist };
   return null;
 }
 
-function tokenizeForIndex(text) {
-  const out = [];
-  for (const w of words(text)) {
-    const k = findClosestKnown(w);
-    out.push(k || w);
-  }
-  return out;
+function idf(term) {
+  const df = docFreq.get(term) || 0;
+  if (df === 0) return 0;
+  return Math.log(1 + (pairs.length - df + 0.5) / (df + 0.5));
 }
 
 function indexPair(idx, question) {
-  const qw = tokenizeForIndex(question);
+  const ts = terms(question);
+  pairs[idx].tokens = ts;
+  pairs[idx].len = ts.length;
+  totalDocLen += ts.length;
   const seen = new Set();
-  for (const w of qw) {
-    registerWord(w);
-    if (!wordToPairs.has(w)) wordToPairs.set(w, new Set());
-    wordToPairs.get(w).add(idx);
-    if (!seen.has(w)) {
-      seen.add(w);
-      docFreq.set(w, (docFreq.get(w) || 0) + 1);
+  for (const t of ts) {
+    registerWord(t);
+    if (!wordToPairs.has(t)) wordToPairs.set(t, new Set());
+    wordToPairs.get(t).add(idx);
+    if (!seen.has(t)) {
+      seen.add(t);
+      docFreq.set(t, (docFreq.get(t) || 0) + 1);
     }
   }
 }
 
-function removePairFromIndex(idx, question) {
-  const qw = tokenizeForIndex(question);
+function unindexPair(idx) {
+  const p = pairs[idx];
+  if (!p || !p.tokens) return;
+  totalDocLen -= p.len;
   const seen = new Set();
-  for (const w of qw) {
-    const s = wordToPairs.get(w);
+  for (const t of p.tokens) {
+    const s = wordToPairs.get(t);
     if (s) {
       s.delete(idx);
-      if (!s.size) wordToPairs.delete(w);
+      if (!s.size) wordToPairs.delete(t);
     }
-    if (!seen.has(w)) {
-      seen.add(w);
-      const df = (docFreq.get(w) || 0) - 1;
-      if (df <= 0) docFreq.delete(w);
-      else docFreq.set(w, df);
+    if (!seen.has(t)) {
+      seen.add(t);
+      const df = (docFreq.get(t) || 0) - 1;
+      if (df <= 0) docFreq.delete(t);
+      else docFreq.set(t, df);
     }
   }
+  p.tokens = null;
 }
 
-function idf(w) {
-  const df = docFreq.get(w) || 0;
-  if (df === 0) return 0;
-  return Math.log(1 + pairs.length / df);
+function avgDocLen() {
+  return pairs.length ? totalDocLen / pairs.length : 1;
 }
 
-function scorePair(inputTokens, pairIdx) {
+function scoreBM25(inputTerms, pairIdx) {
   const pair = pairs[pairIdx];
-  if (!pair) return 0;
-  const qTokens = pair.tokens;
-  if (!qTokens.length) return 0;
+  if (!pair || !pair.tokens) return { score: 0, matched: 0 };
 
   const qCount = new Map();
-  for (const t of qTokens) qCount.set(t, (qCount.get(t) || 0) + 1);
+  for (const t of inputTerms) qCount.set(t, (qCount.get(t) || 0) + 1);
 
-  const iCount = new Map();
-  for (const t of inputTokens) iCount.set(t, (iCount.get(t) || 0) + 1);
+  const docCount = new Map();
+  for (const t of pair.tokens) docCount.set(t, (docCount.get(t) || 0) + 1);
 
-  let dot = 0;
-  let qNorm = 0;
-  let iNorm = 0;
+  const avgdl = avgDocLen() || 1;
+  let score = 0;
+  let matched = 0;
 
   for (const [t, qc] of qCount) {
+    const f = docCount.get(t);
+    if (!f) continue;
+    matched++;
     const w = idf(t);
-    qNorm += (qc * w) * (qc * w);
-    const ic = iCount.get(t) || 0;
-    if (ic) dot += (qc * w) * (ic * w);
+    const denom = f + BM25_K1 * (1 - BM25_B + BM25_B * (pair.len / avgdl));
+    score += w * (f * (BM25_K1 + 1)) / denom * Math.min(qc, 2);
   }
-  for (const [t, ic] of iCount) {
-    const w = idf(t);
-    iNorm += (ic * w) * (ic * w);
+
+  const norm = Math.sqrt(inputTerms.length) || 1;
+  return { score: score / norm, matched };
+}
+
+function resolveInput(input) {
+  const rawTerms = terms(input);
+  if (!rawTerms.length) return null;
+
+  const resolved = [];
+  for (const t of rawTerms) {
+    if (vocab.has(t)) {
+      resolved.push({ term: t, penalty: 1 });
+      continue;
+    }
+    const hit = findClosestKnown(t);
+    if (hit) {
+      resolved.push({ term: hit.word, penalty: hit.dist === 0 ? 1 : hit.dist === 1 ? 0.85 : 0.7 });
+      continue;
+    }
+    if (t.includes('_')) {
+      const parts = t.split('_');
+      let ok = true;
+      const mapped = [];
+      for (const p of parts) {
+        if (vocab.has(p)) mapped.push(p);
+        else {
+          const h = findClosestKnown(p);
+          if (h) mapped.push(h.word);
+          else { ok = false; break; }
+        }
+      }
+      if (ok && mapped.length) {
+        resolved.push({ term: mapped.join('_'), penalty: 0.7 });
+        continue;
+      }
+    }
+    if (t.length >= MIN_SINGLE_LEN) {
+      resolved.push({ term: t, penalty: 0.4 });
+    }
   }
-  if (qNorm === 0 || iNorm === 0) return 0;
-  return dot / (Math.sqrt(qNorm) * Math.sqrt(iNorm));
+
+  return resolved.length ? resolved : null;
 }
 
 function answerFor(input) {
   if (!pairs.length) return null;
-  const cacheKey = lc(input);
-  if (answerCache.has(cacheKey)) return answerCache.get(cacheKey);
+  const key = lc(input);
 
-  const rawTokens = words(input);
-  if (!rawTokens.length) return null;
-  if (rawTokens.length === 1 && rawTokens[0].length < MIN_SINGLE_LEN) {
-    answerCache.set(cacheKey, null);
+  if (cache.has(key)) {
+    cacheHits++;
+    const v = cache.get(key);
+    cache.delete(key);
+    cache.set(key, v);
+    return v;
+  }
+  cacheMiss++;
+
+  const resolved = resolveInput(input);
+  if (!resolved) {
+    if (cache.size >= CACHE_LIMIT) cache.delete(cache.keys().next().value);
+    cache.set(key, null);
     return null;
   }
 
-  const inputTokens = [];
-  for (const w of rawTokens) {
-    const k = findClosestKnown(w);
-    const token = k || w;
-    if (idf(token) < MIN_IDF_FOR_INPUT) continue;
-    inputTokens.push(token);
-  }
-  if (!inputTokens.length) {
-    answerCache.set(cacheKey, null);
-    return null;
+  const inputTerms = resolved.map(r => r.term);
+  const penaltyMap = new Map();
+  for (const r of resolved) {
+    const prev = penaltyMap.get(r.term) || 0;
+    if (r.penalty > prev) penaltyMap.set(r.term, r.penalty);
   }
 
-  const candidateSet = new Set();
-  for (const t of inputTokens) {
+  const candidates = new Set();
+  for (const t of inputTerms) {
     const idxs = wordToPairs.get(t);
-    if (idxs) for (const i of idxs) candidateSet.add(i);
-    if (candidateSet.size > 500) break;
+    if (idxs) for (const i of idxs) {
+      candidates.add(i);
+      if (candidates.size > CANDIDATE_LIMIT) break;
+    }
+    if (candidates.size > CANDIDATE_LIMIT) break;
   }
-  if (!candidateSet.size) {
-    answerCache.set(cacheKey, null);
+
+  if (!candidates.size) {
+    if (cache.size >= CACHE_LIMIT) cache.delete(cache.keys().next().value);
+    cache.set(key, null);
     return null;
   }
 
-  let best = null;
-  let bestScore = 0;
-  for (const i of candidateSet) {
-    const s = scorePair(inputTokens, i);
-    if (s > bestScore) {
-      bestScore = s;
-      best = i;
+  const scored = [];
+  for (const i of candidates) {
+    const { score, matched } = scoreBM25(inputTerms, i);
+    if (score <= 0) continue;
+    const coverage = matched / inputTerms.length;
+    if (coverage < MIN_COVERAGE) continue;
+    let final = score;
+    for (const t of inputTerms) {
+      const p = penaltyMap.get(t);
+      if (p && p < 1) final *= p;
     }
+    scored.push({ idx: i, score: final, coverage });
   }
+
+  if (!scored.length) {
+    if (cache.size >= CACHE_LIMIT) cache.delete(cache.keys().next().value);
+    cache.set(key, null);
+    return null;
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0];
+  const second = scored[1];
 
   let result = null;
-  if (best !== null && bestScore >= MIN_SCORE) {
-    result = { pair: pairs[best], score: bestScore };
+  if (best.score >= MIN_SCORE && (!second || best.score - second.score >= MIN_MARGIN)) {
+    result = { pair: pairs[best.idx], score: best.score, coverage: best.coverage };
+  } else if (best.score >= MIN_SCORE && second && best.score - second.score < MIN_MARGIN) {
+    result = { ambiguous: scored.slice(0, 3).map(s => pairs[s.idx]) };
   }
 
-  if (answerCache.size >= CACHE_LIMIT) {
-    const firstKey = answerCache.keys().next().value;
-    answerCache.delete(firstKey);
-  }
-  answerCache.set(cacheKey, result);
+  if (cache.size >= CACHE_LIMIT) cache.delete(cache.keys().next().value);
+  cache.set(key, result);
   return result;
 }
 
@@ -271,36 +369,38 @@ async function loadAllFromDb() {
 }
 
 function addPair(q, a) {
-  const tokens = tokenizeForIndex(q);
   const idx = pairs.length;
-  pairs.push({ question: q, answer: a, tokens });
+  pairs.push({ question: q, answer: a, tokens: null, len: 0 });
   indexPair(idx, q);
   return idx;
 }
 
 function updatePair(idx, q, a) {
-  removePairFromIndex(idx, pairs[idx].question);
-  const tokens = tokenizeForIndex(q);
-  pairs[idx] = { question: q, answer: a, tokens };
+  unindexPair(idx);
+  pairs[idx].question = q;
+  pairs[idx].answer = a;
   indexPair(idx, q);
 }
 
-function reindexFrom(startIdx) {
-  for (let i = startIdx; i < pairs.length; i++) {
+function rebuildIndex() {
+  wordToPairs.clear();
+  docFreq.clear();
+  byLen.clear();
+  vocab.clear();
+  totalDocLen = 0;
+  cache.clear();
+  for (let i = 0; i < pairs.length; i++) {
+    pairs[i].tokens = null;
+    pairs[i].len = 0;
     indexPair(i, pairs[i].question);
   }
 }
 
 async function rebuildFromDb() {
   pairs.length = 0;
-  wordToPairs.clear();
-  docFreq.clear();
-  byLen.clear();
-  vocab.clear();
-  answerCache.clear();
-
   const dbPairs = await loadAllFromDb();
-  for (const p of dbPairs) addPair(p.question, p.answer);
+  for (const p of dbPairs) pairs.push({ question: p.question, answer: p.answer, tokens: null, len: 0 });
+  rebuildIndex();
   console.log('Loaded from DB:', pairs.length, 'pairs');
 }
 
@@ -364,9 +464,12 @@ async function handle(chatId, text) {
   }
 
   if (t === '/stats') {
+    const top = [...docFreq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
+      .map(([w, c]) => `${w}(${c})`).join(', ');
+    const hitRate = cacheHits + cacheMiss ? (cacheHits / (cacheHits + cacheMiss) * 100).toFixed(1) : '0.0';
     await send(
       chatId,
-      `Пар: ${pairs.length}\nСлов: ${vocab.size}\nКэш: ${answerCache.size}`
+      `Пар: ${pairs.length}\nСлов: ${vocab.size}\nСр.длина: ${avgDocLen().toFixed(1)}\nКэш: ${cache.size} (hit ${hitRate}%)\nТоп: ${top || '-'}`
     );
     return;
   }
@@ -415,7 +518,7 @@ async function handle(chatId, text) {
         }
         addPair(q, a);
       }
-      answerCache.clear();
+      cache.clear();
       await send(chatId, `Запомнил: ${q} = ${a}`);
     } catch (e) {
       console.error('teach error:', e.message);
@@ -438,12 +541,8 @@ async function handle(chatId, text) {
     }
     try {
       await deletePairFromDb(pairs[idx].question);
-      removePairFromIndex(idx, pairs[idx].question);
       pairs.splice(idx, 1);
-      wordToPairs.clear();
-      docFreq.clear();
-      for (let i = 0; i < pairs.length; i++) indexPair(i, pairs[i].question);
-      answerCache.clear();
+      rebuildIndex();
       await send(chatId, `Удалил: ${rest}`);
     } catch (e) {
       console.error('delete error:', e.message);
@@ -453,11 +552,16 @@ async function handle(chatId, text) {
   }
 
   const res = answerFor(t);
-  if (res) {
-    await send(chatId, res.pair.answer);
-  } else {
+  if (!res) {
     await send(chatId, 'Не знаю. Научи: /teach вопрос = ответ');
+    return;
   }
+  if (res.ambiguous) {
+    const opts = res.ambiguous.map((p, i) => `${i + 1}. ${p.answer}`).join('\n');
+    await send(chatId, `Уточни, я знаю несколько вариантов:\n${opts}`);
+    return;
+  }
+  await send(chatId, res.pair.answer);
 }
 
 async function poll() {
