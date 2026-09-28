@@ -1,4 +1,5 @@
 const https = require('https');
+const http = require('http');
 const Parse = require('parse/node');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -6,6 +7,14 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const APP_ID = process.env.B4A_APP_ID;
 const JS_KEY = process.env.B4A_JS_KEY;
 const MASTER_KEY = process.env.B4A_MASTER_KEY;
+
+const healthServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('OK');
+});
+healthServer.listen(3000, () => {
+  console.log('Health check server on port 3000');
+});
 
 Parse.initialize(APP_ID, JS_KEY, MASTER_KEY);
 Parse.serverURL = 'https://parseapi.back4app.com/';
@@ -251,16 +260,16 @@ async function loadAllFromDb() {
 async function rebuildFromDb() {
   pairs.length = 0;
   wordToPairs.clear();
+  nodes.clear();
+  edges.clear();
 
   const dbPairs = await loadAllFromDb();
   for (let i = 0; i < dbPairs.length; i++) {
     const p = dbPairs[i];
     pairs.push({ question: p.question, answer: p.answer });
+    teachGraph(p.question, p.answer);
     const qw = words(p.question);
-    for (const q of qw) {
-      indexWord(q, i);
-      teachGraph(p.question, p.answer);
-    }
+    for (const q of qw) indexWord(q, i);
   }
   console.log('Loaded from DB:', pairs.length, 'pairs');
 }
@@ -311,8 +320,6 @@ const HELP = [
   '/delete вопрос - забыть',
   '/list - что знаю',
   '/stats - статистика',
-  '+ - ответ понравился',
-  '- - ответ не понравился',
   '',
   'Данные хранятся в Back4App, перезапуск не страшен.',
 ].join('\n');
@@ -404,7 +411,6 @@ async function handle(chatId, text) {
     if (idx >= 0) {
       try {
         await deletePairFromDb(pairs[idx].question);
-        pairs.splice(idx, 1);
         await rebuildFromDb();
         await send(chatId, `Удалил: ${rest}`);
       } catch (e) {
@@ -414,11 +420,6 @@ async function handle(chatId, text) {
       return;
     }
     await send(chatId, `Не нашёл: ${key}`);
-    return;
-  }
-
-  if (t === '+' || t === '-') {
-    await send(chatId, 'Обратная связь работает только в памяти, при рестарте сбросится.');
     return;
   }
 
