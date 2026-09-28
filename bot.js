@@ -1,32 +1,10 @@
-const fs = require('fs');
-const path = require('path');
 const https = require('https');
+const brainDb = require('./brain');
 
-const BOT_TOKEN = '8606506994:AAE-g9SYVmUKzehn2FHaS2GikRU1rOufBFE';
-const BRAIN_FILE = path.join(__dirname, 'brain.json');
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const SIMILARITY_THRESHOLD = 0.5;
 
 let brain = {};
-
-function loadBrain() {
-  try {
-    if (fs.existsSync(BRAIN_FILE)) {
-      const raw = fs.readFileSync(BRAIN_FILE, 'utf8');
-      brain = JSON.parse(raw);
-    }
-  } catch (e) {
-    console.error('Failed to load brain:', e.message);
-    brain = {};
-  }
-}
-
-function saveBrain() {
-  try {
-    fs.writeFileSync(BRAIN_FILE, JSON.stringify(brain, null, 2), 'utf8');
-  } catch (e) {
-    console.error('Failed to save brain:', e.message);
-  }
-}
 
 function normalize(text) {
   return String(text)
@@ -162,9 +140,14 @@ async function handleCommand(chatId, text) {
       return true;
     }
     const key = normalize(q);
-    brain[key] = a;
-    saveBrain();
-    await sendMessage(chatId, `Запомнил: ${key} -> ${a}`);
+    try {
+      await brainDb.upsert(key, a);
+      brain[key] = a;
+      await sendMessage(chatId, `Запомнил: ${key} -> ${a}`);
+    } catch (e) {
+      console.error('upsert error:', e.message);
+      await sendMessage(chatId, 'Ошибка сохранения. Попробуй позже.');
+    }
     return true;
   }
 
@@ -176,9 +159,14 @@ async function handleCommand(chatId, text) {
     }
     const key = normalize(rest);
     if (brain[key]) {
-      delete brain[key];
-      saveBrain();
-      await sendMessage(chatId, `Удалил: ${key}`);
+      try {
+        await brainDb.remove(key);
+        delete brain[key];
+        await sendMessage(chatId, `Удалил: ${key}`);
+      } catch (e) {
+        console.error('remove error:', e.message);
+        await sendMessage(chatId, 'Ошибка удаления. Попробуй позже.');
+      }
     } else {
       await sendMessage(chatId, `Не найдено: ${key}`);
     }
@@ -230,6 +218,24 @@ async function poll() {
   }
 }
 
-loadBrain();
-console.log('Bot started');
-poll();
+async function start() {
+  if (!BOT_TOKEN) {
+    console.error('BOT_TOKEN is not set');
+    process.exit(1);
+  }
+  if (!process.env.B4A_APP_ID || !process.env.B4A_JS_KEY || !process.env.B4A_MASTER_KEY) {
+    console.error('Back4App keys are not set');
+    process.exit(1);
+  }
+  try {
+    brain = await brainDb.getAll();
+    console.log('Brain loaded from Back4App, records:', Object.keys(brain).length);
+  } catch (e) {
+    console.error('Failed to load brain:', e.message);
+    brain = {};
+  }
+  console.log('Bot started');
+  poll();
+}
+
+start();
