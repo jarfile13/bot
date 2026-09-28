@@ -1,3 +1,5 @@
+const http = require("http");
+
 const TG_TOKEN = "8606506994:AAE-g9SYVmUKzehn2FHaS2GikRU1rOufBFE";
 const VOCAB_SIZE = 128;
 const HIDDEN = 32;
@@ -7,6 +9,14 @@ const MAX_LEN = 300;
 const GEN_LEN = 120;
 const B1 = 0.9, B2 = 0.999, EPS = 1e-8;
 const MAX_DELTA = 0.5;
+
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("ok");
+}).listen(PORT, () => {
+  console.log("Health check on port " + PORT);
+});
 
 function mulberry32(a) {
   return function () {
@@ -33,52 +43,17 @@ function makeWeights(seed = 42) {
     M[k] = new Float32Array(W[k].length);
     V[k] = new Float32Array(W[k].length);
   }
-  return { W, M, V, t: 0 };
-}
-
-function packModel(m) {
-  const parts = [
-    m.W.emb, m.W.Wx, m.W.Wh, m.W.bh, m.W.Wy, m.W.by,
-    m.M.emb, m.M.Wx, m.M.Wh, m.M.bh, m.M.Wy, m.M.by,
-    m.V.emb, m.V.Wx, m.V.Wh, m.V.bh, m.V.Wy, m.V.by,
-  ];
-  let total = 1;
-  for (const arr of parts) total += arr.length;
-  const view = new Float32Array(total);
-  let off = 0;
-  for (const arr of parts) { view.set(arr, off); off += arr.length; }
-  view[off] = m.t;
-  const bytes = new Uint8Array(view.buffer);
-  let bin = "";
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(bin);
-}
-
-function unpackModel(b64) {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  const view = new Float32Array(bytes.buffer);
-  const m = makeWeights(1);
-  const layout = [
-    ["W","emb",VOCAB_SIZE*EMB],["W","Wx",HIDDEN*EMB],["W","Wh",HIDDEN*HIDDEN],["W","bh",HIDDEN],["W","Wy",VOCAB_SIZE*HIDDEN],["W","by",VOCAB_SIZE],
-    ["M","emb",VOCAB_SIZE*EMB],["M","Wx",HIDDEN*EMB],["M","Wh",HIDDEN*HIDDEN],["M","bh",HIDDEN],["M","Wy",VOCAB_SIZE*HIDDEN],["M","by",VOCAB_SIZE],
-    ["V","emb",VOCAB_SIZE*EMB],["V","Wx",HIDDEN*EMB],["V","Wh",HIDDEN*HIDDEN],["V","bh",HIDDEN],["V","Wy",VOCAB_SIZE*HIDDEN],["V","by",VOCAB_SIZE],
-  ];
-  let off = 0;
-  for (const [a,b,len] of layout) { m[a][b].set(view.subarray(off, off+len)); off += len; }
-  m.t = view[off] | 0;
-  return m;
+  return { W, M, V, t: 0, h: new Float32Array(HIDDEN) };
 }
 
 function softmaxInPlace(logits) {
   let max = -Infinity;
   for (let i = 0; i < logits.length; i++) if (logits[i] > max) max = logits[i];
   let sum = 0;
-  for (let i = 0; i < logits.length; i++) { logits[i] = Math.exp(logits[i] - max); sum += logits[i]; }
+  for (let i = 0; i < logits.length; i++) {
+    logits[i] = Math.exp(logits[i] - max);
+    sum += logits[i];
+  }
   for (let i = 0; i < logits.length; i++) logits[i] /= sum;
 }
 
@@ -109,6 +84,7 @@ function trainStep(model, xIdx, yIdx, hPrev) {
   softmaxInPlace(logits);
   const loss = -Math.log(logits[yIdx] + 1e-9);
   logits[yIdx] -= 1;
+
   const dWy = new Float32Array(VOCAB_SIZE * HIDDEN);
   const dby = new Float32Array(VOCAB_SIZE);
   for (let i = 0; i < VOCAB_SIZE; i++) {
@@ -117,6 +93,7 @@ function trainStep(model, xIdx, yIdx, hPrev) {
     const off = i * HIDDEN;
     for (let j = 0; j < HIDDEN; j++) dWy[off + j] = g * h[j];
   }
+
   const dh = new Float32Array(HIDDEN);
   for (let i = 0; i < VOCAB_SIZE; i++) {
     const g = logits[i];
@@ -124,13 +101,16 @@ function trainStep(model, xIdx, yIdx, hPrev) {
     const off = i * HIDDEN;
     for (let j = 0; j < HIDDEN; j++) dh[j] += g * W.Wy[off + j];
   }
+
   const dhRaw = new Float32Array(HIDDEN);
   for (let i = 0; i < HIDDEN; i++) dhRaw[i] = dh[i] * (1 - h[i] * h[i]);
+
   const dWx = new Float32Array(HIDDEN * EMB);
   const dWh = new Float32Array(HIDDEN * HIDDEN);
   const dbh = new Float32Array(HIDDEN);
   const demb = new Float32Array(EMB);
   const xOff = xIdx * EMB;
+
   for (let i = 0; i < HIDDEN; i++) {
     const g = dhRaw[i];
     dbh[i] = g;
@@ -144,9 +124,11 @@ function trainStep(model, xIdx, yIdx, hPrev) {
     for (let i = 0; i < HIDDEN; i++) s += dhRaw[i] * W.Wx[i * EMB + j];
     demb[j] = s;
   }
+
   model.t++;
   const bc1 = 1 - Math.pow(B1, model.t);
   const bc2 = 1 - Math.pow(B2, model.t);
+
   const applyAdam = (P, G, m, v) => {
     for (let k = 0; k < P.length; k++) {
       let g = G[k];
@@ -163,11 +145,13 @@ function trainStep(model, xIdx, yIdx, hPrev) {
       P[k] -= d;
     }
   };
+
   applyAdam(W.Wy, dWy, M.Wy, V.Wy);
   applyAdam(W.by, dby, M.by, V.by);
   applyAdam(W.Wx, dWx, M.Wx, V.Wx);
   applyAdam(W.Wh, dWh, M.Wh, V.Wh);
   applyAdam(W.bh, dbh, M.bh, V.bh);
+
   for (let j = 0; j < EMB; j++) {
     const k = xOff + j;
     let g = demb[j];
@@ -183,6 +167,7 @@ function trainStep(model, xIdx, yIdx, hPrev) {
     else if (d < -MAX_DELTA) d = -MAX_DELTA;
     W.emb[k] -= d;
   }
+
   return { loss, h };
 }
 
@@ -234,66 +219,102 @@ async function send(chatId, text) {
 }
 
 async function getUpdates(offset) {
-  const url = `https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=10&offset=${offset}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  return data.result || [];
+  try {
+    const url = `https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=30&offset=${offset}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data.ok) {
+      console.error("getUpdates error:", data.description);
+      return [];
+    }
+    return data.result || [];
+  } catch (e) {
+    console.error("getUpdates failed:", e);
+    return [];
+  }
 }
 
-let model = null;
-let offset = 0;
+const models = new Map();
 
 async function processUpdate(update) {
   const msg = update.message;
   if (!msg || !msg.text) return;
   const chatId = msg.chat.id;
   const text = msg.text.trim();
+  if (!text) return;
 
   if (text === "/start" || text === "/help") {
-    return send(chatId, "Отправь текст - я обучусь. /gen [начало] - сгенерировать. /info - статистика. /reset - сброс.");
+    return send(chatId,
+      "Отправь текст - я обучусь (до " + MAX_LEN + " символов).\n" +
+      "/gen [начало] - сгенерирую продолжение.\n" +
+      "/reset - сбросить модель.\n" +
+      "/info - статистика."
+    );
   }
+
   if (text === "/reset") {
-    model = null;
+    models.delete(chatId);
     return send(chatId, "Модель сброшена.");
   }
+
   if (text === "/info") {
-    return send(chatId, "Модель: HIDDEN=" + HIDDEN + ", шагов=" + (model ? model.t : 0));
+    const m = models.get(chatId);
+    return send(chatId,
+      "Vocab: " + VOCAB_SIZE + "\n" +
+      "Hidden: " + HIDDEN + "\n" +
+      "Embedding: " + EMB + "\n" +
+      "Шагов: " + (m ? m.t : 0) + "\n" +
+      "LR: " + LR
+    );
   }
+
   if (text.startsWith("/gen")) {
     const seed = text.slice(4).trim().slice(0, 100) || " ";
-    if (!model) return send(chatId, "Сначала обучи меня текстом.");
-    const out = generate(model.W, seed, GEN_LEN);
+    const m = models.get(chatId);
+    if (!m) return send(chatId, "Сначала обучи меня текстом.");
+    const out = generate(m.W, seed, GEN_LEN);
     return send(chatId, seed + out);
   }
 
   const trainText = text.slice(0, MAX_LEN);
-  if (!model) model = makeWeights(Date.now() & 0xffff);
-  if (!model.h) model.h = new Float32Array(HIDDEN);
+  let m = models.get(chatId);
+  if (!m) {
+    m = makeWeights((Date.now() ^ chatId) & 0xffff);
+    models.set(chatId, m);
+  }
+
   let totalLoss = 0, steps = 0;
   for (let i = 0; i < trainText.length - 1; i++) {
     const x = trainText.charCodeAt(i) % VOCAB_SIZE;
     const y = trainText.charCodeAt(i + 1) % VOCAB_SIZE;
-    const r = trainStep(model, x, y, model.h);
-    model.h = r.h;
+    const r = trainStep(m, x, y, m.h);
+    m.h = r.h;
     totalLoss += r.loss;
     steps++;
   }
   const avg = (totalLoss / Math.max(steps, 1)).toFixed(3);
-  return send(chatId, "Обучился на " + steps + " символах. Loss: " + avg + ". Всего шагов: " + model.t);
+  return send(chatId, "Обучился на " + steps + " символах. Loss: " + avg + ". Всего шагов: " + m.t);
 }
 
-async function main() {
-  console.log("Bot started");
-  const updates = await getUpdates(offset);
-  for (const u of updates) {
-    offset = u.update_id + 1;
+async function pollLoop() {
+  console.log("Bot polling started");
+  let offset = 0;
+  while (true) {
     try {
-      await processUpdate(u);
+      const updates = await getUpdates(offset);
+      for (const u of updates) {
+        offset = u.update_id + 1;
+        try {
+          await processUpdate(u);
+        } catch (e) {
+          console.error("process error:", e);
+        }
+      }
     } catch (e) {
-      console.error("process error:", e);
+      console.error("poll loop error:", e);
+      await new Promise(r => setTimeout(r, 3000));
     }
   }
-  console.log("Done");
 }
 
-main();
+pollLoop();
