@@ -7,12 +7,15 @@ const VOCAB_SIZE = 256;
 const HIDDEN = 64;
 const EMB = 16;
 const LR = 0.03;
-const MAX_LEN = 200;
+const MAX_LEN = 500;
 const GEN_LEN = 80;
 const B1 = 0.9, B2 = 0.999, EPS = 1e-8;
 const MAX_DELTA = 0.5;
+const TEMP = 0.7;
 const SNAPSHOT_DIR = "/tmp/snapshots";
 const MAX_SNAPSHOTS = 5;
+const MAX_REPEAT = 500;
+const MAX_FILE_SIZE = 2 * 1024 * 1024;
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
@@ -45,15 +48,15 @@ function makeWeights(seed = 42) {
     M[k] = new Float32Array(W[k].length);
     V[k] = new Float32Array(W[k].length);
   }
-  return { W, M, V, t: 0, h: new Float32Array(HIDDEN), temp: 1.0 };
+  return { W, M, V, t: 0, h: new Float32Array(HIDDEN) };
 }
 
-function softmaxInPlace(logits, temp = 1.0) {
+function softmaxInPlace(logits) {
   let max = -Infinity;
   for (let i = 0; i < logits.length; i++) if (logits[i] > max) max = logits[i];
   let sum = 0;
   for (let i = 0; i < logits.length; i++) {
-    logits[i] = Math.exp((logits[i] - max) / temp);
+    logits[i] = Math.exp((logits[i] - max) / TEMP);
     sum += logits[i];
   }
   for (let i = 0; i < logits.length; i++) logits[i] /= sum;
@@ -83,7 +86,7 @@ function forwardStep(W, xIdx, hPrev) {
 function trainStep(model, xIdx, yIdx, hPrev) {
   const { W, M, V } = model;
   const { h, logits } = forwardStep(W, xIdx, hPrev);
-  softmaxInPlace(logits, 1.0);
+  softmaxInPlace(logits);
   const loss = -Math.log(logits[yIdx] + 1e-9);
   logits[yIdx] -= 1;
 
@@ -177,7 +180,7 @@ function bytesToStr(bytes) {
   }
 }
 
-function generate(W, seedText, length, temp = 1.0) {
+function generate(W, seedText, length) {
   const enc = new TextEncoder();
   let h = new Float32Array(HIDDEN);
   let lastByte = 32;
@@ -193,7 +196,7 @@ function generate(W, seedText, length, temp = 1.0) {
     const r = forwardStep(W, lastByte, h);
     h = r.h;
     const probs = r.logits;
-    softmaxInPlace(probs, temp);
+    softmaxInPlace(probs);
     let p = Math.random(), acc = 0, next = 0;
     for (let k = 0; k < VOCAB_SIZE; k++) {
       acc += probs[k];
@@ -254,6 +257,21 @@ async function getUpdates(offset) {
   }
 }
 
+async function getFile(fileId) {
+  try {
+    const r = await tg("getFile", { file_id: fileId });
+    if (!r.ok) return null;
+    const filePath = r.result.file_path;
+    const url = `https://api.telegram.org/file/bot${TG_TOKEN}/${filePath}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return await res.text();
+  } catch (e) {
+    console.error("getFile failed:", e);
+    return null;
+  }
+}
+
 const models = new Map();
 const pendingReset = new Set();
 
@@ -263,13 +281,12 @@ function packModel(m) {
     m.M.emb, m.M.Wx, m.M.Wh, m.M.bh, m.M.Wy, m.M.by,
     m.V.emb, m.V.Wx, m.V.Wh, m.V.bh, m.V.Wy, m.V.by,
   ];
-  let total = 2;
+  let total = 1;
   for (const arr of parts) total += arr.length;
   const view = new Float32Array(total);
   let off = 0;
   for (const arr of parts) { view.set(arr, off); off += arr.length; }
-  view[off++] = m.t;
-  view[off] = m.temp || 1.0;
+  view[off] = m.t;
   return Buffer.from(view.buffer);
 }
 
@@ -283,8 +300,7 @@ function unpackModel(buf) {
   ];
   let off = 0;
   for (const [a,b,len] of layout) { m[a][b].set(view.subarray(off, off+len)); off += len; }
-  m.t = view[off++] | 0;
-  m.temp = view[off] || 1.0;
+  m.t = view[off] | 0;
   return m;
 }
 
@@ -332,16 +348,29 @@ function getModel(chatId) {
   return m;
 }
 
+function trainOnText(m, text) {
+  const bytes = new TextEncoder().encode(text);
+  let totalLoss = 0, steps = 0;
+  for (let i = 0; i < bytes.length - 1; i++) {
+    const x = bytes[i];
+    const y = bytes[i + 1];
+    const r = trainStep(m, x, y, m.h);
+    m.h = r.h;
+    totalLoss += r.loss;
+    steps++;
+  }
+  return { avg: totalLoss / Math.max(steps, 1), steps };
+}
+
 async function processUpdate(update) {
   const msg = update.message;
-  if (!msg || !msg.text) return;
+  if (!msg) return;
   const chatId = msg.chat.id;
-  const text = msg.text.trim();
-  if (!text) return;
 
-  if (pendingReset.has(chatId)) {
+  if (pendingReset.has(chatId) && msg.text) {
+    const t = msg.text.trim().toLowerCase();
     pendingReset.delete(chatId);
-    if (text.toLowerCase() === "да" || text === "/yes") {
+    if (t === "да" || t === "/yes") {
       models.delete(chatId);
       try { fs.rmSync(snapshotDir(chatId), { recursive: true, force: true }); } catch {}
       return send(chatId, "Модель сброшена. Начинаем заново.");
@@ -349,41 +378,95 @@ async function processUpdate(update) {
     return send(chatId, "Отмена. Модель сохранена.");
   }
 
+  if (msg.document) {
+    const doc = msg.document;
+    const name = (doc.file_name || "").toLowerCase();
+    if (!name.endsWith(".txt")) {
+      return send(chatId, "Принимаю только .txt файлы.");
+    }
+    if (doc.file_size && doc.file_size > MAX_FILE_SIZE) {
+      return send(chatId, "Файл слишком большой (максимум 2 МБ).");
+    }
+    await send(chatId, "Скачиваю файл...");
+    const content = await getFile(doc.file_id);
+    if (!content) {
+      return send(chatId, "Не смог скачать файл.");
+    }
+    if (content.length < 2) {
+      return send(chatId, "Файл пустой.");
+    }
+    const m = getModel(chatId);
+    saveSnapshot(chatId, m, "before_file");
+
+    const fullText = content.slice(0, 100000);
+    const bytes = new TextEncoder().encode(fullText);
+
+    let totalLoss = 0, steps = 0;
+    const batchSize = 5000;
+    let i = 0;
+    while (i < bytes.length - 1) {
+      const end = Math.min(i + batchSize, bytes.length - 1);
+      for (; i < end; i++) {
+        const x = bytes[i];
+        const y = bytes[i + 1];
+        const r = trainStep(m, x, y, m.h);
+        m.h = r.h;
+        totalLoss += r.loss;
+        steps++;
+      }
+      if (i % 20000 === 0) {
+        await send(chatId, "Прогресс: " + i + " / " + (bytes.length - 1) + " байт, Loss: " + (totalLoss / steps).toFixed(3));
+      }
+    }
+
+    const avg = (totalLoss / Math.max(steps, 1)).toFixed(3);
+    return send(chatId,
+      "Файл обработан.\n" +
+      "Символов: " + fullText.length + "\n" +
+      "Байт: " + bytes.length + "\n" +
+      "Loss: " + avg + "\n" +
+      "Всего шагов: " + m.t + "\n" +
+      "(если что-то не так — /undo)"
+    );
+  }
+
+  if (!msg.text) return;
+  const text = msg.text.trim();
+  if (!text) return;
+
   if (text === "/start" || text === "/help") {
     return send(chatId,
-      "RNN-нейросеть. Команды:\n\n" +
-      "Просто отправь текст - учусь на нём.\n" +
-      "Чем больше повторов одной фразы, тем лучше запомню.\n\n" +
-      "/gen привет - сгенерирую продолжение\n" +
-      "/gen 5 привет - 5 вариантов\n" +
-      "/top привет - что я хочу сказать дальше\n" +
-      "/temp 0.5 - температура (0.3 точно, 1.5 безумно)\n" +
+      "RNN-нейросеть.\n\n" +
+      "Как учить:\n" +
+      "1. /repeat 100 привет как дела - повторит фразу 100 раз\n" +
+      "2. Или отправь .txt файл - обучусь на нём\n" +
+      "3. Или просто отправь текст - учусь один раз\n\n" +
+      "Команды:\n" +
+      "/repeat N текст - повторить текст N раз (макс 500)\n" +
+      "/gen текст - сгенерировать\n" +
+      "/gen 5 текст - 5 вариантов\n" +
+      "/top текст - что я хочу сказать дальше\n" +
       "/stats - статистика\n" +
       "/undo - откатить последнее обучение\n" +
-      "/reset - сбросить модель\n\n" +
-      "Если случайно отправил мусор - /undo вернёт модель назад."
+      "/reset - сбросить модель"
     );
   }
 
   if (text === "/reset") {
     pendingReset.add(chatId);
-    return send(chatId, "Точно сбросить модель? Напиши 'да' для подтверждения.");
+    return send(chatId, "Точно сбросить модель? Напиши 'да'.");
   }
 
   if (text === "/undo") {
     const snap = loadLastSnapshot(chatId);
-    if (!snap) return send(chatId, "Нечего откатывать. Снапшотов нет.");
+    if (!snap) return send(chatId, "Нечего откатывать.");
     models.set(chatId, snap.model);
-    return send(chatId,
-      "Откатил последнее обучение.\n" +
-      "Шагов теперь: " + snap.model.t + "\n" +
-      "Loss вернулся к предыдущему значению."
-    );
+    return send(chatId, "Откатил. Шагов теперь: " + snap.model.t);
   }
 
   if (text === "/stats" || text === "/info") {
     const m = models.get(chatId);
-    if (!m) return send(chatId, "Модель пустая. Отправь текст для обучения.");
+    if (!m) return send(chatId, "Модель пустая. Отправь текст или /repeat.");
     const params = VOCAB_SIZE*EMB + HIDDEN*EMB + HIDDEN*HIDDEN + HIDDEN + VOCAB_SIZE*HIDDEN + VOCAB_SIZE;
     let snaps = 0;
     try {
@@ -393,24 +476,39 @@ async function processUpdate(update) {
     return send(chatId,
       "Параметров: " + params.toLocaleString() + "\n" +
       "Шагов: " + m.t + "\n" +
-      "Vocab: " + VOCAB_SIZE + "\n" +
       "Hidden: " + HIDDEN + "\n" +
       "Embedding: " + EMB + "\n" +
       "LR: " + LR + "\n" +
-      "Temp: " + m.temp.toFixed(2) + "\n" +
-      "Снапшотов для отката: " + snaps
+      "Снапшотов: " + snaps
     );
   }
 
-  if (text.startsWith("/temp")) {
-    const val = parseFloat(text.slice(5).trim());
-    if (isNaN(val) || val < 0.1 || val > 3.0) {
-      return send(chatId, "Использование: /temp 0.5 (от 0.1 до 3.0)");
+  if (text.startsWith("/repeat")) {
+    const rest = text.slice(7).trim();
+    const mNum = rest.match(/^(\d+)\s+(.+)$/s);
+    if (!mNum) {
+      return send(chatId, "Использование: /repeat 100 привет как дела");
     }
+    let count = parseInt(mNum[1]);
+    let phrase = mNum[2].trim();
+    if (count < 1) count = 1;
+    if (count > MAX_REPEAT) count = MAX_REPEAT;
+    if (!phrase) return send(chatId, "Нужен текст после числа.");
+    if (phrase.length > 200) phrase = phrase.slice(0, 200);
+
     const m = getModel(chatId);
-    m.temp = val;
-    return send(chatId, "Температура: " + val.toFixed(2) + "\n" +
-      (val < 0.7 ? "Точная генерация" : val > 1.3 ? "Безумная генерация" : "Сбалансированная"));
+    saveSnapshot(chatId, m, "before_repeat");
+
+    const fullText = (phrase + "\n").repeat(count);
+    const result = trainOnText(m, fullText);
+
+    return send(chatId,
+      "Повторил " + count + " раз.\n" +
+      "Байт обработано: " + new TextEncoder().encode(fullText).length + "\n" +
+      "Loss: " + result.avg.toFixed(3) + "\n" +
+      "Всего шагов: " + m.t + "\n" +
+      "(если что-то не так — /undo)"
+    );
   }
 
   if (text.startsWith("/top")) {
@@ -427,13 +525,13 @@ async function processUpdate(update) {
     }
     const r = forwardStep(m.W, lastByte, h);
     const probs = r.logits;
-    softmaxInPlace(probs, m.temp);
+    softmaxInPlace(probs);
 
     const pairs = [];
     for (let i = 0; i < VOCAB_SIZE; i++) pairs.push([i, probs[i]]);
     pairs.sort((a, b) => b[1] - a[1]);
 
-    let out = "После '" + seed + "' топ-8 байт:\n\n";
+    let out = "После '" + seed + "':\n\n";
     for (let i = 0; i < 8; i++) {
       const [byte, prob] = pairs[i];
       let single = "?";
@@ -445,22 +543,18 @@ async function processUpdate(update) {
       if (single === "(полбайта)") {
         out += (i + 1) + ". байт " + byte + " (часть символа) — " + (prob * 100).toFixed(1) + "%\n";
       } else {
-        out += (i + 1) + ". '" + single + "' (байт " + byte + ") — " + (prob * 100).toFixed(1) + "%\n";
+        out += (i + 1) + ". '" + single + "' — " + (prob * 100).toFixed(1) + "%\n";
       }
     }
-
-    const topTwo = pairs.slice(0, 2).map(p => p[0]);
-    const combined = bytesToStr(topTwo);
-    if (combined !== null && combined.length > 0) {
-      out += "\nЕсли взять топ-2 байта вместе: '" + combined + "'";
-    }
+    const combined = bytesToStr(pairs.slice(0, 2).map(p => p[0]));
+    if (combined) out += "\nТоп-2 байта вместе: '" + combined + "'";
     return send(chatId, out);
   }
 
   if (text.startsWith("/gen")) {
     const rest = text.slice(4).trim();
     const m = models.get(chatId);
-    if (!m) return send(chatId, "Сначала обучи меня текстом.");
+    if (!m) return send(chatId, "Сначала обучи меня.");
 
     const mNum = rest.match(/^(\d+)\s*(.*)$/);
     if (mNum) {
@@ -468,38 +562,22 @@ async function processUpdate(update) {
       const seed = mNum[2].slice(0, 50) || " ";
       let out = "";
       for (let i = 0; i < count; i++) {
-        out += (i + 1) + ") " + generate(m.W, seed, 60, m.temp) + "\n\n";
+        out += (i + 1) + ") " + generate(m.W, seed, 60) + "\n\n";
       }
       return send(chatId, out);
     }
 
-    const out = generate(m.W, rest.slice(0, 50) || " ", GEN_LEN, m.temp);
-    return send(chatId, out);
+    return send(chatId, generate(m.W, rest.slice(0, 50) || " ", GEN_LEN));
   }
 
-  const trainText = text.slice(0, MAX_LEN);
   const m = getModel(chatId);
-
-  if (m.t > 0) {
-    saveSnapshot(chatId, m, "before_train");
-  }
-
-  const bytes = new TextEncoder().encode(trainText);
-  let totalLoss = 0, steps = 0;
-  for (let i = 0; i < bytes.length - 1; i++) {
-    const x = bytes[i];
-    const y = bytes[i + 1];
-    const r = trainStep(m, x, y, m.h);
-    m.h = r.h;
-    totalLoss += r.loss;
-    steps++;
-  }
-  const avg = (totalLoss / Math.max(steps, 1)).toFixed(3);
+  saveSnapshot(chatId, m, "before_train");
+  const result = trainOnText(m, text.slice(0, MAX_LEN));
   return send(chatId,
-    "Обучился на " + steps + " байтах.\n" +
-    "Loss: " + avg + "\n" +
+    "Обучился на " + result.steps + " байтах.\n" +
+    "Loss: " + result.avg.toFixed(3) + "\n" +
     "Всего шагов: " + m.t + "\n" +
-    "(если это был мусор — /undo)"
+    "(если мусор — /undo)"
   );
 }
 
