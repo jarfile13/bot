@@ -1,4 +1,4 @@
-const TG_TOKEN = "8606506994:AAEq8_0WBOlsyxbZF2vC0PhZb8ok5lJ6OA4";
+const TG_TOKEN = "8606506994:AAE-g9SYVmUKzehn2FHaS2GikRU1rOufBFE";
 const VOCAB_SIZE = 128;
 const HIDDEN = 32;
 const EMB = 8;
