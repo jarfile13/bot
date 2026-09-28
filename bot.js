@@ -461,6 +461,9 @@ async function start() {
     process.exit(1);
   }
 
+  console.log('Bot started');
+  poll();
+
   try {
     await rebuildFromDb();
 
@@ -478,12 +481,8 @@ async function start() {
       await rebuildFromDb();
     }
 
-    console.log('Bot started');
-    poll();
+    console.log('Brain ready, pairs:', pairs.length);
   } catch (e) {
     console.error('start error:', e.message);
-    process.exit(1);
   }
 }
-
-start();
