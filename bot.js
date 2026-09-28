@@ -6,7 +6,7 @@ const TG_TOKEN = "8606506994:AAE-g9SYVmUKzehn2FHaS2GikRU1rOufBFE";
 const VOCAB_SIZE = 256;
 const HIDDEN = 64;
 const EMB = 16;
-const LR = 0.03;
+const LR = 0.01;
 const MAX_LEN = 500;
 const GEN_LEN = 80;
 const B1 = 0.9, B2 = 0.999, EPS = 1e-8;
@@ -16,8 +16,9 @@ const SNAPSHOT_DIR = "/tmp/snapshots";
 const MAX_SNAPSHOTS = 5;
 const MAX_FILE_SIZE = 2 * 1024 * 1024;
 const END_MARK = "\u0003";
-const MAX_EPOCHS = 200;
-const EARLY_STOP_PATIENCE = 5;
+const MAX_EPOCHS = 1000;
+const EARLY_STOP_PATIENCE = 30;
+const MIN_EPOCHS = 80;
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
@@ -331,21 +332,6 @@ function saveSnapshot(chatId, m, label, loss) {
   }
 }
 
-function loadSnapshotByIndex(chatId, index) {
-  try {
-    const dir = snapshotDir(chatId);
-    if (!fs.existsSync(dir)) return null;
-    const files = fs.readdirSync(dir).sort();
-    if (index < 0 || index >= files.length) return null;
-    const f = files[index];
-    const buf = fs.readFileSync(path.join(dir, f));
-    return { model: unpackModel(buf), name: f };
-  } catch (e) {
-    console.error("load snapshot failed:", e.message);
-    return null;
-  }
-}
-
 function getModel(chatId) {
   let m = models.get(chatId);
   if (!m) {
@@ -401,14 +387,14 @@ function trainOnPhrases(m, phrases, epochs, onEpoch) {
     steps += epochSteps;
     epochHistory.push(avgEpoch);
 
-    if (onEpoch && (epoch + 1) % 20 === 0) {
+    if (onEpoch && (epoch + 1) % 40 === 0) {
       onEpoch(epoch + 1, epochs, avgEpoch);
     }
 
     if (avgEpoch < bestLoss - 0.001) {
       bestLoss = avgEpoch;
       patienceLeft = EARLY_STOP_PATIENCE;
-    } else {
+    } else if (epoch + 1 >= MIN_EPOCHS) {
       patienceLeft--;
       if (patienceLeft <= 0) {
         stopped = true;
@@ -416,7 +402,7 @@ function trainOnPhrases(m, phrases, epochs, onEpoch) {
     }
   }
 
-  return { avg: totalLoss / Math.max(steps, 1), steps, best: bestLoss, stopped, epochs: epochHistory.length, history: epochHistory };
+  return { avg: totalLoss / Math.max(steps, 1), steps, best: bestLoss, stopped, epochs: epochHistory.length };
 }
 
 async function processUpdate(update) {
@@ -444,14 +430,14 @@ async function processUpdate(update) {
     const content = await getFile(doc.file_id);
     if (!content || content.length < 2) return send(chatId, "Пусто или не скачалось.");
 
-    const lines = content.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0).slice(0, 50);
+    const lines = content.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0).slice(0, 30);
     if (!lines.length) return send(chatId, "Нет строк для обучения.");
 
     const m = getModel(chatId);
     saveSnapshot(chatId, m, "beforefile");
 
-    const result = trainOnPhrases(m, lines, 100, async (e, total, loss) => {
-      if (e % 40 === 0) await send(chatId, "Эпоха " + e + "/" + total + ", loss: " + loss.toFixed(3));
+    const result = trainOnPhrases(m, lines, 300, async (e, total, loss) => {
+      await send(chatId, "Эпоха " + e + "/" + total + ", loss: " + loss.toFixed(3));
     });
 
     saveSnapshot(chatId, m, "afterfile", result.avg);
@@ -480,7 +466,7 @@ async function processUpdate(update) {
       "/reset - сбросить\n\n" +
       "Как учить: пиши фразы через |. Бот учит их по кругу и не забывает.\n\n" +
       "Пример:\n" +
-      "/learn привет как дела | хорошо а у тебя | тоже хорошо"
+      "/learn привет как дела | привет что делаешь | привет как ты"
     );
   }
 
@@ -529,12 +515,12 @@ async function processUpdate(update) {
       return send(chatId,
         "Использование:\n" +
         "/learn фраза1 | фраза2 | фраза3\n" +
-        "/learn 100 фраза1 | фраза2  (100 эпох)\n\n" +
-        "Фразы разделяй |. Бот учит их в случайном порядке, не забывая."
+        "/learn 300 фраза1 | фраза2  (300 эпох)\n\n" +
+        "Фразы разделяй |. Бот учит их в случайном порядке."
       );
     }
 
-    let epochs = 100;
+    let epochs = 200;
     const mNum = rest.match(/^(\d+)\s+(.+)$/s);
     if (mNum) {
       epochs = Math.min(parseInt(mNum[1]), MAX_EPOCHS);
@@ -543,7 +529,7 @@ async function processUpdate(update) {
 
     const phrases = rest.split("|").map(p => p.trim()).filter(p => p.length > 0);
     if (!phrases.length) return send(chatId, "Нужна хотя бы одна фраза.");
-    if (phrases.length > 20) return send(chatId, "Максимум 20 фраз.");
+    if (phrases.length > 10) return send(chatId, "Максимум 10 фраз.");
     for (let i = 0; i < phrases.length; i++) {
       if (phrases[i].length > 100) phrases[i] = phrases[i].slice(0, 100);
     }
@@ -551,8 +537,10 @@ async function processUpdate(update) {
     const m = getModel(chatId);
     saveSnapshot(chatId, m, "beforelearn");
 
+    await send(chatId, "Учу " + phrases.length + " фраз, " + epochs + " эпох. Это займёт 1-3 минуты...");
+
     const result = trainOnPhrases(m, phrases, epochs, async (e, total, loss) => {
-      if (e % 40 === 0) await send(chatId, "Эпоха " + e + "/" + total + ", loss: " + loss.toFixed(3));
+      await send(chatId, "Эпоха " + e + "/" + total + ", loss: " + loss.toFixed(3));
     });
 
     saveSnapshot(chatId, m, "afterlearn", result.avg);
