@@ -7,13 +7,15 @@ const APP_ID = process.env.B4A_APP_ID;
 const JS_KEY = process.env.B4A_JS_KEY;
 const MASTER_KEY = process.env.B4A_MASTER_KEY;
 
+const DIM = 50;
 const MIN_SCORE = 0.35;
-const MIN_GEN_LEN = 2;
-const MAX_GEN_LEN = 25;
+const HIGH_CONFIDENCE = 0.7;
 const MAX_PAIRS = 5000;
 const MAX_SYN = 30;
 const LIST_PAGE = 20;
 const MAX_BRAINS = 200;
+const REBUILD_EVERY = 10;
+const PPMI_WINDOW = 5;
 
 const health = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -34,7 +36,7 @@ function lc(s) {
 }
 
 function words(s) {
-  return lc(s).split(' ').filter(w => w.length > 0);
+  return lc(s).split(' ').filter(w => w.length > 1);
 }
 
 function dbKey(owner, q) { return owner + ':' + lc(q); }
@@ -45,10 +47,11 @@ function makeBrain(owner) {
     owner,
     pairs: [],
     syn: new Map(),
-    wordIndex: new Map(),
-    df: new Map(),
-    markov: new Map(),
-    starters: [],
+    vocab: new Map(),
+    ppmi: null,
+    vectors: null,
+    pairVectors: null,
+    dirty: 0,
     loaded: false,
     loading: null,
   };
@@ -71,224 +74,315 @@ function getBrain(owner) {
   return b;
 }
 
-function expand(brain, word) {
+function expandSyn(brain, word) {
   const out = new Set([word]);
   const s = brain.syn.get(word);
   if (s) for (const x of s) out.add(x);
   return out;
 }
 
-function idf(brain, w) {
-  const df = brain.df.get(w) || 0;
-  if (df === 0) return 0;
-  return Math.log(1 + brain.pairs.length / df);
-}
-
-function indexPair(brain, idx, question, answer) {
-  const qw = words(question);
-  brain.pairs[idx].qWords = qw;
-  const seen = new Set();
-  for (const w of qw) {
-    if (!brain.wordIndex.has(w)) brain.wordIndex.set(w, new Set());
-    brain.wordIndex.get(w).add(idx);
-    if (!seen.has(w)) {
-      seen.add(w);
-      brain.df.set(w, (brain.df.get(w) || 0) + 1);
-    }
-  }
-  indexMarkov(brain, answer);
-}
-
-function indexMarkov(brain, text) {
-  const ws = words(text);
-  if (!ws.length) return;
-  brain.starters.push(ws[0]);
-  for (let i = 0; i < ws.length; i++) {
-    const cur = ws[i];
-    const next = ws[i + 1] || null;
-    if (!brain.markov.has(cur)) brain.markov.set(cur, new Map());
-    if (next) {
-      const m = brain.markov.get(cur);
-      m.set(next, (m.get(next) || 0) + 1);
-    }
-  }
-}
-
-function unindexPair(brain, idx) {
-  const p = brain.pairs[idx];
-  if (!p || !p.qWords) return;
-  const seen = new Set();
-  for (const w of p.qWords) {
-    const s = brain.wordIndex.get(w);
-    if (s) { s.delete(idx); if (!s.size) brain.wordIndex.delete(w); }
-    if (!seen.has(w)) {
-      seen.add(w);
-      const d = (brain.df.get(w) || 0) - 1;
-      if (d <= 0) brain.df.delete(w);
-      else brain.df.set(w, d);
-    }
-  }
-  p.qWords = null;
-}
-
-function rebuildMarkov(brain) {
-  brain.markov.clear();
-  brain.starters = [];
+function buildVocab(brain) {
+  brain.vocab = new Map();
   for (const p of brain.pairs) {
-    if (p.answer) indexMarkov(brain, p.answer);
-  }
-}
-
-function rebuildIndex(brain) {
-  brain.wordIndex.clear();
-  brain.df.clear();
-  for (let i = 0; i < brain.pairs.length; i++) {
-    brain.pairs[i].qWords = null;
-    indexPair(brain, i, brain.pairs[i].question, brain.pairs[i].answer);
-  }
-  rebuildMarkov(brain);
-}
-
-function addSyn(brain, a, b) {
-  if (a === b) return;
-  if (!brain.syn.has(a)) brain.syn.set(a, new Set());
-  if (!brain.syn.has(b)) brain.syn.set(b, new Set());
-  const sa = brain.syn.get(a), sb = brain.syn.get(b);
-  if (sa.size < MAX_SYN) sa.add(b);
-  if (sb.size < MAX_SYN) sb.add(a);
-}
-
-function delSyn(brain, a, b) {
-  const sa = brain.syn.get(a), sb = brain.syn.get(b);
-  if (sa) sa.delete(b);
-  if (sb) sb.delete(a);
-}
-
-function scorePair(brain, queryWords, pairIdx) {
-  const pair = brain.pairs[pairIdx];
-  if (!pair || !pair.qWords || !pair.qWords.length) return 0;
-  const qSet = new Set();
-  for (const w of queryWords) for (const v of expand(brain, w)) qSet.add(v);
-  const pairSet = new Set(pair.qWords);
-  let dot = 0, qNorm = 0, pNorm = 0;
-  for (const w of qSet) {
-    const i = idf(brain, w);
-    qNorm += i * i;
-    if (pairSet.has(w)) dot += i * i;
-  }
-  for (const w of pairSet) {
-    const i = idf(brain, w);
-    pNorm += i * i;
-  }
-  if (!qNorm || !pNorm) return 0;
-  return dot / (Math.sqrt(qNorm) * Math.sqrt(pNorm));
-}
-
-function findBestPairs(brain, queryWords, limit) {
-  const candidates = new Set();
-  for (const w of queryWords) {
-    for (const v of expand(brain, w)) {
-      const idxs = brain.wordIndex.get(v);
-      if (idxs) for (const i of idxs) candidates.add(i);
+    const ws = words(p.question).concat(words(p.answer));
+    for (const w of ws) {
+      if (!brain.vocab.has(w)) brain.vocab.set(w, brain.vocab.size);
     }
   }
+}
+
+function buildPPMI(brain) {
+  const V = brain.vocab.size;
+  if (!V) {
+    brain.ppmi = null;
+    return;
+  }
+
+  const cooc = new Map();
+  const wordTotal = new Float64Array(V);
+  let totalPairs = 0;
+
+  for (const p of brain.pairs) {
+    const ws = words(p.question + ' ' + p.answer).map(w => brain.vocab.get(w)).filter(x => x !== undefined);
+    totalPairs++;
+    for (let i = 0; i < ws.length; i++) {
+      wordTotal[ws[i]]++;
+      for (let j = i + 1; j < Math.min(i + 1 + PPMI_WINDOW, ws.length); j++) {
+        const a = ws[i], b = ws[j];
+        const key = a < b ? a * V + b : b * V + a;
+        cooc.set(key, (cooc.get(key) || 0) + 1);
+      }
+    }
+  }
+
+  const ppmi = new Map();
+  const totalCooc = [...cooc.values()].reduce((s, v) => s + v, 0) || 1;
+
+  for (const [key, count] of cooc) {
+    const a = Math.floor(key / V);
+    const b = key % V;
+    const pA = wordTotal[a] / totalCooc;
+    const pB = wordTotal[b] / totalCooc;
+    const pAB = count / totalCooc;
+    if (!pA || !pB || !pAB) continue;
+    const pmi = Math.log(pAB / (pA * pB));
+    if (pmi > 0) ppmi.set(key, pmi);
+  }
+
+  brain.ppmi = { V, ppmi, wordTotal, totalCooc };
+}
+
+function powerIteration(M, dim, iterations = 30) {
+  const n = M.length;
+  const Q = [];
+  const R = [];
+
+  let A = M.map(row => row.slice());
+
+  for (let k = 0; k < dim; k++) {
+    let v = new Float64Array(n);
+    for (let i = 0; i < n; i++) v[i] = Math.random();
+    let norm = 0;
+    for (let i = 0; i < n; i++) norm += v[i] * v[i];
+    norm = Math.sqrt(norm);
+    if (!norm) break;
+    for (let i = 0; i < n; i++) v[i] /= norm;
+
+    for (let it = 0; it < iterations; it++) {
+      const w = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        let s = 0;
+        const row = A[i];
+        for (let j = 0; j < n; j++) s += row[j] * v[j];
+        w[i] = s;
+      }
+      let nn = 0;
+      for (let i = 0; i < n; i++) nn += w[i] * w[i];
+      nn = Math.sqrt(nn);
+      if (nn < 1e-12) break;
+      for (let i = 0; i < n; i++) v[i] = w[i] / nn;
+    }
+
+    const Av = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      let s = 0;
+      const row = A[i];
+      for (let j = 0; j < n; j++) s += row[j] * v[j];
+      Av[i] = s;
+    }
+    let lambda = 0;
+    for (let i = 0; i < n; i++) lambda += v[i] * Av[i];
+
+    Q.push(Array.from(v));
+    R.push(lambda);
+
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        A[i][j] -= lambda * v[i] * v[j];
+      }
+    }
+  }
+
+  return { Q, R };
+}
+
+function computeVectors(brain) {
+  const V = brain.vocab.size;
+  if (!V || !brain.ppmi) {
+    brain.vectors = null;
+    brain.pairVectors = null;
+    return;
+  }
+
+  const dim = Math.min(DIM, Math.max(2, V - 1));
+
+  const M = [];
+  for (let i = 0; i < V; i++) M.push(new Float64Array(V));
+
+  for (const [key, val] of brain.ppmi.ppmi) {
+    const a = Math.floor(key / V);
+    const b = key % V;
+    M[a][b] = val;
+    M[b][a] = val;
+  }
+
+  const { Q } = powerIteration(M, dim);
+
+  const vectors = new Map();
+  for (let i = 0; i < V; i++) {
+    const vec = new Float64Array(dim);
+    for (let k = 0; k < dim; k++) vec[k] = Q[k][i];
+    let norm = 0;
+    for (let k = 0; k < dim; k++) norm += vec[k] * vec[k];
+    norm = Math.sqrt(norm) || 1;
+    for (let k = 0; k < dim; k++) vec[k] /= norm;
+    vectors.set(i, vec);
+  }
+  brain.vectors = vectors;
+
+  const pairVectors = [];
+  for (const p of brain.pairs) {
+    const ws = words(p.question);
+    const vec = new Float64Array(dim);
+    let count = 0;
+    for (const w of ws) {
+      for (const v of expandSyn(brain, w)) {
+        const id = brain.vocab.get(v);
+        if (id === undefined) continue;
+        const wv = vectors.get(id);
+        if (!wv) continue;
+        for (let k = 0; k < dim; k++) vec[k] += wv[k];
+        count++;
+      }
+    }
+    if (count) {
+      let norm = 0;
+      for (let k = 0; k < dim; k++) norm += vec[k] * vec[k];
+      norm = Math.sqrt(norm) || 1;
+      for (let k = 0; k < dim; k++) vec[k] /= norm;
+    }
+    pairVectors.push(vec);
+  }
+  brain.pairVectors = pairVectors;
+}
+
+function questionVector(brain, input) {
+  if (!brain.vectors) return null;
+  const ws = words(input);
+  if (!ws.length) return null;
+  const dim = brain.vectors.values().next().value.length;
+  const vec = new Float64Array(dim);
+  let count = 0;
+  for (const w of ws) {
+    for (const v of expandSyn(brain, w)) {
+      const id = brain.vocab.get(v);
+      if (id === undefined) continue;
+      const wv = brain.vectors.get(id);
+      if (!wv) continue;
+      for (let k = 0; k < dim; k++) vec[k] += wv[k];
+      count++;
+    }
+  }
+  if (!count) return null;
+  let norm = 0;
+  for (let k = 0; k < dim; k++) norm += vec[k] * vec[k];
+  norm = Math.sqrt(norm) || 1;
+  for (let k = 0; k < dim; k++) vec[k] /= norm;
+  return vec;
+}
+
+function cosVec(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (!na || !nb) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+function findTopPairs(brain, qVec, limit) {
+  if (!brain.pairVectors) return [];
   const scored = [];
-  for (const i of candidates) {
-    const s = scorePair(brain, queryWords, i);
-    if (s > 0) scored.push({ idx: i, score: s });
+  for (let i = 0; i < brain.pairVectors.length; i++) {
+    const score = cosVec(qVec, brain.pairVectors[i]);
+    if (score > 0) scored.push({ idx: i, score });
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit);
 }
 
-function pickNext(brain, word) {
-  const m = brain.markov.get(word);
-  if (!m || !m.size) return null;
-  let total = 0;
-  for (const c of m.values()) total += c;
-  let r = Math.random() * total;
-  for (const [next, count] of m) {
-    r -= count;
-    if (r <= 0) return next;
-  }
-  return null;
-}
+function bridgeGenerate(brain, input, topPairs) {
+  const qWords = words(input);
+  const candidates = [];
 
-function generateFromSeed(brain, seed) {
-  if (!brain.markov.has(seed)) return null;
-  const out = [seed];
-  let cur = seed;
-  for (let i = 0; i < MAX_GEN_LEN; i++) {
-    const next = pickNext(brain, cur);
-    if (!next) break;
-    out.push(next);
-    cur = next;
-    if (out.length >= MIN_GEN_LEN && Math.random() < 0.15) break;
-  }
-  if (out.length < MIN_GEN_LEN) return null;
-  return out.join(' ');
-}
+  for (const tp of topPairs) {
+    const pair = brain.pairs[tp.idx];
+    const ansWords = words(pair.answer);
+    if (!ansWords.length) continue;
 
-function pickSeedFromPairs(brain, bestPairs) {
-  const seeds = [];
-  for (const bp of bestPairs) {
-    const ans = brain.pairs[bp.idx].answer;
-    const ws = words(ans);
-    if (ws.length) seeds.push({ word: ws[0], score: bp.score });
+    let relevance = 0;
+    for (const aw of ansWords) {
+      for (const qw of qWords) {
+        if (brain.syn && brain.syn.get(qw)?.has(aw)) { relevance += 1; break; }
+        if (aw === qw) { relevance += 1; break; }
+      }
+    }
+    candidates.push({
+      text: pair.answer,
+      score: tp.score + relevance * 0.1,
+    });
   }
-  if (!seeds.length) return null;
-  seeds.sort((a, b) => b.score - a.score);
-  return seeds[0].word;
-}
 
-function generateAnswer(brain, queryWords, bestPairs) {
-  const seed = pickSeedFromPairs(brain, bestPairs);
-  if (!seed) return null;
-  const gen = generateFromSeed(brain, seed);
-  if (gen) return gen;
-  return null;
-}
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.score - a.score);
 
-function glueFromPairs(brain, bestPairs) {
-  const parts = [];
-  for (const bp of bestPairs.slice(0, 2)) {
-    const ans = brain.pairs[bp.idx].answer;
-    if (ans && !parts.includes(ans)) parts.push(ans);
+  const top = candidates[0];
+  if (candidates.length >= 2) {
+    const second = candidates[1];
+    if (second.text !== top.text && second.score >= top.score * 0.7) {
+      const tWords = words(top.text);
+      const sWords = words(second.text);
+      const shared = tWords.filter(w => sWords.includes(w)).length;
+      if (shared < tWords.length * 0.5) {
+        return top.text + ' ' + second.text;
+      }
+    }
   }
-  if (!parts.length) return null;
-  return parts.join(' ');
+  return top.text;
 }
 
 function answerFor(brain, input) {
   if (!brain.pairs.length) return null;
-  const qWords = words(input);
-  if (!qWords.length) return null;
 
-  const bestPairs = findBestPairs(brain, qWords, 5);
-
-  if (bestPairs.length) {
-    const top = bestPairs[0];
-    if (top.score >= 0.65) {
-      return { answer: brain.pairs[top.idx].answer, kind: 'exact', score: top.score };
-    }
-    if (top.score >= MIN_SCORE) {
-      const gen = generateAnswer(brain, qWords, bestPairs);
-      if (gen) return { answer: gen, kind: 'generated', score: top.score };
-      const glue = glueFromPairs(brain, bestPairs);
-      if (glue) return { answer: glue, kind: 'glued', score: top.score };
-      return { answer: brain.pairs[top.idx].answer, kind: 'exact', score: top.score };
-    }
+  if (brain.dirty >= REBUILD_EVERY) {
+    rebuildBrainVectors(brain);
   }
 
-  const gen = generateFromRandomSeed(brain);
-  if (gen) return { answer: gen, kind: 'random', score: 0 };
+  if (!brain.vectors) {
+    rebuildBrainVectors(brain);
+    if (!brain.vectors) return null;
+  }
+
+  const qVec = questionVector(brain, input);
+  if (!qVec) {
+    const qWords = words(input);
+    for (let i = 0; i < brain.pairs.length; i++) {
+      const pWords = words(brain.pairs[i].question);
+      const overlap = pWords.filter(w => qWords.includes(w)).length;
+      if (overlap > 0) return { answer: brain.pairs[i].answer, kind: 'fallback' };
+    }
+    return null;
+  }
+
+  const top = findTopPairs(brain, qVec, 5);
+  if (!top.length) return null;
+
+  const best = top[0];
+  if (best.score >= HIGH_CONFIDENCE) {
+    return { answer: brain.pairs[best.idx].answer, kind: 'vector-exact', score: best.score };
+  }
+  if (best.score >= MIN_SCORE) {
+    const gen = bridgeGenerate(brain, input, top);
+    if (gen) return { answer: gen, kind: 'vector-generated', score: best.score };
+    return { answer: brain.pairs[best.idx].answer, kind: 'vector-exact', score: best.score };
+  }
+
   return null;
 }
 
-function generateFromRandomSeed(brain) {
-  if (!brain.starters.length) return null;
-  const seed = brain.starters[Math.floor(Math.random() * brain.starters.length)];
-  return generateFromSeed(brain, seed);
+function rebuildBrainVectors(brain) {
+  try {
+    buildVocab(brain);
+    buildPPMI(brain);
+    computeVectors(brain);
+    brain.dirty = 0;
+    console.log('Vectors rebuilt for', brain.owner, 'vocab:', brain.vocab.size, 'pairs:', brain.pairs.length);
+  } catch (e) {
+    console.error('rebuild error:', e.message);
+  }
 }
 
 async function dbSavePair(owner, q, a) {
@@ -364,12 +458,12 @@ async function ensureLoaded(brain) {
   if (brain.loading) return brain.loading;
   brain.loading = (async () => {
     const { pairs, syn } = await dbLoadAll(brain.owner);
-    brain.pairs = pairs.map(p => ({ question: p.question, answer: p.answer, qWords: null }));
+    brain.pairs = pairs.map(p => ({ question: p.question, answer: p.answer }));
     brain.syn = new Map();
     for (const [w, set] of syn) brain.syn.set(w, new Set(set));
-    rebuildIndex(brain);
     brain.loaded = true;
-    console.log('Loaded', brain.owner, 'pairs:', brain.pairs.length, 'syn:', brain.syn.size, 'markov:', brain.markov.size);
+    brain.dirty = pairs.length;
+    console.log('Loaded', brain.owner, 'pairs:', brain.pairs.length);
     return brain;
   })();
   try { return await brain.loading; }
@@ -402,17 +496,18 @@ async function send(chat, text) {
 }
 
 const HELP = [
-  'Свой генеративный бот. У каждого свой мозг.',
+  'Смысловой бот. У каждого свой мозг.',
   '',
-  '/teach вопрос = ответ — научить',
+  '/teach вопрос = ответ',
   '/learn слово = синоним1, синоним2',
   '/delete вопрос',
   '/forget слово = синоним',
   '/list [стр]',
   '/synonyms слово',
+  '/rebuild — пересчитать смысловые векторы',
   '/stats',
   '',
-  'Если точного ответа нет — бот сам сгенерирует из выученного.',
+  'Чем больше похожих пар — тем умнее бот.',
 ].join('\n');
 
 async function handle(chat, text) {
@@ -422,10 +517,18 @@ async function handle(chat, text) {
 
   if (t === '/start' || t === '/help') return send(chat, HELP);
 
+  if (t === '/rebuild') {
+    await ensureLoaded(brain);
+    await send(chat, 'Пересчитываю смысловые векторы...');
+    rebuildBrainVectors(brain);
+    return send(chat, `Готово. Слов: ${brain.vocab.size}, размерность: ${brain.vectors ? brain.vectors.values().next().value.length : 0}`);
+  }
+
   if (t === '/stats') {
     await ensureLoaded(brain);
     const links = [...brain.syn.values()].reduce((s, set) => s + set.size, 0);
-    return send(chat, `Пар: ${brain.pairs.length}\nСлов с синонимами: ${brain.syn.size}\nСвязей: ${links}\nСлов в цепи Маркова: ${brain.markov.size}`);
+    const dim = brain.vectors ? brain.vectors.values().next().value.length : 0;
+    return send(chat, `Пар: ${brain.pairs.length}\nСлов: ${brain.vocab.size}\nСинонимов: ${brain.syn.size} (${links} связей)\nВектор: ${dim}D\nDirty: ${brain.dirty}`);
   }
 
   if (t === '/list' || t.startsWith('/list ')) {
@@ -471,17 +574,13 @@ async function handle(chat, text) {
       const key = lc(q);
       const idx = brain.pairs.findIndex(p => lc(p.question) === key);
       if (idx >= 0) {
-        unindexPair(brain, idx);
         brain.pairs[idx].question = q;
         brain.pairs[idx].answer = a;
-        indexPair(brain, idx, q, a);
-        rebuildMarkov(brain);
       } else {
         if (brain.pairs.length >= MAX_PAIRS) return send(chat, 'Слишком много пар.');
-        const newIdx = brain.pairs.length;
-        brain.pairs.push({ question: q, answer: a, qWords: null });
-        indexPair(brain, newIdx, q, a);
+        brain.pairs.push({ question: q, answer: a });
       }
+      brain.dirty++;
       return send(chat, `Запомнил: ${q} = ${a}`);
     } catch (e) {
       console.error('teach', e.message);
@@ -498,9 +597,8 @@ async function handle(chat, text) {
     if (idx < 0) return send(chat, `Не нашёл: ${key}`);
     try {
       await dbDeletePair(owner, brain.pairs[idx].question);
-      unindexPair(brain, idx);
       brain.pairs.splice(idx, 1);
-      rebuildIndex(brain);
+      brain.dirty++;
       return send(chat, `Удалил: ${rest}`);
     } catch (e) {
       console.error('delete', e.message);
@@ -516,17 +614,22 @@ async function handle(chat, text) {
     const others = parts[1].split(',').map(s => lc(s.trim())).filter(Boolean);
     if (!main || !others.length) return send(chat, 'Пусто.');
     await ensureLoaded(brain);
-    for (const o of others) addSyn(brain, main, o);
+    if (!brain.syn.has(main)) brain.syn.set(main, new Set());
+    for (const o of others) {
+      if (!brain.syn.has(o)) brain.syn.set(o, new Set());
+      if (brain.syn.get(main).size < MAX_SYN) brain.syn.get(main).add(o);
+      if (brain.syn.get(o).size < MAX_SYN) brain.syn.get(o).add(main);
+    }
     try {
-      await dbSaveSyn(owner, main, brain.syn.get(main) || new Set());
+      await dbSaveSyn(owner, main, brain.syn.get(main));
       for (const o of others) {
-        const s = brain.syn.get(o);
-        if (s) await dbSaveSyn(owner, o, s);
+        if (brain.syn.get(o)) await dbSaveSyn(owner, o, brain.syn.get(o));
       }
+      brain.dirty++;
       return send(chat, `Связал: ${main} ↔ ${others.join(', ')}`);
     } catch (e) {
       console.error('learn', e.message);
-      return send(chat, 'Ошибка сохранения.');
+      return send(chat, 'Ошибка.');
     }
   }
 
@@ -538,11 +641,12 @@ async function handle(chat, text) {
     const b = lc(parts[1].trim());
     if (!a || !b) return send(chat, 'Пусто.');
     await ensureLoaded(brain);
-    delSyn(brain, a, b);
+    if (brain.syn.get(a)) brain.syn.get(a).delete(b);
+    if (brain.syn.get(b)) brain.syn.get(b).delete(a);
     try {
-      const sa = brain.syn.get(a), sb = brain.syn.get(b);
-      if (sa) await dbSaveSyn(owner, a, sa);
-      if (sb) await dbSaveSyn(owner, b, sb);
+      if (brain.syn.get(a)) await dbSaveSyn(owner, a, brain.syn.get(a));
+      if (brain.syn.get(b)) await dbSaveSyn(owner, b, brain.syn.get(b));
+      brain.dirty++;
       return send(chat, `Разъединил: ${a} ✕ ${b}`);
     } catch (e) {
       console.error('forget', e.message);
@@ -579,7 +683,7 @@ async function poll() {
 async function start() {
   if (!BOT_TOKEN) { console.error('BOT_TOKEN not set'); process.exit(1); }
   if (!APP_ID || !JS_KEY || !MASTER_KEY) { console.error('B4A keys not set'); process.exit(1); }
-  console.log('Generative bot started');
+  console.log('Semantic bot started');
   poll();
 }
 
