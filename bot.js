@@ -14,8 +14,10 @@ const MAX_DELTA = 0.5;
 const TEMP = 0.7;
 const SNAPSHOT_DIR = "/tmp/snapshots";
 const MAX_SNAPSHOTS = 5;
-const MAX_REPEAT = 500;
 const MAX_FILE_SIZE = 2 * 1024 * 1024;
+const END_MARK = "\u0003";
+const MAX_EPOCHS = 200;
+const EARLY_STOP_PATIENCE = 5;
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
@@ -185,7 +187,8 @@ function generate(W, seedText, length) {
   let h = new Float32Array(HIDDEN);
   let lastByte = 32;
 
-  for (const b of enc.encode(seedText)) {
+  const actualSeed = seedText || END_MARK;
+  for (const b of enc.encode(actualSeed)) {
     const r = forwardStep(W, b, h);
     h = r.h;
     lastByte = b;
@@ -206,18 +209,22 @@ function generate(W, seedText, length) {
     lastByte = next;
   }
 
-  let result = seedText;
+  let result = "";
   let buf = [];
   for (const b of outBytes) {
     buf.push(b);
     const s = bytesToStr(buf);
     if (s !== null) {
-      result += s;
+      if (s === END_MARK) {
+        result += "\n";
+      } else {
+        result += s;
+      }
       buf = [];
     }
     if (buf.length > 4) buf = [];
   }
-  return result;
+  return seedText ? seedText + result : result;
 }
 
 async function tg(method, payload) {
@@ -308,7 +315,7 @@ function snapshotDir(chatId) {
   return path.join(SNAPSHOT_DIR, String(chatId));
 }
 
-function saveSnapshot(chatId, m, label) {
+function saveSnapshot(chatId, m, label, loss) {
   try {
     const dir = snapshotDir(chatId);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -316,23 +323,23 @@ function saveSnapshot(chatId, m, label) {
     while (files.length >= MAX_SNAPSHOTS) {
       fs.unlinkSync(path.join(dir, files.shift()));
     }
-    const fname = String(Date.now()) + "_" + label + ".bin";
+    const lossStr = loss !== undefined ? loss.toFixed(3) : "start";
+    const fname = String(Date.now()) + "_" + label + "_loss" + lossStr + ".bin";
     fs.writeFileSync(path.join(dir, fname), packModel(m));
   } catch (e) {
     console.error("snapshot failed:", e.message);
   }
 }
 
-function loadLastSnapshot(chatId) {
+function loadSnapshotByIndex(chatId, index) {
   try {
     const dir = snapshotDir(chatId);
     if (!fs.existsSync(dir)) return null;
     const files = fs.readdirSync(dir).sort();
-    if (files.length === 0) return null;
-    const last = files[files.length - 1];
-    const buf = fs.readFileSync(path.join(dir, last));
-    fs.unlinkSync(path.join(dir, last));
-    return { model: unpackModel(buf), name: last };
+    if (index < 0 || index >= files.length) return null;
+    const f = files[index];
+    const buf = fs.readFileSync(path.join(dir, f));
+    return { model: unpackModel(buf), name: f };
   } catch (e) {
     console.error("load snapshot failed:", e.message);
     return null;
@@ -348,18 +355,68 @@ function getModel(chatId) {
   return m;
 }
 
-function trainOnText(m, text) {
-  const bytes = new TextEncoder().encode(text);
-  let totalLoss = 0, steps = 0;
-  for (let i = 0; i < bytes.length - 1; i++) {
-    const x = bytes[i];
-    const y = bytes[i + 1];
-    const r = trainStep(m, x, y, m.h);
-    m.h = r.h;
-    totalLoss += r.loss;
-    steps++;
+function shuffle(arr, rnd) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
   }
-  return { avg: totalLoss / Math.max(steps, 1), steps };
+  return a;
+}
+
+function trainOnPhrases(m, phrases, epochs, onEpoch) {
+  const enc = new TextEncoder();
+  const endBytes = enc.encode(END_MARK);
+  const rnd = mulberry32(Date.now() & 0xffff);
+
+  const encodedPhrases = phrases.map(p => {
+    const bytes = enc.encode(p);
+    const full = new Uint8Array(bytes.length + endBytes.length);
+    full.set(bytes, 0);
+    full.set(endBytes, bytes.length);
+    return full;
+  });
+
+  let totalLoss = 0, steps = 0;
+  let bestLoss = Infinity;
+  let patienceLeft = EARLY_STOP_PATIENCE;
+  let stopped = false;
+  let epochHistory = [];
+
+  for (let epoch = 0; epoch < epochs && !stopped; epoch++) {
+    const order = shuffle(encodedPhrases, rnd);
+    let epochLoss = 0, epochSteps = 0;
+
+    for (const bytes of order) {
+      for (let i = 0; i < bytes.length - 1; i++) {
+        const r = trainStep(m, bytes[i], bytes[i + 1], m.h);
+        m.h = r.h;
+        epochLoss += r.loss;
+        epochSteps++;
+      }
+    }
+
+    const avgEpoch = epochLoss / Math.max(epochSteps, 1);
+    totalLoss += epochLoss;
+    steps += epochSteps;
+    epochHistory.push(avgEpoch);
+
+    if (onEpoch && (epoch + 1) % 20 === 0) {
+      onEpoch(epoch + 1, epochs, avgEpoch);
+    }
+
+    if (avgEpoch < bestLoss - 0.001) {
+      bestLoss = avgEpoch;
+      patienceLeft = EARLY_STOP_PATIENCE;
+    } else {
+      patienceLeft--;
+      if (patienceLeft <= 0) {
+        stopped = true;
+      }
+    }
+  }
+
+  return { avg: totalLoss / Math.max(steps, 1), steps, best: bestLoss, stopped, epochs: epochHistory.length, history: epochHistory };
 }
 
 async function processUpdate(update) {
@@ -373,60 +430,39 @@ async function processUpdate(update) {
     if (t === "да" || t === "/yes") {
       models.delete(chatId);
       try { fs.rmSync(snapshotDir(chatId), { recursive: true, force: true }); } catch {}
-      return send(chatId, "Модель сброшена. Начинаем заново.");
+      return send(chatId, "Модель сброшена.");
     }
-    return send(chatId, "Отмена. Модель сохранена.");
+    return send(chatId, "Отмена.");
   }
 
   if (msg.document) {
     const doc = msg.document;
     const name = (doc.file_name || "").toLowerCase();
-    if (!name.endsWith(".txt")) {
-      return send(chatId, "Принимаю только .txt файлы.");
-    }
-    if (doc.file_size && doc.file_size > MAX_FILE_SIZE) {
-      return send(chatId, "Файл слишком большой (максимум 2 МБ).");
-    }
-    await send(chatId, "Скачиваю файл...");
+    if (!name.endsWith(".txt")) return send(chatId, "Только .txt.");
+    if (doc.file_size && doc.file_size > MAX_FILE_SIZE) return send(chatId, "Файл больше 2 МБ.");
+    await send(chatId, "Скачиваю...");
     const content = await getFile(doc.file_id);
-    if (!content) {
-      return send(chatId, "Не смог скачать файл.");
-    }
-    if (content.length < 2) {
-      return send(chatId, "Файл пустой.");
-    }
+    if (!content || content.length < 2) return send(chatId, "Пусто или не скачалось.");
+
+    const lines = content.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0).slice(0, 50);
+    if (!lines.length) return send(chatId, "Нет строк для обучения.");
+
     const m = getModel(chatId);
-    saveSnapshot(chatId, m, "before_file");
+    saveSnapshot(chatId, m, "beforefile");
 
-    const fullText = content.slice(0, 100000);
-    const bytes = new TextEncoder().encode(fullText);
+    const result = trainOnPhrases(m, lines, 100, async (e, total, loss) => {
+      if (e % 40 === 0) await send(chatId, "Эпоха " + e + "/" + total + ", loss: " + loss.toFixed(3));
+    });
 
-    let totalLoss = 0, steps = 0;
-    const batchSize = 5000;
-    let i = 0;
-    while (i < bytes.length - 1) {
-      const end = Math.min(i + batchSize, bytes.length - 1);
-      for (; i < end; i++) {
-        const x = bytes[i];
-        const y = bytes[i + 1];
-        const r = trainStep(m, x, y, m.h);
-        m.h = r.h;
-        totalLoss += r.loss;
-        steps++;
-      }
-      if (i % 20000 === 0) {
-        await send(chatId, "Прогресс: " + i + " / " + (bytes.length - 1) + " байт, Loss: " + (totalLoss / steps).toFixed(3));
-      }
-    }
+    saveSnapshot(chatId, m, "afterfile", result.avg);
 
-    const avg = (totalLoss / Math.max(steps, 1)).toFixed(3);
     return send(chatId,
       "Файл обработан.\n" +
-      "Символов: " + fullText.length + "\n" +
-      "Байт: " + bytes.length + "\n" +
-      "Loss: " + avg + "\n" +
-      "Всего шагов: " + m.t + "\n" +
-      "(если что-то не так — /undo)"
+      "Строк: " + lines.length + "\n" +
+      "Эпох: " + result.epochs + (result.stopped ? " (ранний стоп)" : "") + "\n" +
+      "Loss: " + result.avg.toFixed(3) + "\n" +
+      "Лучший: " + result.best.toFixed(3) + "\n" +
+      "Шагов: " + m.t
     );
   }
 
@@ -436,37 +472,41 @@ async function processUpdate(update) {
 
   if (text === "/start" || text === "/help") {
     return send(chatId,
-      "RNN-нейросеть.\n\n" +
-      "Как учить:\n" +
-      "1. /repeat 100 привет как дела - повторит фразу 100 раз\n" +
-      "2. Или отправь .txt файл - обучусь на нём\n" +
-      "3. Или просто отправь текст - учусь один раз\n\n" +
-      "Команды:\n" +
-      "/repeat N текст - повторить текст N раз (макс 500)\n" +
-      "/gen текст - сгенерировать\n" +
-      "/gen 5 текст - 5 вариантов\n" +
-      "/top текст - что я хочу сказать дальше\n" +
+      "RNN. Команды:\n\n" +
+      "/learn фраза1 | фраза2 | фраза3 - учить фразы\n" +
+      "/gen [начало] - генерировать\n" +
       "/stats - статистика\n" +
-      "/undo - откатить последнее обучение\n" +
-      "/reset - сбросить модель"
+      "/undo - откатить\n" +
+      "/reset - сбросить\n\n" +
+      "Как учить: пиши фразы через |. Бот учит их по кругу и не забывает.\n\n" +
+      "Пример:\n" +
+      "/learn привет как дела | хорошо а у тебя | тоже хорошо"
     );
   }
 
   if (text === "/reset") {
     pendingReset.add(chatId);
-    return send(chatId, "Точно сбросить модель? Напиши 'да'.");
+    return send(chatId, "Точно сбросить? Напиши 'да'.");
   }
 
   if (text === "/undo") {
-    const snap = loadLastSnapshot(chatId);
-    if (!snap) return send(chatId, "Нечего откатывать.");
-    models.set(chatId, snap.model);
-    return send(chatId, "Откатил. Шагов теперь: " + snap.model.t);
+    const dir = snapshotDir(chatId);
+    if (!fs.existsSync(dir)) return send(chatId, "Нечего откатывать.");
+    const files = fs.readdirSync(dir).sort();
+    if (!files.length) return send(chatId, "Нечего откатывать.");
+    const last = files[files.length - 1];
+    fs.unlinkSync(path.join(dir, last));
+    const remaining = fs.readdirSync(dir).sort();
+    if (!remaining.length) return send(chatId, "Откатил до пустой модели.");
+    const target = remaining[remaining.length - 1];
+    const buf = fs.readFileSync(path.join(dir, target));
+    models.set(chatId, unpackModel(buf));
+    return send(chatId, "Откатил. Шагов: " + models.get(chatId).t);
   }
 
-  if (text === "/stats" || text === "/info") {
+  if (text === "/stats") {
     const m = models.get(chatId);
-    if (!m) return send(chatId, "Модель пустая. Отправь текст или /repeat.");
+    if (!m) return send(chatId, "Модель пустая. Используй /learn");
     const params = VOCAB_SIZE*EMB + HIDDEN*EMB + HIDDEN*HIDDEN + HIDDEN + VOCAB_SIZE*HIDDEN + VOCAB_SIZE;
     let snaps = 0;
     try {
@@ -479,106 +519,63 @@ async function processUpdate(update) {
       "Hidden: " + HIDDEN + "\n" +
       "Embedding: " + EMB + "\n" +
       "LR: " + LR + "\n" +
-      "Снапшотов: " + snaps
+      "Откатов доступно: " + snaps
     );
   }
 
-  if (text.startsWith("/repeat")) {
-    const rest = text.slice(7).trim();
-    const mNum = rest.match(/^(\d+)\s+(.+)$/s);
-    if (!mNum) {
-      return send(chatId, "Использование: /repeat 100 привет как дела");
+  if (text.startsWith("/learn")) {
+    let rest = text.slice(6).trim();
+    if (!rest) {
+      return send(chatId,
+        "Использование:\n" +
+        "/learn фраза1 | фраза2 | фраза3\n" +
+        "/learn 100 фраза1 | фраза2  (100 эпох)\n\n" +
+        "Фразы разделяй |. Бот учит их в случайном порядке, не забывая."
+      );
     }
-    let count = parseInt(mNum[1]);
-    let phrase = mNum[2].trim();
-    if (count < 1) count = 1;
-    if (count > MAX_REPEAT) count = MAX_REPEAT;
-    if (!phrase) return send(chatId, "Нужен текст после числа.");
-    if (phrase.length > 200) phrase = phrase.slice(0, 200);
+
+    let epochs = 100;
+    const mNum = rest.match(/^(\d+)\s+(.+)$/s);
+    if (mNum) {
+      epochs = Math.min(parseInt(mNum[1]), MAX_EPOCHS);
+      rest = mNum[2];
+    }
+
+    const phrases = rest.split("|").map(p => p.trim()).filter(p => p.length > 0);
+    if (!phrases.length) return send(chatId, "Нужна хотя бы одна фраза.");
+    if (phrases.length > 20) return send(chatId, "Максимум 20 фраз.");
+    for (let i = 0; i < phrases.length; i++) {
+      if (phrases[i].length > 100) phrases[i] = phrases[i].slice(0, 100);
+    }
 
     const m = getModel(chatId);
-    saveSnapshot(chatId, m, "before_repeat");
+    saveSnapshot(chatId, m, "beforelearn");
 
-    const fullText = (phrase + "\n").repeat(count);
-    const result = trainOnText(m, fullText);
+    const result = trainOnPhrases(m, phrases, epochs, async (e, total, loss) => {
+      if (e % 40 === 0) await send(chatId, "Эпоха " + e + "/" + total + ", loss: " + loss.toFixed(3));
+    });
 
+    saveSnapshot(chatId, m, "afterlearn", result.avg);
+
+    const firstWord = phrases[0].split(" ")[0];
     return send(chatId,
-      "Повторил " + count + " раз.\n" +
-      "Байт обработано: " + new TextEncoder().encode(fullText).length + "\n" +
+      "Обучил " + phrases.length + " фраз.\n" +
+      "Эпох: " + result.epochs + (result.stopped ? " (ранний стоп)" : "") + "\n" +
       "Loss: " + result.avg.toFixed(3) + "\n" +
-      "Всего шагов: " + m.t + "\n" +
-      "(если что-то не так — /undo)"
+      "Лучший: " + result.best.toFixed(3) + "\n" +
+      "Шагов: " + m.t + "\n\n" +
+      "Проверь: /gen " + firstWord
     );
-  }
-
-  if (text.startsWith("/top")) {
-    const seed = text.slice(4).trim().slice(0, 50);
-    const m = models.get(chatId);
-    if (!m) return send(chatId, "Сначала обучи меня.");
-    const enc = new TextEncoder();
-    let h = new Float32Array(HIDDEN);
-    let lastByte = 32;
-    for (const b of enc.encode(seed)) {
-      const r = forwardStep(m.W, b, h);
-      h = r.h;
-      lastByte = b;
-    }
-    const r = forwardStep(m.W, lastByte, h);
-    const probs = r.logits;
-    softmaxInPlace(probs);
-
-    const pairs = [];
-    for (let i = 0; i < VOCAB_SIZE; i++) pairs.push([i, probs[i]]);
-    pairs.sort((a, b) => b[1] - a[1]);
-
-    let out = "После '" + seed + "':\n\n";
-    for (let i = 0; i < 8; i++) {
-      const [byte, prob] = pairs[i];
-      let single = "?";
-      try {
-        single = new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array([byte]));
-      } catch { single = "(полбайта)"; }
-      if (single === "\n") single = "\\n";
-      if (single === " ") single = "[пробел]";
-      if (single === "(полбайта)") {
-        out += (i + 1) + ". байт " + byte + " (часть символа) — " + (prob * 100).toFixed(1) + "%\n";
-      } else {
-        out += (i + 1) + ". '" + single + "' — " + (prob * 100).toFixed(1) + "%\n";
-      }
-    }
-    const combined = bytesToStr(pairs.slice(0, 2).map(p => p[0]));
-    if (combined) out += "\nТоп-2 байта вместе: '" + combined + "'";
-    return send(chatId, out);
   }
 
   if (text.startsWith("/gen")) {
-    const rest = text.slice(4).trim();
+    const seed = text.slice(4).trim().slice(0, 50);
     const m = models.get(chatId);
-    if (!m) return send(chatId, "Сначала обучи меня.");
-
-    const mNum = rest.match(/^(\d+)\s*(.*)$/);
-    if (mNum) {
-      const count = Math.min(parseInt(mNum[1]), 10);
-      const seed = mNum[2].slice(0, 50) || " ";
-      let out = "";
-      for (let i = 0; i < count; i++) {
-        out += (i + 1) + ") " + generate(m.W, seed, 60) + "\n\n";
-      }
-      return send(chatId, out);
-    }
-
-    return send(chatId, generate(m.W, rest.slice(0, 50) || " ", GEN_LEN));
+    if (!m) return send(chatId, "Сначала обучи: /learn");
+    return send(chatId, generate(m.W, seed, GEN_LEN));
   }
 
-  const m = getModel(chatId);
-  saveSnapshot(chatId, m, "before_train");
-  const result = trainOnText(m, text.slice(0, MAX_LEN));
-  return send(chatId,
-    "Обучился на " + result.steps + " байтах.\n" +
-    "Loss: " + result.avg.toFixed(3) + "\n" +
-    "Всего шагов: " + m.t + "\n" +
-    "(если мусор — /undo)"
-  );
+  return send(chatId, "Неизвестная команда. /help");
 }
 
 async function pollLoop() {
