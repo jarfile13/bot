@@ -3,223 +3,237 @@ const http = require('http');
 const Parse = require('parse/node');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-
 const APP_ID = process.env.B4A_APP_ID;
 const JS_KEY = process.env.B4A_JS_KEY;
 const MASTER_KEY = process.env.B4A_MASTER_KEY;
+
+const MIN_SCORE = 0.35;
+const MIN_SINGLE_LEN = 5;
+const MIN_IDF_FOR_INPUT = 0.8;
+const MAX_PAIRS = 20000;
+const CACHE_LIMIT = 500;
 
 const healthServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
 });
-healthServer.listen(3000, () => {
-  console.log('Health check server on port 3000');
-});
+healthServer.listen(3000, () => console.log('Health check server on port 3000'));
 
 Parse.initialize(APP_ID, JS_KEY, MASTER_KEY);
 Parse.serverURL = 'https://parseapi.back4app.com/';
 
-const MAX_NEIGHBORS = 20;
-const DECAY_THRESHOLD = 0.05;
-const DECAY_EVERY = 200;
-
-const nodes = new Map();
-const edges = new Map();
 const pairs = [];
 const wordToPairs = new Map();
+const docFreq = new Map();
+const byLen = new Map();
+const vocab = new Set();
+const answerCache = new Map();
 
 let offset = 0;
-let teachesSinceDecay = 0;
-let lastPairForChat = new Map();
 
 function lc(s) {
-  return String(s).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+  return String(s)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function words(s) {
   const n = lc(s);
-  return n ? n.split(' ').filter((w) => w.length > 1) : [];
+  if (!n) return [];
+  const out = [];
+  for (const w of n.split(' ')) {
+    if (w.length > 1) out.push(w);
+  }
+  return out;
 }
 
 function levenshtein(a, b) {
   if (a === b) return 0;
-  if (!a.length) return b.length;
-  if (!b.length) return a.length;
-  const prev = new Array(b.length + 1);
-  const cur = new Array(b.length + 1);
-  for (let j = 0; j <= b.length; j++) prev[j] = j;
-  for (let i = 1; i <= a.length; i++) {
+  const al = a.length, bl = b.length;
+  if (!al) return bl;
+  if (!bl) return al;
+  if (Math.abs(al - bl) > 2) return Infinity;
+  let prev = new Array(bl + 1);
+  let cur = new Array(bl + 1);
+  for (let j = 0; j <= bl; j++) prev[j] = j;
+  for (let i = 1; i <= al; i++) {
     cur[0] = i;
-    for (let j = 1; j <= b.length; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+    const ca = a.charCodeAt(i - 1);
+    for (let j = 1; j <= bl; j++) {
+      const cost = ca === b.charCodeAt(j - 1) ? 0 : 1;
+      const v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      cur[j] = v;
     }
-    for (let j = 0; j <= b.length; j++) prev[j] = cur[j];
+    const t = prev; prev = cur; cur = t;
   }
-  return prev[b.length];
+  return prev[bl];
 }
 
-function ensureNode(w) {
-  if (!nodes.has(w)) nodes.set(w, 0);
-  if (!edges.has(w)) edges.set(w, new Map());
-}
-
-function link(a, b, strength) {
-  if (a === b) return;
-  ensureNode(a);
-  ensureNode(b);
-  const ea = edges.get(a);
-  const eb = edges.get(b);
-  ea.set(b, Math.min(1, (ea.get(b) || 0) + strength));
-  eb.set(a, Math.min(1, (eb.get(a) || 0) + strength));
-}
-
-function charge(w, amount) {
-  ensureNode(w);
-  nodes.set(w, Math.min(1, nodes.get(w) + amount));
-}
-
-function indexWord(word, pairIndex) {
-  if (!wordToPairs.has(word)) wordToPairs.set(word, new Set());
-  wordToPairs.get(word).add(pairIndex);
-}
-
-function teachGraph(question, answer) {
-  const qw = words(question);
-  const aw = words(answer);
-  if (!qw.length || !aw.length) return;
-
-  for (const q of qw) {
-    charge(q, 1.0);
-    for (const a of aw) link(q, a, 0.3);
-  }
-  for (const a of aw) charge(a, 0.5);
-  for (let i = 0; i < qw.length; i++)
-    for (let j = i + 1; j < qw.length; j++) link(qw[i], qw[j], 0.5);
-  for (let i = 0; i < aw.length; i++)
-    for (let j = i + 1; j < aw.length; j++) link(aw[i], aw[j], 0.5);
-}
-
-function decay() {
-  for (const [word, neighbors] of edges) {
-    const entries = [...neighbors.entries()];
-    for (const [nWord, strength] of entries) {
-      const newStrength = strength * 0.98;
-      if (newStrength < DECAY_THRESHOLD) {
-        neighbors.delete(nWord);
-        const reverse = edges.get(nWord);
-        if (reverse) reverse.delete(word);
-      } else {
-        neighbors.set(nWord, newStrength);
-      }
-    }
-    if (neighbors.size > MAX_NEIGHBORS) {
-      const sorted = [...neighbors.entries()].sort((a, b) => b[1] - a[1]);
-      const keep = sorted.slice(0, MAX_NEIGHBORS);
-      neighbors.clear();
-      for (const [w, s] of keep) neighbors.set(w, s);
-    }
-  }
-
-  for (const [word, chargeVal] of nodes) {
-    const newCharge = chargeVal * 0.95;
-    if (newCharge < DECAY_THRESHOLD) nodes.delete(word);
-    else nodes.set(word, newCharge);
+function registerWord(w) {
+  if (!vocab.has(w)) {
+    vocab.add(w);
+    if (!byLen.has(w.length)) byLen.set(w.length, new Set());
+    byLen.get(w.length).add(w);
   }
 }
 
 function findClosestKnown(word) {
-  if (nodes.has(word)) return word;
+  if (vocab.has(word)) return word;
+  if (word.length < 3) return null;
   let best = null;
   let bestDist = Infinity;
-  for (const k of nodes.keys()) {
-    if (Math.abs(k.length - word.length) > 2) continue;
-    const d = levenshtein(word, k);
-    if (d < bestDist) {
-      bestDist = d;
-      best = k;
-      if (d === 1) break;
+  const maxDist = Math.max(1, Math.floor(word.length / 3));
+  for (let len = word.length - 2; len <= word.length + 2; len++) {
+    const bucket = byLen.get(len);
+    if (!bucket) continue;
+    for (const k of bucket) {
+      const d = levenshtein(word, k);
+      if (d < bestDist) {
+        bestDist = d;
+        best = k;
+        if (d === 1) return best;
+      }
     }
   }
-  if (best && bestDist <= Math.max(1, Math.floor(word.length / 3))) return best;
+  if (best && bestDist <= maxDist) return best;
   return null;
 }
 
-function spreadWave(startWords) {
-  const activation = new Map();
-  let frontier = [];
+function tokenizeForIndex(text) {
+  const out = [];
+  for (const w of words(text)) {
+    const k = findClosestKnown(w);
+    out.push(k || w);
+  }
+  return out;
+}
 
-  for (const w of startWords) {
-    const known = findClosestKnown(w);
-    if (known) {
-      activation.set(known, (activation.get(known) || 0) + 1);
-      frontier.push({ word: known, energy: 1, depth: 0 });
+function indexPair(idx, question) {
+  const qw = tokenizeForIndex(question);
+  const seen = new Set();
+  for (const w of qw) {
+    registerWord(w);
+    if (!wordToPairs.has(w)) wordToPairs.set(w, new Set());
+    wordToPairs.get(w).add(idx);
+    if (!seen.has(w)) {
+      seen.add(w);
+      docFreq.set(w, (docFreq.get(w) || 0) + 1);
     }
   }
+}
 
-  const MAX_DEPTH = 3;
-  const DECAY_FACTOR = 0.5;
-  const visited = new Map();
-
-  while (frontier.length) {
-    const next = [];
-    for (const { word, energy, depth } of frontier) {
-      if (depth >= MAX_DEPTH) continue;
-      const prevE = visited.get(word) || 0;
-      if (prevE >= energy) continue;
-      visited.set(word, energy);
-
-      const neighbors = edges.get(word);
-      if (!neighbors) continue;
-      for (const [nWord, strength] of neighbors) {
-        const newEnergy = energy * strength * DECAY_FACTOR;
-        if (newEnergy < 0.05) continue;
-        activation.set(nWord, (activation.get(nWord) || 0) + newEnergy);
-        next.push({ word: nWord, energy: newEnergy, depth: depth + 1 });
-      }
+function removePairFromIndex(idx, question) {
+  const qw = tokenizeForIndex(question);
+  const seen = new Set();
+  for (const w of qw) {
+    const s = wordToPairs.get(w);
+    if (s) {
+      s.delete(idx);
+      if (!s.size) wordToPairs.delete(w);
     }
-    frontier = next;
+    if (!seen.has(w)) {
+      seen.add(w);
+      const df = (docFreq.get(w) || 0) - 1;
+      if (df <= 0) docFreq.delete(w);
+      else docFreq.set(w, df);
+    }
   }
+}
 
-  return activation;
+function idf(w) {
+  const df = docFreq.get(w) || 0;
+  if (df === 0) return 0;
+  return Math.log(1 + pairs.length / df);
+}
+
+function scorePair(inputTokens, pairIdx) {
+  const pair = pairs[pairIdx];
+  if (!pair) return 0;
+  const qTokens = pair.tokens;
+  if (!qTokens.length) return 0;
+
+  const qCount = new Map();
+  for (const t of qTokens) qCount.set(t, (qCount.get(t) || 0) + 1);
+
+  const iCount = new Map();
+  for (const t of inputTokens) iCount.set(t, (iCount.get(t) || 0) + 1);
+
+  let dot = 0;
+  let qNorm = 0;
+  let iNorm = 0;
+
+  for (const [t, qc] of qCount) {
+    const w = idf(t);
+    qNorm += (qc * w) * (qc * w);
+    const ic = iCount.get(t) || 0;
+    if (ic) dot += (qc * w) * (ic * w);
+  }
+  for (const [t, ic] of iCount) {
+    const w = idf(t);
+    iNorm += (ic * w) * (ic * w);
+  }
+  if (qNorm === 0 || iNorm === 0) return 0;
+  return dot / (Math.sqrt(qNorm) * Math.sqrt(iNorm));
 }
 
 function answerFor(input) {
   if (!pairs.length) return null;
-  const iw = words(input);
-  if (!iw.length) return null;
+  const cacheKey = lc(input);
+  if (answerCache.has(cacheKey)) return answerCache.get(cacheKey);
 
-  const activation = spreadWave(iw);
+  const rawTokens = words(input);
+  if (!rawTokens.length) return null;
+  if (rawTokens.length === 1 && rawTokens[0].length < MIN_SINGLE_LEN) {
+    answerCache.set(cacheKey, null);
+    return null;
+  }
+
+  const inputTokens = [];
+  for (const w of rawTokens) {
+    const k = findClosestKnown(w);
+    const token = k || w;
+    if (idf(token) < MIN_IDF_FOR_INPUT) continue;
+    inputTokens.push(token);
+  }
+  if (!inputTokens.length) {
+    answerCache.set(cacheKey, null);
+    return null;
+  }
 
   const candidateSet = new Set();
-  for (const [word, energy] of activation) {
-    if (energy < 0.1) continue;
-    const idxs = wordToPairs.get(word);
+  for (const t of inputTokens) {
+    const idxs = wordToPairs.get(t);
     if (idxs) for (const i of idxs) candidateSet.add(i);
+    if (candidateSet.size > 500) break;
   }
-  if (!candidateSet.size) return null;
+  if (!candidateSet.size) {
+    answerCache.set(cacheKey, null);
+    return null;
+  }
 
-  let bestPair = null;
+  let best = null;
   let bestScore = 0;
-
   for (const i of candidateSet) {
-    const pair = pairs[i];
-    if (!pair) continue;
-    const qw = words(pair.question);
-    let score = 0;
-    for (const w of qw) {
-      const known = findClosestKnown(w);
-      if (known) score += activation.get(known) || 0;
-    }
-    score /= Math.sqrt(qw.length) || 1;
-    if (score > bestScore) {
-      bestScore = score;
-      bestPair = pair;
+    const s = scorePair(inputTokens, i);
+    if (s > bestScore) {
+      bestScore = s;
+      best = i;
     }
   }
 
-  if (bestPair && bestScore >= 0.4) return { pair: bestPair, score: bestScore };
-  return null;
+  let result = null;
+  if (best !== null && bestScore >= MIN_SCORE) {
+    result = { pair: pairs[best], score: bestScore };
+  }
+
+  if (answerCache.size >= CACHE_LIMIT) {
+    const firstKey = answerCache.keys().next().value;
+    answerCache.delete(firstKey);
+  }
+  answerCache.set(cacheKey, result);
+  return result;
 }
 
 async function savePairToDb(question, answer) {
@@ -227,7 +241,6 @@ async function savePairToDb(question, answer) {
   const query = new Parse.Query(Knowledge);
   query.equalTo('question', lc(question));
   let obj = await query.first({ useMasterKey: true });
-
   if (!obj) {
     obj = new Knowledge();
     obj.set('question', lc(question));
@@ -257,25 +270,43 @@ async function loadAllFromDb() {
   }));
 }
 
+function addPair(q, a) {
+  const tokens = tokenizeForIndex(q);
+  const idx = pairs.length;
+  pairs.push({ question: q, answer: a, tokens });
+  indexPair(idx, q);
+  return idx;
+}
+
+function updatePair(idx, q, a) {
+  removePairFromIndex(idx, pairs[idx].question);
+  const tokens = tokenizeForIndex(q);
+  pairs[idx] = { question: q, answer: a, tokens };
+  indexPair(idx, q);
+}
+
+function reindexFrom(startIdx) {
+  for (let i = startIdx; i < pairs.length; i++) {
+    indexPair(i, pairs[i].question);
+  }
+}
+
 async function rebuildFromDb() {
   pairs.length = 0;
   wordToPairs.clear();
-  nodes.clear();
-  edges.clear();
+  docFreq.clear();
+  byLen.clear();
+  vocab.clear();
+  answerCache.clear();
 
   const dbPairs = await loadAllFromDb();
-  for (let i = 0; i < dbPairs.length; i++) {
-    const p = dbPairs[i];
-    pairs.push({ question: p.question, answer: p.answer });
-    teachGraph(p.question, p.answer);
-    const qw = words(p.question);
-    for (const q of qw) indexWord(q, i);
-  }
+  for (const p of dbPairs) addPair(p.question, p.answer);
   console.log('Loaded from DB:', pairs.length, 'pairs');
 }
 
 function api(method, payload) {
   return new Promise((resolve, reject) => {
+    if (!BOT_TOKEN) return reject(new Error('BOT_TOKEN not set'));
     const data = JSON.stringify(payload || {});
     const req = https.request(
       {
@@ -333,10 +364,9 @@ async function handle(chatId, text) {
   }
 
   if (t === '/stats') {
-    const totalEdges = [...edges.values()].reduce((s, m) => s + m.size, 0) / 2;
     await send(
       chatId,
-      `Пар: ${pairs.length}\nСлов: ${nodes.size}\nСвязей: ${Math.floor(totalEdges)}`
+      `Пар: ${pairs.length}\nСлов: ${vocab.size}\nКэш: ${answerCache.size}`
     );
     return;
   }
@@ -361,37 +391,31 @@ async function handle(chatId, text) {
 
   if (t.startsWith('/teach')) {
     const rest = t.slice('/teach'.length).trim();
-    const sep = rest.indexOf('=');
-    if (sep === -1) {
+    const parts = rest.split('=');
+    if (parts.length < 2) {
       await send(chatId, 'Формат: /teach вопрос = ответ');
       return;
     }
-    const q = rest.slice(0, sep).trim();
-    const a = rest.slice(sep + 1).trim();
+    const q = parts[0].trim();
+    const a = parts.slice(1).join('=').trim();
     if (!q || !a) {
       await send(chatId, 'Пусто.');
       return;
     }
     try {
       await savePairToDb(q, a);
-
-      const existingIdx = pairs.findIndex((p) => lc(p.question) === lc(q));
+      const key = lc(q);
+      const existingIdx = pairs.findIndex((p) => lc(p.question) === key);
       if (existingIdx >= 0) {
-        pairs[existingIdx] = { question: q, answer: a };
+        updatePair(existingIdx, q, a);
       } else {
-        pairs.push({ question: q, answer: a });
+        if (pairs.length >= MAX_PAIRS) {
+          await send(chatId, 'Слишком много пар, удали что-нибудь.');
+          return;
+        }
+        addPair(q, a);
       }
-      teachGraph(q, a);
-
-      const idx = pairs.length - 1;
-      for (const w of words(q)) indexWord(w, idx);
-
-      teachesSinceDecay++;
-      if (teachesSinceDecay >= DECAY_EVERY) {
-        decay();
-        teachesSinceDecay = 0;
-      }
-
+      answerCache.clear();
       await send(chatId, `Запомнил: ${q} = ${a}`);
     } catch (e) {
       console.error('teach error:', e.message);
@@ -408,24 +432,28 @@ async function handle(chatId, text) {
     }
     const key = lc(rest);
     const idx = pairs.findIndex((p) => lc(p.question) === key);
-    if (idx >= 0) {
-      try {
-        await deletePairFromDb(pairs[idx].question);
-        await rebuildFromDb();
-        await send(chatId, `Удалил: ${rest}`);
-      } catch (e) {
-        console.error('delete error:', e.message);
-        await send(chatId, 'Ошибка удаления.');
-      }
+    if (idx < 0) {
+      await send(chatId, `Не нашёл: ${key}`);
       return;
     }
-    await send(chatId, `Не нашёл: ${key}`);
+    try {
+      await deletePairFromDb(pairs[idx].question);
+      removePairFromIndex(idx, pairs[idx].question);
+      pairs.splice(idx, 1);
+      wordToPairs.clear();
+      docFreq.clear();
+      for (let i = 0; i < pairs.length; i++) indexPair(i, pairs[i].question);
+      answerCache.clear();
+      await send(chatId, `Удалил: ${rest}`);
+    } catch (e) {
+      console.error('delete error:', e.message);
+      await send(chatId, 'Ошибка удаления.');
+    }
     return;
   }
 
   const res = answerFor(t);
   if (res) {
-    lastPairForChat.set(chatId, res.pair);
     await send(chatId, res.pair.answer);
   } else {
     await send(chatId, 'Не знаю. Научи: /teach вопрос = ответ');
@@ -441,7 +469,11 @@ async function poll() {
           offset = u.update_id + 1;
           const m = u.message;
           if (!m || !m.text) continue;
-          await handle(m.chat.id, m.text);
+          try {
+            await handle(m.chat.id, m.text);
+          } catch (e) {
+            console.error('handle error:', e.message);
+          }
         }
       }
     } catch (e) {
@@ -461,12 +493,8 @@ async function start() {
     process.exit(1);
   }
 
-  console.log('Bot started');
-  poll();
-
   try {
     await rebuildFromDb();
-
     if (pairs.length === 0) {
       console.log('Empty DB, seeding...');
       const seeds = [
@@ -475,16 +503,16 @@ async function start() {
         ['как дела', 'Отлично а у тебя'],
         ['пока', 'До встречи'],
       ];
-      for (const [q, a] of seeds) {
-        await savePairToDb(q, a);
-      }
+      for (const [q, a] of seeds) await savePairToDb(q, a);
       await rebuildFromDb();
     }
-
     console.log('Brain ready, pairs:', pairs.length);
   } catch (e) {
     console.error('start error:', e.message);
   }
+
+  console.log('Bot started');
+  poll();
 }
 
 start();
