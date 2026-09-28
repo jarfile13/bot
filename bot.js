@@ -1,49 +1,95 @@
 const https = require('https');
-const brainDb = require('./brain');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const SIMILARITY_THRESHOLD = 0.5;
 
-let brain = {};
+const knowledge = {};
+let lastAnswerChat = {};
+let offset = 0;
 
-function normalize(text) {
-  return String(text)
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+function lc(s) {
+  return String(s).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
 }
 
-function tokens(text) {
-  const n = normalize(text);
-  if (!n) return new Set();
-  return new Set(n.split(' '));
+function words(s) {
+  const n = lc(s);
+  return n ? n.split(' ').filter((w) => w.length > 1) : [];
 }
 
-function similarity(a, b) {
-  const ta = tokens(a);
-  const tb = tokens(b);
-  if (ta.size === 0 || tb.size === 0) return 0;
-  let inter = 0;
-  for (const t of ta) if (tb.has(t)) inter++;
-  const union = ta.size + tb.size - inter;
-  return union === 0 ? 0 : inter / union;
-}
-
-function findAnswer(text) {
-  const key = normalize(text);
-  if (!key) return null;
-  if (brain[key]) return brain[key];
-  let best = null;
-  let bestScore = 0;
-  for (const k of Object.keys(brain)) {
-    const s = similarity(k, key);
-    if (s > bestScore) {
-      bestScore = s;
-      best = k;
+function longestCommonSubstring(a, b) {
+  a = lc(a);
+  b = lc(b);
+  if (!a || !b) return 0;
+  let max = 0;
+  const prev = new Array(b.length + 1).fill(0);
+  const cur = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        cur[j] = prev[j - 1] + 1;
+        if (cur[j] > max) max = cur[j];
+      } else {
+        cur[j] = 0;
+      }
+    }
+    for (let j = 0; j <= b.length; j++) {
+      prev[j] = cur[j];
+      cur[j] = 0;
     }
   }
-  if (best && bestScore >= SIMILARITY_THRESHOLD) return brain[best];
+  return max;
+}
+
+function keywordScore(input, question) {
+  const iw = words(input);
+  const qw = words(question);
+  if (!iw.length || !qw.length) return 0;
+  let score = 0;
+  for (const q of qw) {
+    for (const i of iw) {
+      if (i === q) {
+        score += 2 + q.length * 0.1;
+        break;
+      }
+      if (q.length > 3 && i.length > 3 && (i.startsWith(q) || q.startsWith(i))) {
+        score += 1 + Math.min(q.length, i.length) * 0.05;
+        break;
+      }
+    }
+  }
+  return score;
+}
+
+function findAnswer(input) {
+  const keys = Object.keys(knowledge);
+  if (!keys.length) return null;
+
+  let bestKey = null;
+  let bestScore = 0;
+  for (const k of keys) {
+    const s = keywordScore(input, k);
+    if (s > bestScore) {
+      bestScore = s;
+      bestKey = k;
+    }
+  }
+  if (bestKey && bestScore >= 2) {
+    return knowledge[bestKey];
+  }
+
+  const inputLc = lc(input);
+  if (inputLc.length < 4) return null;
+  let bestSub = 0;
+  let bestBySub = null;
+  for (const k of keys) {
+    const l = longestCommonSubstring(inputLc, lc(k));
+    if (l > bestSub) {
+      bestSub = l;
+      bestBySub = k;
+    }
+  }
+  if (bestBySub && bestSub >= 4 && bestSub / inputLc.length >= 0.5) {
+    return knowledge[bestBySub];
+  }
   return null;
 }
 
@@ -78,110 +124,117 @@ function api(method, payload) {
   });
 }
 
-async function sendMessage(chatId, text) {
+async function send(chatId, text) {
   try {
-    await api('sendMessage', {
-      chat_id: chatId,
-      text,
-      disable_web_page_preview: true,
-    });
+    await api('sendMessage', { chat_id: chatId, text });
   } catch (e) {
-    console.error('sendMessage error:', e.message);
+    console.error('send error:', e.message);
   }
 }
 
 const HELP = [
-  'Доступные команды:',
-  '/help - показать справку',
-  '/teach вопрос | ответ - обучить бота',
-  '/delete вопрос - удалить знание',
-  '/list - показать все знания',
-  '/stats - статистика',
+  'Команды:',
+  '/help - справка',
+  '/teach вопрос = ответ - научить',
+  '/delete вопрос - забыть',
+  '/list - что знаю',
+  '/stats - сколько знаю',
   '',
-  'Просто напиши вопрос, и я отвечу, если знаю.',
+  'Просто пиши вопрос - отвечу, если знаю.',
 ].join('\n');
 
-async function handleCommand(chatId, text) {
-  const trimmed = text.trim();
+async function handle(chatId, text) {
+  const t = text.trim();
 
-  if (trimmed === '/start' || trimmed === '/help') {
-    await sendMessage(chatId, HELP);
-    return true;
+  if (t === '/start' || t === '/help') {
+    await send(chatId, HELP);
+    return;
   }
 
-  if (trimmed === '/list') {
-    const keys = Object.keys(brain);
-    if (keys.length === 0) {
-      await sendMessage(chatId, 'Пока ничего не знаю.');
-      return true;
+  if (t === '/stats') {
+    await send(chatId, `Знаю пар: ${Object.keys(knowledge).length}`);
+    return;
+  }
+
+  if (t === '/list') {
+    const keys = Object.keys(knowledge);
+    if (!keys.length) {
+      await send(chatId, 'Пусто.');
+      return;
     }
-    const lines = keys.map((k, i) => `${i + 1}. ${k} -> ${brain[k]}`);
-    await sendMessage(chatId, lines.join('\n'));
-    return true;
+    const lines = keys.map((k, i) => `${i + 1}. ${k} = ${knowledge[k]}`);
+    const chunkSize = 3500;
+    let buf = '';
+    for (const line of lines) {
+      if ((buf + line + '\n').length > chunkSize) {
+        await send(chatId, buf);
+        buf = '';
+      }
+      buf += line + '\n';
+    }
+    if (buf) await send(chatId, buf);
+    return;
   }
 
-  if (trimmed === '/stats') {
-    const count = Object.keys(brain).length;
-    await sendMessage(chatId, `Записей в базе знаний: ${count}`);
-    return true;
-  }
-
-  if (trimmed.startsWith('/teach')) {
-    const rest = trimmed.slice('/teach'.length).trim();
-    const sep = rest.indexOf('|');
+  if (t.startsWith('/teach')) {
+    const rest = t.slice('/teach'.length).trim();
+    const sep = rest.indexOf('=');
     if (sep === -1) {
-      await sendMessage(chatId, 'Формат: /teach вопрос | ответ');
-      return true;
+      await send(chatId, 'Формат: /teach вопрос = ответ');
+      return;
     }
-    const q = rest.slice(0, sep).trim();
+    const q = lc(rest.slice(0, sep));
     const a = rest.slice(sep + 1).trim();
     if (!q || !a) {
-      await sendMessage(chatId, 'Вопрос и ответ не должны быть пустыми.');
-      return true;
+      await send(chatId, 'Пусто.');
+      return;
     }
-    const key = normalize(q);
-    try {
-      await brainDb.upsert(key, a);
-      brain[key] = a;
-      await sendMessage(chatId, `Запомнил: ${key} -> ${a}`);
-    } catch (e) {
-      console.error('upsert error:', e.message);
-      await sendMessage(chatId, 'Ошибка сохранения. Попробуй позже.');
-    }
-    return true;
+    knowledge[q] = a;
+    await send(chatId, `Запомнил: ${q} = ${a}`);
+    return;
   }
 
-  if (trimmed.startsWith('/delete')) {
-    const rest = trimmed.slice('/delete'.length).trim();
+  if (t.startsWith('/delete')) {
+    const rest = t.slice('/delete'.length).trim();
     if (!rest) {
-      await sendMessage(chatId, 'Формат: /delete вопрос');
-      return true;
+      await send(chatId, 'Формат: /delete вопрос');
+      return;
     }
-    const key = normalize(rest);
-    if (brain[key]) {
-      try {
-        await brainDb.remove(key);
-        delete brain[key];
-        await sendMessage(chatId, `Удалил: ${key}`);
-      } catch (e) {
-        console.error('remove error:', e.message);
-        await sendMessage(chatId, 'Ошибка удаления. Попробуй позже.');
+    const k = lc(rest);
+    if (knowledge[k]) {
+      delete knowledge[k];
+      await send(chatId, `Удалил: ${k}`);
+      return;
+    }
+    const keys = Object.keys(knowledge);
+    let found = null;
+    let bestSub = 0;
+    for (const key of keys) {
+      const l = longestCommonSubstring(k, key);
+      if (l > bestSub) {
+        bestSub = l;
+        found = key;
       }
-    } else {
-      await sendMessage(chatId, `Не найдено: ${key}`);
     }
-    return true;
+    if (found && bestSub >= 4) {
+      delete knowledge[found];
+      await send(chatId, `Удалил: ${found}`);
+    } else {
+      await send(chatId, `Не нашёл: ${k}`);
+    }
+    return;
   }
 
-  return false;
+  const answer = findAnswer(t);
+  if (answer) {
+    lastAnswerChat[chatId] = answer;
+    await send(chatId, answer);
+  } else {
+    await send(chatId, 'Не знаю. Научи: /teach вопрос = ответ');
+  }
 }
 
-let offset = 0;
-let polling = false;
-
 async function poll() {
-  if (polling) return;
-  polling = true;
   while (true) {
     try {
       const res = await api('getUpdates', {
@@ -190,25 +243,11 @@ async function poll() {
         allowed_updates: ['message'],
       });
       if (res && res.ok && Array.isArray(res.result)) {
-        for (const update of res.result) {
-          offset = update.update_id + 1;
-          const msg = update.message;
+        for (const u of res.result) {
+          offset = u.update_id + 1;
+          const msg = u.message;
           if (!msg || !msg.text) continue;
-          const chatId = msg.chat.id;
-          const text = msg.text;
-
-          const handled = await handleCommand(chatId, text);
-          if (handled) continue;
-
-          const answer = findAnswer(text);
-          if (answer) {
-            await sendMessage(chatId, answer);
-          } else {
-            await sendMessage(
-              chatId,
-              'Не знаю ответа. Обучи меня: /teach вопрос | ответ'
-            );
-          }
+          await handle(msg.chat.id, msg.text);
         }
       }
     } catch (e) {
@@ -218,24 +257,10 @@ async function poll() {
   }
 }
 
-async function start() {
-  if (!BOT_TOKEN) {
-    console.error('BOT_TOKEN is not set');
-    process.exit(1);
-  }
-  if (!process.env.B4A_APP_ID || !process.env.B4A_JS_KEY || !process.env.B4A_MASTER_KEY) {
-    console.error('Back4App keys are not set');
-    process.exit(1);
-  }
-  try {
-    brain = await brainDb.getAll();
-    console.log('Brain loaded from Back4App, records:', Object.keys(brain).length);
-  } catch (e) {
-    console.error('Failed to load brain:', e.message);
-    brain = {};
-  }
-  console.log('Bot started');
-  poll();
+if (!BOT_TOKEN) {
+  console.error('BOT_TOKEN not set');
+  process.exit(1);
 }
 
-start();
+console.log('Bot started');
+poll();
