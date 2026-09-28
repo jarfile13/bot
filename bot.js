@@ -19,6 +19,7 @@ const CANDIDATE_LIMIT = 800;
 const MAX_ACTIVE_BRAINS = 200;
 const TEACH_RATE_LIMIT = 20;
 const TEACH_RATE_WINDOW = 60 * 1000;
+const LIST_PAGE_SIZE = 20;
 
 const healthServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -501,11 +502,33 @@ const HELP = [
   '/help - справка',
   '/teach вопрос = ответ - научить',
   '/delete вопрос - забыть',
-  '/list - что знаю',
+  '/list [страница] - что знаю (по 20 на стр.)',
   '/stats - статистика',
   '',
-  'Твои пары видишь только ты.',
+  'Пример: /list 3 — третья страница.',
 ].join('\n');
+
+function buildListPage(brain, page) {
+  const total = brain.pairs.length;
+  const totalPages = Math.max(1, Math.ceil(total / LIST_PAGE_SIZE));
+  const p = Math.min(Math.max(1, page), totalPages);
+  const start = (p - 1) * LIST_PAGE_SIZE;
+  const end = Math.min(start + LIST_PAGE_SIZE, total);
+  const slice = brain.pairs.slice(start, end);
+
+  const header = `Стр. ${p} из ${totalPages} (всего ${total} пар)\n\n`;
+  let body = '';
+  for (let i = 0; i < slice.length; i++) {
+    const n = start + i + 1;
+    const q = slice[i].question.length > 80 ? slice[i].question.slice(0, 77) + '...' : slice[i].question;
+    const a = slice[i].answer.length > 120 ? slice[i].answer.slice(0, 117) + '...' : slice[i].answer;
+    body += `${n}. ${q} = ${a}\n`;
+  }
+
+  let text = header + body;
+  if (text.length > 3900) text = text.slice(0, 3900) + '\n...';
+  return { text, page: p, totalPages };
+}
 
 async function handle(chatId, text) {
   const t = text.trim();
@@ -531,22 +554,25 @@ async function handle(chatId, text) {
     return;
   }
 
-  if (t === '/list') {
+  if (t === '/list' || t.startsWith('/list ')) {
     await ensureBrainLoaded(brain);
     if (!brain.pairs.length) {
       await send(chatId, 'У тебя пусто.');
       return;
     }
-    const lines = brain.pairs.slice(-100).map((p, i) => `${i + 1}. ${p.question} = ${p.answer}`);
-    let buf = '';
-    for (const line of lines) {
-      if ((buf + line + '\n').length > 3500) {
-        await send(chatId, buf);
-        buf = '';
+    const arg = t.slice('/list'.length).trim();
+    let page = 1;
+    if (arg) {
+      const n = parseInt(arg, 10);
+      if (!Number.isFinite(n) || n < 1) {
+        const totalPages = Math.ceil(brain.pairs.length / LIST_PAGE_SIZE);
+        await send(chatId, `Формат: /list <номер страницы>\nВсего страниц: ${totalPages}`);
+        return;
       }
-      buf += line + '\n';
+      page = n;
     }
-    if (buf) await send(chatId, buf);
+    const { text: out } = buildListPage(brain, page);
+    await send(chatId, out);
     return;
   }
 
