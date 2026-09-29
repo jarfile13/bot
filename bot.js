@@ -5,7 +5,7 @@ const path = require('path');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.error('[КРИТИЧЕСКАЯ ОШИБКА] Переменная BOT_TOKEN не задана!');
+  console.error('[КРИТИЧЕСКАЯ ОШИБКА] Переменная BOT_TOKEN не задана в Railway!');
   process.exit(1);
 }
 
@@ -162,7 +162,7 @@ function learn(userId, question, answer, memory) {
   if (qTokens.words.length === 0 || !answer.trim()) return;
 
   let existing = memory.find(entry => {
-    const inter = qTokens.words.filter(w => entry.tokens.words.includes(w));
+    const inter = qWords.filter(w => entry.tokens.words.includes(w));
     const uni = new Set([...qTokens.words, ...entry.tokens.words]);
     return (inter.length / uni.size) > 0.85;
   });
