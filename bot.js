@@ -9,14 +9,28 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(3000);
 
-const memoryFile = path.join(DATA_DIR, 'ai_memory.json');
-let memory = [];
+const userMemories = new Map();
+const lastMessages = new Map();
 
-if (fs.existsSync(memoryFile)) {
-  try { memory = JSON.parse(fs.readFileSync(memoryFile, 'utf8')); } catch (e) { memory = []; }
+function getUserMemoryFile(userId) {
+  return path.join(DATA_DIR, `mem_${userId}.json`);
 }
 
-const lastMessages = new Map();
+function loadUserMemory(userId) {
+  if (userMemories.has(userId)) return userMemories.get(userId);
+  const file = getUserMemoryFile(userId);
+  let memory = [];
+  if (fs.existsSync(file)) {
+    try { memory = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { memory = []; }
+  }
+  userMemories.set(userId, memory);
+  return memory;
+}
+
+function saveUserMemory(userId, memory) {
+  userMemories.set(userId, memory);
+  fs.writeFileSync(getUserMemoryFile(userId), JSON.stringify(memory, null, 2), 'utf8');
+}
 
 function cleanText(str) {
   return String(str)
@@ -47,6 +61,7 @@ function sendMessage(chatId, text) {
   req.end();
 }
 
+// Изменено: теперь принимает filePath для отправки конкретного пользовательского файла
 function sendDocument(chatId, filePath, caption) {
   const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
   const filename = path.basename(filePath);
@@ -92,7 +107,7 @@ function downloadFile(fileId, callback) {
   });
 }
 
-function findBestAnswer(userTokens) {
+function findBestAnswer(userTokens, memory) {
   if (userTokens.words.length === 0) return null;
   let bestMatch = null;
   let maxScore = 0.15;
@@ -120,7 +135,7 @@ function findBestAnswer(userTokens) {
   return null;
 }
 
-function learn(question, answer) {
+function learn(userId, question, answer, memory) {
   const qTokens = tokenize(question);
   if (qTokens.words.length === 0 || !answer.trim()) return;
 
@@ -142,20 +157,21 @@ function learn(question, answer) {
     });
   }
 
-  fs.writeFileSync(memoryFile, JSON.stringify(memory, null, 2), 'utf8');
+  saveUserMemory(userId, memory);
 }
 
-function handleMessage(chatId, text, document) {
+function handleMessage(chatId, userId, text, document) {
+  let memory = loadUserMemory(userId);
+
   if (document && document.file_name && document.file_name.endsWith('.json')) {
     downloadFile(document.file_id, (content) => {
       try {
         const importedData = JSON.parse(content);
         if (Array.isArray(importedData)) {
-          memory = importedData;
-          fs.writeFileSync(memoryFile, JSON.stringify(memory, null, 2), 'utf8');
-          sendMessage(chatId, 'База знаний успешно импортирована');
+          saveUserMemory(userId, importedData);
+          sendMessage(chatId, 'Твоя личная база знаний успешно импортирована');
         } else {
-          sendMessage(chatId, 'Некорректный формат базы знаний');
+          sendMessage(chatId, 'Некорректный формат файла базы знаний');
         }
       } catch (e) {
         sendMessage(chatId, 'Ошибка при чтении файла');
@@ -166,18 +182,19 @@ function handleMessage(chatId, text, document) {
 
   if (text && text.startsWith('/')) {
     if (text === '/reset') {
-      memory = [];
-      if (fs.existsSync(memoryFile)) fs.unlinkSync(memoryFile);
-      lastMessages.delete(chatId);
-      sendMessage(chatId, 'Память полностью очищена');
+      const file = getUserMemoryFile(userId);
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+      userMemories.delete(userId);
+      lastMessages.delete(userId);
+      sendMessage(chatId, 'Твоя личная память полностью очищена');
       return;
     }
     if (text === '/export') {
       if (memory.length === 0) {
-        sendMessage(chatId, 'База знаний пока пуста для экспорта');
+        sendMessage(chatId, 'Твоя база знаний пока пуста для экспорта');
         return;
       }
-      sendDocument(chatId, memoryFile, 'Экспорт базы знаний текстового ИИ');
+      sendDocument(chatId, getUserMemoryFile(userId), 'Экспорт твоей личной базы знаний ИИ');
       return;
     }
     if (text.startsWith('/forget ')) {
@@ -186,21 +203,21 @@ function handleMessage(chatId, text, document) {
       const initialLength = memory.length;
       memory = memory.filter(entry => cleanText(entry.text) !== cleanedTarget);
       if (memory.length < initialLength) {
-        fs.writeFileSync(memoryFile, JSON.stringify(memory, null, 2), 'utf8');
-        sendMessage(chatId, `Воспоминание "${target}" успешно удалено`);
+        saveUserMemory(userId, memory);
+        sendMessage(chatId, `Воспоминание "${target}" успешно удалено из твоей базы`);
       } else {
-        sendMessage(chatId, `Воспоминание "${target}" не найдено`);
+        sendMessage(chatId, `Воспоминание "${target}" не найдено в твоей базе`);
       }
       return;
     }
     if (text === '/stats') {
       let answersCount = 0;
       memory.forEach(e => answersCount += e.answers.length);
-      sendMessage(chatId, `Статистика ИИ:\nУникальных фраз: ${memory.length}\nВсего вариантов ответов: ${answersCount}`);
+      sendMessage(chatId, `Личная статистика ИИ:\nУникальных фраз: ${memory.length}\nВсего вариантов ответов: ${answersCount}`);
       return;
     }
     if (text === '/help') {
-      sendMessage(chatId, 'Команды:\n/reset - Стереть память\n/export - Скачать базу знаний\n/forget [фраза] - Забыть конкретную фразу\n/stats - Посмотреть объем памяти');
+      sendMessage(chatId, 'Команды:\n/reset - Стереть свою память\n/export - Скачать свою базу знаний\n/forget [фраза] - Забыть фразу\n/stats - Посмотреть объем своей памяти');
       return;
     }
   }
@@ -210,19 +227,19 @@ function handleMessage(chatId, text, document) {
   const cleanTextStr = text.trim();
   const tokens = tokenize(cleanTextStr);
 
-  const prevBotMessage = lastMessages.get(chatId);
+  const prevBotMessage = lastMessages.get(userId);
   if (prevBotMessage) {
-    learn(prevBotMessage, cleanTextStr);
+    learn(userId, prevBotMessage, cleanTextStr, memory);
   }
 
-  const aiResponse = findBestAnswer(tokens);
+  const aiResponse = findBestAnswer(tokens, memory);
 
   if (aiResponse) {
     sendMessage(chatId, aiResponse);
-    lastMessages.set(chatId, aiResponse);
+    lastMessages.set(userId, aiResponse);
   } else {
     sendMessage(chatId, cleanTextStr);
-    lastMessages.set(chatId, cleanTextStr);
+    lastMessages.set(userId, cleanTextStr);
   }
 }
 
@@ -238,7 +255,8 @@ function getUpdates() {
           for (const update of json.result) {
             offset = update.update_id + 1;
             if (update.message) {
-              handleMessage(update.message.chat.id, update.message.text, update.message.document);
+              // Изменено: теперь в handleMessage передается и chatId (куда писать) и userId (чья память)
+              handleMessage(update.message.chat.id, update.message.from.id, update.message.text, update.message.document);
             }
           }
         }
