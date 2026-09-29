@@ -133,6 +133,15 @@ function buildSynGroups(brain) {
   return groups;
 }
 
+function sortedSynGroups(brain) {
+  const groups = buildSynGroups(brain);
+  groups.sort((a, b) => {
+    if (a.hasAnchor !== b.hasAnchor) return a.hasAnchor ? -1 : 1;
+    return a.main.localeCompare(b.main);
+  });
+  return groups;
+}
+
 function buildVocab(brain) {
   const df = new Map();
   for (const p of brain.pairs) {
@@ -433,7 +442,9 @@ const HELP = [
   '',
   '/teach вопрос = ответ',
   '/learn слово = синоним1, синоним2',
-  '/delete <вопрос или слово> — удалить пару или синоним',
+  '/delete <вопрос> — удалить пару',
+  '/delete <слово> — удалить всю группу синонимов',
+  '/delete <номер> [номер ...] — удалить группы из /syn по номерам',
   '/list [стр] — список пар',
   '/syn [стр] — список синонимов',
   '/syn слово — синонимы конкретного слова',
@@ -533,12 +544,8 @@ async function handle(chat, text, isGroup, replyTo) {
         return send(chat, `${group.main} = ${group.members.filter(m => m !== group.main).join(', ')}`);
       }
 
-      const groups = buildSynGroups(brain);
+      const groups = sortedSynGroups(brain);
       if (!groups.length) return send(chat, 'Синонимов нет.');
-      groups.sort((a, b) => {
-        if (a.hasAnchor !== b.hasAnchor) return a.hasAnchor ? -1 : 1;
-        return a.main.localeCompare(b.main);
-      });
       const totalPages = Math.max(1, Math.ceil(groups.length / LIST_PAGE));
       let page = 1;
       if (arg) {
@@ -635,8 +642,47 @@ async function handle(chat, text, isGroup, replyTo) {
 
     if (t.startsWith('/delete')) {
       const rest = t.slice(7).trim();
-      if (!rest) return send(chat, 'Формат: /delete <вопрос или слово>');
+      if (!rest) return send(chat, 'Формат: /delete <вопрос> или /delete <номер> [номер ...]');
       await ensureLoaded(brain);
+
+      if (/^[\d\s]+$/.test(rest)) {
+        const nums = rest.split(/\s+/).map(n => parseInt(n, 10)).filter(n => Number.isFinite(n) && n > 0);
+        if (!nums.length) return send(chat, 'Нет номеров.');
+        const groups = sortedSynGroups(brain);
+        const toDelete = [];
+        const seen = new Set();
+        for (const n of nums) {
+          if (n < 1 || n > groups.length) continue;
+          const g = groups[n - 1];
+          const sig = g.members.slice().sort().join('|');
+          if (seen.has(sig)) continue;
+          seen.add(sig);
+          toDelete.push(g);
+        }
+        if (!toDelete.length) return send(chat, 'Номера вне диапазона.');
+
+        let removedWords = 0;
+        for (const g of toDelete) {
+          for (const m of g.members) {
+            brain.syn.delete(m);
+            brain.anchors.delete(m);
+            removedWords++;
+          }
+        }
+        for (const [, set] of brain.syn) {
+          for (const g of toDelete) {
+            for (const m of g.members) set.delete(m);
+          }
+        }
+
+        brain.dirty = true;
+        rebuildEmbeddings(brain);
+        reindexVectors(brain);
+        await persistLocal(brain);
+        const mains = toDelete.map(g => g.main).join(', ');
+        return send(chat, `Удалил групп: ${toDelete.length} (${mains}). Слов убрано: ${removedWords}`);
+      }
+
       const key = lc(rest);
 
       const idx = brain.pairs.findIndex(p => lc(p.question) === key);
@@ -654,35 +700,24 @@ async function handle(chat, text, isGroup, replyTo) {
         }
       }
 
-      const own = brain.syn.get(key);
-      if (!own && !brain.anchors.has(key)) {
-        let found = false;
-        for (const [, set] of brain.syn) { if (set.has(key)) { found = true; break; } }
-        if (!found) return send(chat, `Не нашёл: ${key}`);
-      }
-
-      const peers = new Set();
-      if (own) for (const p of own) peers.add(p);
-      for (const [w, set] of brain.syn) {
-        if (set.has(key)) peers.add(w);
-      }
-      for (const p of peers) {
-        const s = brain.syn.get(p);
-        if (s) s.delete(key);
-      }
-      brain.syn.delete(key);
-      brain.anchors.delete(key);
-
-      try {
+      const groups = buildSynGroups(brain);
+      const group = groups.find(g => g.members.includes(key));
+      if (group) {
+        for (const m of group.members) {
+          brain.syn.delete(m);
+          brain.anchors.delete(m);
+        }
+        for (const [, set] of brain.syn) {
+          for (const m of group.members) set.delete(m);
+        }
         brain.dirty = true;
         rebuildEmbeddings(brain);
         reindexVectors(brain);
         await persistLocal(brain);
-        return send(chat, `Удалил синоним: ${key}`);
-      } catch (e) {
-        console.error('delete syn', e.message);
-        return send(chat, 'Ошибка удаления синонима: ' + e.message);
+        return send(chat, `Удалил группу синонимов: ${group.main} (${group.members.length} слов)`);
       }
+
+      return send(chat, `Не нашёл: ${key}`);
     }
 
     if (t.startsWith('/learn')) {
