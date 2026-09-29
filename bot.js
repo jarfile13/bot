@@ -17,6 +17,7 @@ http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(P
 
 const userNetworks = new Map();
 const pending = new Map();
+const pendingReset = new Map();
 
 function cleanText(str) {
   return String(str).toLowerCase().replace(/ё/g, 'е').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
@@ -270,23 +271,143 @@ function downloadFile(fileId, callback) {
             fileRes.on('data', chunk => content += chunk);
             fileRes.on('end', () => callback(content));
           });
+        } else {
+          callback(null);
         }
-      } catch (e) {}
+      } catch (e) { callback(null); }
     });
-  });
+  }).on('error', () => callback(null));
 }
 
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function formatTrainStats(info, before, after) {
-  const lines = [];
-  if (info.isNewIntent) lines.push('новый интент');
-  if (info.vocabChanged) lines.push('словарь пополнен');
-  const errInfo = `ошибка ${before.toFixed(3)} → ${after.toFixed(3)}`;
-  lines.push(errInfo);
-  return lines.join(' · ');
+function teachAndReport(userId, question, answer) {
+  const net = loadUserNet(userId);
+  const words = getWords(question);
+  if (words.length === 0 || !answer.trim()) return null;
+
+  const beforeVocab = net.vocabulary.length;
+  const beforeIntents = net.intents.length;
+
+  const info = updateNetworkStructure(net, words, answer.trim());
+  const refreshedNet = loadUserNet(userId);
+  const bag = buildBagOfWords(words, refreshedNet.vocabulary);
+  const { firstErr, lastErr } = trainNetwork(bag, info.intentIdx, refreshedNet, 0.6, 40);
+  saveUserNet(userId, refreshedNet);
+
+  const addedWords = refreshedNet.vocabulary.length - beforeVocab;
+  const addedIntents = refreshedNet.intents.length - beforeIntents;
+  const parts = [];
+  if (addedIntents > 0) parts.push(`+${addedIntents} интент`);
+  if (addedWords > 0) parts.push(`+${addedWords} слов`);
+  parts.push(`ошибка ${firstErr.toFixed(2)}→${lastErr.toFixed(2)}`);
+  return parts.join(' · ');
+}
+
+function showHelp(chatId) {
+  const text =
+    '<b>Нейросеть на JS (backpropagation)</b>\n\n' +
+    '<b>Обучение</b>\n' +
+    'Напиши фразу — я повторю её и буду ждать ответ.\n' +
+    'Ответь — запомню пару «вопрос → ответ».\n\n' +
+    'Или сразу:\n' +
+    '<code>/teach вопрос = ответ</code>\n' +
+    '<code>/teach вопрос</code> — и следующим сообщением ответ\n\n' +
+    '<b>Управление</b>\n' +
+    '/list — все выученные пары\n' +
+    '/show &lt;номер&gt; — подробности о паре\n' +
+    '/del &lt;номер&gt; — удалить пару\n' +
+    '/find &lt;текст&gt; — поиск по выученному\n' +
+    '/forget &lt;текст&gt; — удалить по точному вопросу\n\n' +
+    '<b>Данные</b>\n' +
+    '/export — скачать веса сети (JSON)\n' +
+    '/import — как импортировать (отправь JSON)\n' +
+    '/stats — статистика сети\n' +
+    '/reset — стереть всё (с подтверждением)\n\n' +
+    '<b>Прочее</b>\n' +
+    '/cancel — отменить текущее действие';
+
+  sendMessage(chatId, text, { parse_mode: 'HTML' });
+}
+
+function getIntents(net) {
+  return net.intents.map((it, i) => ({ idx: i, response: it.response }));
+}
+
+function findIntentByResponse(net, text) {
+  const t = cleanText(text);
+  return net.intents.findIndex(it => cleanText(it.response) === t);
+}
+
+function showList(chatId, net, page) {
+  if (net.intents.length === 0) {
+    sendMessage(chatId, 'сеть пуста');
+    return;
+  }
+  const PAGE = 10;
+  const totalPages = Math.ceil(net.intents.length / PAGE);
+  const p = Math.max(1, Math.min(page, totalPages));
+  const start = (p - 1) * PAGE;
+  const slice = net.intents.slice(start, start + PAGE);
+
+  let out = `<b>Выученные ответы</b> (стр. ${p}/${totalPages}, всего ${net.intents.length})\n\n`;
+  slice.forEach((it, i) => {
+    const num = start + i + 1;
+    const preview = it.response.length > 80 ? it.response.slice(0, 80) + '…' : it.response;
+    out += `<b>${num}.</b> ${escapeHtml(preview)}\n`;
+  });
+  if (totalPages > 1) out += `\n/list ${p + 1}`;
+  sendMessage(chatId, out, { parse_mode: 'HTML' });
+}
+
+function showEntry(chatId, net, num) {
+  const idx = num - 1;
+  if (idx < 0 || idx >= net.intents.length) {
+    sendMessage(chatId, `нет интента #${num}. всего: ${net.intents.length}`);
+    return;
+  }
+  const it = net.intents[idx];
+  let out = `<b>Интент #${num}</b>\n\n`;
+  out += `Ответ: ${escapeHtml(it.response)}\n\n`;
+  out += `Слов в словаре: ${net.vocabulary.length}\n`;
+  out += `Всего интентов: ${net.intents.length}`;
+  sendMessage(chatId, out, { parse_mode: 'HTML' });
+}
+
+function findPairs(chatId, net, query) {
+  const q = cleanText(query);
+  if (!q) { sendMessage(chatId, 'формат: /find текст'); return; }
+  const results = [];
+  net.intents.forEach((it, i) => {
+    if (cleanText(it.response).includes(q)) {
+      results.push({ num: i + 1, response: it.response });
+    }
+  });
+  if (results.length === 0) {
+    sendMessage(chatId, `не найдено: "${escapeHtml(query)}"`, { parse_mode: 'HTML' });
+    return;
+  }
+  let out = `<b>Найдено: ${results.length}</b>\n\n`;
+  results.slice(0, 15).forEach(r => {
+    const preview = r.response.length > 70 ? r.response.slice(0, 70) + '…' : r.response;
+    out += `<b>#${r.num}</b> ${escapeHtml(preview)}\n`;
+  });
+  if (results.length > 15) out += `\n…и ещё ${results.length - 15}`;
+  sendMessage(chatId, out, { parse_mode: 'HTML' });
+}
+
+function showStats(chatId, net) {
+  const totalWeights = net.weights_ih.reduce((s, row) => s + row.length, 0) +
+                       net.weights_ho.reduce((s, row) => s + row.length, 0);
+  let out = '<b>Статистика сети</b>\n\n';
+  out += `Слов в словаре: <b>${net.vocabulary.length}</b>\n`;
+  out += `Интентов (ответов): <b>${net.intents.length}</b>\n`;
+  out += `Нейронов скрытого слоя: <b>${net.bias_h.length}</b>\n`;
+  out += `Синапсов: <b>${totalWeights}</b>\n`;
+  out += `Параметров (весов и смещений): <b>${totalWeights + net.bias_h.length + net.bias_o.length}</b>`;
+  sendMessage(chatId, out, { parse_mode: 'HTML' });
 }
 
 function handleMessage(chatId, userId, text, document) {
@@ -294,99 +415,122 @@ function handleMessage(chatId, userId, text, document) {
 
   if (document && document.file_name && document.file_name.endsWith('.json')) {
     downloadFile(document.file_id, (content) => {
+      if (!content) { sendMessage(chatId, 'не удалось скачать файл'); return; }
       try {
         const imported = JSON.parse(content);
-        if (imported.weights_ih && imported.intents) {
+        if (imported.weights_ih && imported.intents && imported.vocabulary) {
           saveUserNet(userId, imported);
           pending.delete(userId);
-          sendMessage(chatId, 'сеть загружена');
+          pendingReset.delete(userId);
+          sendMessage(chatId, `сеть загружена: ${imported.vocabulary.length} слов, ${imported.intents.length} интентов`);
         } else {
-          sendMessage(chatId, 'неверный формат');
+          sendMessage(chatId, 'неверный формат файла');
         }
-      } catch (e) { sendMessage(chatId, 'ошибка чтения'); }
+      } catch (e) { sendMessage(chatId, 'ошибка чтения файла'); }
     });
     return;
   }
 
   if (text && text.startsWith('/')) {
     const trimmed = text.trim();
-    const cmd = trimmed.split(/\s+/)[0].toLowerCase();
+    const parts = trimmed.split(/\s+/);
+    const cmd = parts[0].toLowerCase();
+    const arg = parts.slice(1).join(' ');
 
     if (cmd === '/start' || cmd === '/help') {
       pending.delete(userId);
-      sendMessage(chatId,
-        '<b>Нейросеть на JS</b>\n\n' +
-        '<b>Обучение</b>\n' +
-        'Просто напиши фразу — я повторю и буду ждать ответ.\n' +
-        'Ответь — запомню пару.\n\n' +
-        'Или сразу: <code>/teach вопрос = ответ</code>\n\n' +
-        '<b>Команды</b>\n' +
-        '/stats — статистика сети\n' +
-        '/export — скачать веса\n' +
-        '/reset — стереть сеть\n' +
-        '/cancel — отменить обучение',
-        { parse_mode: 'HTML' });
+      pendingReset.delete(userId);
+      showHelp(chatId);
       return;
     }
+
     if (cmd === '/cancel') {
       pending.delete(userId);
+      pendingReset.delete(userId);
       sendMessage(chatId, 'отменено');
       return;
     }
+
     if (cmd === '/reset') {
-      const file = getUserNetFile(userId);
-      if (fs.existsSync(file)) fs.unlinkSync(file);
-      userNetworks.delete(userId);
-      pending.delete(userId);
-      sendMessage(chatId, 'сеть стёрта');
+      pendingReset.set(userId, true);
+      sendMessage(chatId, 'Уверен? Вся сеть будет удалена.\n\nНапиши <b>да</b> для подтверждения.', { parse_mode: 'HTML' });
       return;
     }
+
     if (cmd === '/export') {
       if (net.vocabulary.length === 0) { sendMessage(chatId, 'сеть пуста'); return; }
-      sendDocument(chatId, getUserNetFile(userId), 'веса сети');
+      sendDocument(chatId, getUserNetFile(userId), `веса сети (${net.vocabulary.length} слов, ${net.intents.length} интентов)`);
       return;
     }
-    if (cmd === '/stats') {
-      const totalWeights = net.weights_ih.reduce((s, row) => s + row.length, 0) +
-                          net.weights_ho.reduce((s, row) => s + row.length, 0);
-      let out = '<b>Сеть</b>\n\n';
-      out += `Слов в словаре: ${net.vocabulary.length}\n`;
-      out += `Интентов: ${net.intents.length}\n`;
-      out += `Нейронов скрытого слоя: ${net.bias_h.length}\n`;
-      out += `Синапсов: ${totalWeights}\n`;
-      sendMessage(chatId, out, { parse_mode: 'HTML' });
+
+    if (cmd === '/import') {
+      sendMessage(chatId, 'Отправь JSON-файл с весами сети (полученный через /export).\n\nТекущая сеть будет заменена.');
       return;
     }
-    if (cmd === '/teach') {
-      const m = trimmed.match(/^\/teach\s+(.+?)\s*=\s*(.+)$/s);
-      if (!m) {
-        sendMessage(chatId, 'формат: /teach вопрос = ответ');
+
+    if (cmd === '/stats') { showStats(chatId, net); return; }
+
+    if (cmd === '/list') {
+      const page = parseInt(arg, 10) || 1;
+      showList(chatId, net, page);
+      return;
+    }
+
+    if (cmd === '/show') {
+      const num = parseInt(arg, 10);
+      if (!num) { sendMessage(chatId, 'формат: /show <номер>'); return; }
+      showEntry(chatId, net, num);
+      return;
+    }
+
+    if (cmd === '/find') {
+      findPairs(chatId, net, arg);
+      return;
+    }
+
+    if (cmd === '/del') {
+      const num = parseInt(arg, 10);
+      if (!num || num < 1 || num > net.intents.length) {
+        sendMessage(chatId, `укажи номер 1–${net.intents.length}`);
         return;
       }
-      const q = m[1].trim();
-      const a = m[2].trim();
-      const words = getWords(q);
-      if (words.length === 0) { sendMessage(chatId, 'вопрос пустой'); return; }
-
-      const beforeNet = JSON.parse(JSON.stringify(net));
-      const beforeIntents = beforeNet.intents.length;
-      const beforeVocab = beforeNet.vocabulary.length;
-
-      const info = updateNetworkStructure(net, words, a);
-      const refreshedNet = loadUserNet(userId);
-      const bag = buildBagOfWords(words, refreshedNet.vocabulary);
-      const { firstErr, lastErr } = trainNetwork(bag, info.intentIdx, refreshedNet, 0.6, 40);
-      saveUserNet(userId, refreshedNet);
-
-      const addedWords = refreshedNet.vocabulary.length - beforeVocab;
-      const addedIntents = refreshedNet.intents.length - beforeIntents;
-      const parts = [];
-      if (addedIntents > 0) parts.push(`+${addedIntents} интент`);
-      if (addedWords > 0) parts.push(`+${addedWords} слов`);
-      parts.push(`ошибка ${firstErr.toFixed(2)}→${lastErr.toFixed(2)}`);
-      sendMessage(chatId, parts.join(' · '));
+      const removed = net.intents.splice(num - 1, 1)[0];
+      saveUserNet(userId, net);
+      sendMessage(chatId, `удалён интент #${num}: "${escapeHtml(removed.response.slice(0, 80))}"`, { parse_mode: 'HTML' });
       return;
     }
+
+    if (cmd === '/forget') {
+      const target = arg.trim();
+      if (!target) { sendMessage(chatId, 'формат: /forget текст ответа'); return; }
+      const idx = findIntentByResponse(net, target);
+      if (idx === -1) {
+        sendMessage(chatId, `не найдено: "${escapeHtml(target)}". попробуй /find`, { parse_mode: 'HTML' });
+        return;
+      }
+      net.intents.splice(idx, 1);
+      saveUserNet(userId, net);
+      sendMessage(chatId, `удалено: "${escapeHtml(target)}"`, { parse_mode: 'HTML' });
+      return;
+    }
+
+    if (cmd === '/teach') {
+      const m = trimmed.match(/^\/teach\s+(.+?)\s*=\s*(.+)$/s);
+      if (m) {
+        const report = teachAndReport(userId, m[1].trim(), m[2].trim());
+        if (report) sendMessage(chatId, 'запомнил: ' + report);
+        else sendMessage(chatId, 'не удалось');
+        return;
+      }
+      if (!arg) {
+        sendMessage(chatId, 'формат:\n/teach вопрос = ответ\nили\n/teach вопрос (и следующим сообщением — ответ)');
+        return;
+      }
+      pending.set(userId, { type: 'teach', question: arg.trim() });
+      sendMessage(chatId, `Какой ответ на "${escapeHtml(arg.trim())}"? Напиши следующим сообщением. /cancel — отмена.`, { parse_mode: 'HTML' });
+      return;
+    }
+
     sendMessage(chatId, 'неизвестная команда, смотри /help');
     return;
   }
@@ -396,32 +540,43 @@ function handleMessage(chatId, userId, text, document) {
   const rawWords = getWords(text);
   const trimmedText = text.trim();
 
-  const p = pending.get(userId);
-  if (p) {
-    pending.delete(userId);
-    if (rawWords.length === 0) { sendMessage(chatId, 'пусто'); return; }
-
-    const beforeVocab = net.vocabulary.length;
-    const beforeIntents = net.intents.length;
-
-    const info = updateNetworkStructure(net, p.words, trimmedText);
-    const refreshedNet = loadUserNet(userId);
-    const bag = buildBagOfWords(p.words, refreshedNet.vocabulary);
-    const { firstErr, lastErr } = trainNetwork(bag, info.intentIdx, refreshedNet, 0.6, 40);
-    saveUserNet(userId, refreshedNet);
-
-    const addedWords = refreshedNet.vocabulary.length - beforeVocab;
-    const addedIntents = refreshedNet.intents.length - beforeIntents;
-    const parts = [];
-    if (addedIntents > 0) parts.push(`+${addedIntents} интент`);
-    if (addedWords > 0) parts.push(`+${addedWords} слов`);
-    parts.push(`ошибка ${firstErr.toFixed(2)}→${lastErr.toFixed(2)}`);
-    sendMessage(chatId, 'запомнил: ' + parts.join(' · '));
+  if (pendingReset.get(userId)) {
+    const a = trimmedText.toLowerCase();
+    if (a === 'да' || a === 'yes' || a === 'y') {
+      const file = getUserNetFile(userId);
+      if (fs.existsSync(file)) { try { fs.unlinkSync(file); } catch (e) {} }
+      userNetworks.delete(userId);
+      pendingReset.delete(userId);
+      sendMessage(chatId, 'сеть стёрта');
+    } else {
+      pendingReset.delete(userId);
+      sendMessage(chatId, 'отменено');
+    }
     return;
   }
 
+  const p = pending.get(userId);
+  if (p) {
+    if (p.type === 'teach') {
+      pending.delete(userId);
+      const report = teachAndReport(userId, p.question, trimmedText);
+      if (report) sendMessage(chatId, 'запомнил: ' + report);
+      else sendMessage(chatId, 'не удалось');
+      return;
+    }
+    if (p.type === 'echo') {
+      pending.delete(userId);
+      const report = teachAndReport(userId, p.question, trimmedText);
+      if (report) sendMessage(chatId, 'запомнил: ' + report);
+      else sendMessage(chatId, 'не удалось');
+      return;
+    }
+  }
+
+  if (rawWords.length === 0) return;
+
   if (net.vocabulary.length === 0 || net.intents.length === 0) {
-    pending.set(userId, { words: rawWords });
+    pending.set(userId, { type: 'echo', question: trimmedText });
     sendMessage(chatId, escapeHtml(trimmedText) + '\n\n<i>чему учить?</i>', { parse_mode: 'HTML' });
     return;
   }
@@ -429,7 +584,7 @@ function handleMessage(chatId, userId, text, document) {
   const bag = buildBagOfWords(rawWords, net.vocabulary);
   const totalInBag = bag.reduce((a, b) => a + b, 0);
   if (totalInBag === 0) {
-    pending.set(userId, { words: rawWords });
+    pending.set(userId, { type: 'echo', question: trimmedText });
     sendMessage(chatId, escapeHtml(trimmedText) + '\n\n<i>новые слова. чему учить?</i>', { parse_mode: 'HTML' });
     return;
   }
@@ -447,7 +602,7 @@ function handleMessage(chatId, userId, text, document) {
   if (maxIdx !== -1 && maxVal > 0.65) {
     sendMessage(chatId, net.intents[maxIdx].response);
   } else {
-    pending.set(userId, { words: rawWords });
+    pending.set(userId, { type: 'echo', question: trimmedText });
     const conf = maxVal > 0 ? ` (уверенность ${(maxVal * 100).toFixed(0)}%)` : '';
     sendMessage(chatId, escapeHtml(trimmedText) + `\n\n<i>не уверен${conf}. чему учить?</i>`, { parse_mode: 'HTML' });
   }
