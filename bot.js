@@ -4,9 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const APP_ID = process.env.B4A_APP_ID;
-const MASTER_KEY = process.env.B4A_MASTER_KEY;
-const SERVER_HOST = 'parseapi.back4app.com';
+const DATA_DIR = process.env.DATA_DIR || './data';
 
 const WINDOW = 5;
 const MIN_WORD_FREQ = 1;
@@ -15,8 +13,6 @@ const SIM_THRESHOLD = 0.65;
 const MIN_SIM = 0.35;
 const LIST_PAGE = 20;
 const MAX_BRAINS = 200;
-const PAGE_SIZE = 100;
-const DATA_DIR = process.env.DATA_DIR || './data';
 const DEBUG = true;
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -51,9 +47,6 @@ function scopeOf(chatId, isGroup) {
 function safeName(scope) {
   return scope.replace(/[^\w]/g, '_');
 }
-
-function dbKey(scope, q) { return scope + ':' + lc(q); }
-function synKey(scope, w) { return scope + ':@syn:' + lc(w); }
 
 function makeBrain(scope) {
   return {
@@ -314,101 +307,15 @@ function answerFor(brain, input) {
   return null;
 }
 
-function b4aRequest(method, urlPath, body) {
-  return new Promise((resolve, reject) => {
-    const data = body ? JSON.stringify(body) : null;
-    const headers = {
-      'X-Parse-Application-Id': APP_ID,
-      'X-Parse-Master-Key': MASTER_KEY,
-    };
-    if (data) {
-      headers['Content-Type'] = 'application/json';
-      headers['Content-Length'] = Buffer.byteLength(data);
-    }
-    const req = https.request({ hostname: SERVER_HOST, path: urlPath, method, headers }, (res) => {
-      let buf = '';
-      res.on('data', c => buf += c);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(buf || '{}');
-          if (res.statusCode >= 400) return reject(new Error(json.error || ('HTTP ' + res.statusCode)));
-          resolve(json);
-        } catch (e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    if (data) req.write(data);
-    req.end();
-  });
-}
-
-async function dbFind(scope, q) {
-  const where = encodeURIComponent(JSON.stringify({ question: dbKey(scope, q) }));
-  const r = await b4aRequest('GET', `/classes/Knowledge?where=${where}&limit=1`);
-  return r.results && r.results[0] ? r.results[0] : null;
-}
-
-async function dbSavePair(scope, q, a) {
-  const existing = await dbFind(scope, q);
-  const body = { question: dbKey(scope, q), answer: a, originalQuestion: q, scope };
-  if (existing) await b4aRequest('PUT', `/classes/Knowledge/${existing.objectId}`, body);
-  else await b4aRequest('POST', '/classes/Knowledge', body);
-}
-
-async function dbDeletePair(scope, q) {
-  const existing = await dbFind(scope, q);
-  if (existing) await b4aRequest('DELETE', `/classes/Knowledge/${existing.objectId}`);
-}
-
-async function dbSaveSyn(scope, word, set) {
-  const existing = await dbFind(scope, '@syn:' + word);
-  const body = { question: synKey(scope, word), answer: [...set].join(','), originalQuestion: word, scope };
-  if (existing) await b4aRequest('PUT', `/classes/Knowledge/${existing.objectId}`, body);
-  else await b4aRequest('POST', '/classes/Knowledge', body);
-}
-
-async function dbLoadScope(scope) {
-  const prefix = scope + ':';
-  const synPrefix = scope + ':@syn:';
-  const pairs = [];
-  const syn = new Map();
-  let skip = 0;
-  while (true) {
-    const where = encodeURIComponent(JSON.stringify({
-      question: { $regex: '^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
-    }));
-    const r = await b4aRequest('GET', `/classes/Knowledge?where=${where}&limit=${PAGE_SIZE}&skip=${skip}&order=createdAt`);
-    const results = r.results || [];
-    if (!results.length) break;
-    for (const obj of results) {
-      const raw = obj.question || '';
-      if (raw.startsWith(synPrefix)) {
-        const word = raw.slice(synPrefix.length);
-        const ans = obj.answer || '';
-        const set = new Set();
-        for (const s of ans.split(',')) {
-          const t = s.trim();
-          if (t) set.add(t);
-        }
-        syn.set(word, set);
-      } else if (raw.startsWith(prefix)) {
-        const clean = raw.slice(prefix.length);
-        pairs.push({ question: obj.originalQuestion || clean, answer: obj.answer, scope });
-      }
-    }
-    if (results.length < PAGE_SIZE) break;
-    skip += PAGE_SIZE;
-  }
-  return { pairs, syn };
-}
-
 async function persistLocal(brain) {
   const data = {
     scope: brain.scope,
     pairs: brain.pairs.map(p => ({ question: p.question, answer: p.answer, scope: p.scope })),
     syn: [...brain.syn.entries()].map(([w, set]) => [w, [...set]]),
   };
-  await fs.promises.writeFile(brain.file, JSON.stringify(data), 'utf8');
+  const tmp = brain.file + '.tmp';
+  await fs.promises.writeFile(tmp, JSON.stringify(data), 'utf8');
+  await fs.promises.rename(tmp, brain.file);
 }
 
 async function loadLocal(brain) {
@@ -433,10 +340,8 @@ async function ensureLoaded(brain) {
     try {
       const local = await loadLocal(brain);
       if (!local) {
-        const { pairs, syn } = await dbLoadScope(brain.scope);
-        brain.pairs = pairs;
+        brain.pairs = [];
         brain.syn = new Map();
-        for (const [w, set] of syn) brain.syn.set(w, new Set(set));
         await persistLocal(brain);
       }
       brain.loaded = true;
@@ -643,7 +548,7 @@ async function handle(chat, text, isGroup, replyTo) {
       const data = {
         scope,
         exportedAt: new Date().toISOString(),
-        pairs: brain.pairs.filter(p => p.scope === scope).map(p => ({ q: p.question, a: p.answer })),
+        pairs: brain.pairs.map(p => ({ q: p.question, a: p.answer })),
         syn: [...brain.syn.entries()].filter(([, set]) => set.size).map(([w, set]) => ({ w, s: [...set] })),
       };
       const filename = `brain_${safeName(scope)}.json`;
@@ -666,7 +571,6 @@ async function handle(chat, text, isGroup, replyTo) {
           const key = lc(p.q);
           const idx = brain.pairs.findIndex(x => lc(x.question) === key);
           if (idx >= 0) continue;
-          await dbSavePair(scope, p.q, p.a);
           brain.pairs.push({ question: p.q, answer: p.a, scope });
           added++;
         }
@@ -676,7 +580,6 @@ async function handle(chat, text, isGroup, replyTo) {
           if (!brain.syn.has(w)) brain.syn.set(w, new Set());
           const target = brain.syn.get(w);
           for (const s of item.s) target.add(lc(s));
-          await dbSaveSyn(scope, w, target);
         }
         brain.dirty = true;
         rebuildEmbeddings(brain);
@@ -698,7 +601,6 @@ async function handle(chat, text, isGroup, replyTo) {
       if (!q || !a) return send(chat, 'Пусто.');
       await ensureLoaded(brain);
       try {
-        await dbSavePair(scope, q, a);
         const key = lc(q);
         const idx = brain.pairs.findIndex(p => lc(p.question) === key);
         const newPair = { question: q, answer: a, scope };
@@ -723,7 +625,6 @@ async function handle(chat, text, isGroup, replyTo) {
       const idx = brain.pairs.findIndex(p => lc(p.question) === key);
       if (idx < 0) return send(chat, `Не нашёл: ${key}`);
       try {
-        await dbDeletePair(scope, brain.pairs[idx].question);
         brain.pairs.splice(idx, 1);
         brain.dirty = true;
         rebuildEmbeddings(brain);
@@ -752,11 +653,6 @@ async function handle(chat, text, isGroup, replyTo) {
         brain.syn.get(o).add(main);
       }
       try {
-        await dbSaveSyn(scope, main, sa);
-        for (const o of others) {
-          const s = brain.syn.get(o);
-          if (s) await dbSaveSyn(scope, o, s);
-        }
         brain.dirty = true;
         rebuildEmbeddings(brain);
         reindexVectors(brain);
@@ -780,8 +676,6 @@ async function handle(chat, text, isGroup, replyTo) {
       if (sa) sa.delete(b);
       if (sb) sb.delete(a);
       try {
-        if (sa) await dbSaveSyn(scope, a, sa);
-        if (sb) await dbSaveSyn(scope, b, sb);
         brain.dirty = true;
         rebuildEmbeddings(brain);
         reindexVectors(brain);
@@ -828,8 +722,7 @@ async function poll() {
 
 async function start() {
   if (!BOT_TOKEN) { console.error('BOT_TOKEN not set'); process.exit(1); }
-  if (!APP_ID || !MASTER_KEY) { console.error('B4A keys not set'); process.exit(1); }
-  console.log('[START] bot polling');
+  console.log('[START] bot polling. data dir:', DATA_DIR);
   poll();
 }
 
