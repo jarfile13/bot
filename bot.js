@@ -39,6 +39,8 @@ if (fs.existsSync(DATA_FILE)) {
     }
 }
 
+let pendingReset = {};
+
 let saveTimer = null;
 let saving = false;
 
@@ -471,6 +473,19 @@ async function handleMessage(msg) {
     const text = msg.text.trim();
     if (!text) return;
 
+    if (pendingReset[userId]) {
+        if (text.toLowerCase() === 'да') {
+            aiBrain = { vocabulary: {}, relations: {}, originals: {}, lastInput: {}, synonyms: {}, context: {} };
+            pendingReset[userId] = false;
+            saveBrainNow();
+            await sendMessage(chatId, 'Память очищена.');
+        } else {
+            pendingReset[userId] = false;
+            await sendMessage(chatId, 'Отменено.');
+        }
+        return;
+    }
+
     if (text === '/start') {
         await sendMessage(chatId,
             'Как учить:\n' +
@@ -488,7 +503,7 @@ async function handleMessage(msg) {
             '/del вопрос = ответ - один ответ\n\n' +
             'Ещё:\n' +
             '/stats - статистика\n' +
-            '/reset - стереть всё\n' +
+            '/reset - стереть всё (с подтверждением)\n' +
             '/export - скачать базу\n' +
             '/import - загрузить базу'
         );
@@ -496,9 +511,8 @@ async function handleMessage(msg) {
     }
 
     if (text === '/reset') {
-        aiBrain = { vocabulary: {}, relations: {}, originals: {}, lastInput: {}, synonyms: {}, context: {} };
-        saveBrainNow();
-        await sendMessage(chatId, 'Память очищена.');
+        pendingReset[userId] = true;
+        await sendMessage(chatId, 'Точно стереть всю память? Напиши "да" для подтверждения.');
         return;
     }
 
