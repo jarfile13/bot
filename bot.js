@@ -19,7 +19,8 @@ let aiBrain = {
     relations: {},
     lastInput: {},
     synonyms: {},
-    context: {}
+    context: {},
+    listPage: {}
 };
 
 if (fs.existsSync(DATA_FILE)) {
@@ -30,7 +31,8 @@ if (fs.existsSync(DATA_FILE)) {
             relations: parsed.relations || {},
             lastInput: parsed.lastInput || {},
             synonyms: parsed.synonyms || {},
-            context: parsed.context || {}
+            context: parsed.context || {},
+            listPage: {}
         };
     } catch (e) {
         console.error('Failed to read', DATA_FILE, e.message);
@@ -258,8 +260,64 @@ function apiRequest(method, data) {
     });
 }
 
-function sendMessage(chatId, text) {
-    return apiRequest('sendMessage', { chat_id: chatId, text });
+function sendMessage(chatId, text, keyboard) {
+    const payload = { chat_id: chatId, text };
+    if (keyboard) payload.reply_markup = keyboard;
+    return apiRequest('sendMessage', payload);
+}
+
+function editMessage(chatId, messageId, text, keyboard) {
+    const payload = { chat_id: chatId, message_id: messageId, text };
+    if (keyboard) payload.reply_markup = keyboard;
+    return apiRequest('editMessageText', payload);
+}
+
+function answerCallback(id) {
+    return apiRequest('answerCallbackQuery', { callback_query_id: id });
+}
+
+const PAGE_SIZE = 10;
+
+function buildListPage(page) {
+    const items = [];
+    for (const q in aiBrain.relations) {
+        items.push({ q, opts: aiBrain.relations[q] });
+    }
+    items.sort((a, b) => a.q.localeCompare(b.q));
+
+    const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+    if (page < 0) page = 0;
+    if (page >= totalPages) page = totalPages - 1;
+
+    const slice = items.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+
+    let out = 'Пары ' + (items.length ? (page * PAGE_SIZE + 1) : 0) + '-' +
+        Math.min((page + 1) * PAGE_SIZE, items.length) + ' из ' + items.length +
+        ' | стр. ' + (page + 1) + '/' + totalPages + '\n\n';
+
+    slice.forEach((it, i) => {
+        const num = page * PAGE_SIZE + i + 1;
+        out += num + '. ' + it.q + '\n';
+        const opts = Object.keys(it.opts);
+        for (const a of opts) {
+            out += '   -> ' + a + ' (' + it.opts[a] + ')\n';
+        }
+        const syns = aiBrain.synonyms[it.q];
+        if (syns && syns.length) {
+            out += '   ~ ' + syns.join(', ') + '\n';
+        }
+        out += '\n';
+    });
+
+    const keyboard = { inline_keyboard: [] };
+    const nav = [];
+    if (page > 0) nav.push({ text: '<<', callback_data: 'list:' + (page - 1) });
+    nav.push({ text: (page + 1) + '/' + totalPages, callback_data: 'list:noop' });
+    if (page < totalPages - 1) nav.push({ text: '>>', callback_data: 'list:' + (page + 1) });
+    if (nav.length) keyboard.inline_keyboard.push(nav);
+    keyboard.inline_keyboard.push([{ text: 'Закрыть', callback_data: 'list:close' }]);
+
+    return { text: out, keyboard, totalPages };
 }
 
 function getStats() {
@@ -277,16 +335,18 @@ function getStats() {
     return { pairs, answers, examples, words, syns };
 }
 
-function getList(limit) {
-    const items = [];
-    for (const q in aiBrain.relations) {
-        const opts = aiBrain.relations[q];
-        const best = pickWeighted(opts);
-        const count = opts[best] || 0;
-        items.push({ q, a: best, count });
+function deleteAnswer(question, answer) {
+    const tokens = tokenize(question);
+    const key = tokens.join(' ');
+    if (!key || !aiBrain.relations[key]) return false;
+    const outClean = String(answer).trim();
+    if (!aiBrain.relations[key][outClean]) return false;
+    delete aiBrain.relations[key][outClean];
+    if (!Object.keys(aiBrain.relations[key]).length) {
+        delete aiBrain.relations[key];
     }
-    items.sort((a, b) => b.count - a.count);
-    return items.slice(0, limit || 50);
+    saveBrainNow();
+    return true;
 }
 
 function deletePair(question) {
@@ -359,7 +419,7 @@ async function getUpdates(offset) {
     const res = await apiRequest('getUpdates', {
         offset,
         timeout: 30,
-        allowed_updates: ['message']
+        allowed_updates: ['message', 'callback_query']
     });
 
     polling = false;
@@ -368,12 +428,14 @@ async function getUpdates(offset) {
         for (const update of res.result) {
             offset = update.update_id + 1;
             saveOffset(offset);
-            if (update.message && typeof update.message.text === 'string') {
-                try {
+            try {
+                if (update.message && typeof update.message.text === 'string') {
                     await handleMessage(update.message);
-                } catch (e) {
-                    console.error('handleMessage error:', e.message);
+                } else if (update.callback_query) {
+                    await handleCallback(update.callback_query);
                 }
+            } catch (e) {
+                console.error('handle error:', e.message);
             }
         }
         setTimeout(() => getUpdates(offset), 50);
@@ -381,6 +443,32 @@ async function getUpdates(offset) {
         const delay = (res && res.ok) ? 50 : 3000;
         setTimeout(() => getUpdates(offset), delay);
     }
+}
+
+async function handleCallback(cb) {
+    const data = cb.data || '';
+    const chatId = cb.message.chat.id;
+    const messageId = cb.message.message_id;
+
+    if (data.startsWith('list:')) {
+        const arg = data.slice(5);
+        if (arg === 'noop') {
+            await answerCallback(cb.id);
+            return;
+        }
+        if (arg === 'close') {
+            await answerCallback(cb.id);
+            await apiRequest('deleteMessage', { chat_id: chatId, message_id: messageId });
+            return;
+        }
+        const page = parseInt(arg, 10) || 0;
+        const { text, keyboard } = buildListPage(page);
+        await answerCallback(cb.id);
+        await editMessage(chatId, messageId, text, keyboard);
+        return;
+    }
+
+    await answerCallback(cb.id);
 }
 
 async function handleMessage(msg) {
@@ -392,24 +480,24 @@ async function handleMessage(msg) {
     if (text === '/start') {
         await sendMessage(chatId,
             'Команды:\n' +
-            '/start - это сообщение\n' +
             '/train вопрос = ответ - обучить\n' +
             '/syn слово = синоним1, синоним2 - добавить синонимы\n' +
             '/syn del слово = синоним - удалить один синоним\n' +
-            '/syn del слово - удалить все синонимы слова\n' +
+            '/syn del слово - удалить все синонимы\n' +
+            '/list - список пар (листается кнопками)\n' +
+            '/del вопрос = ответ - удалить один ответ\n' +
+            '/del вопрос - удалить всю пару\n' +
+            '/delete - то же самое\n' +
+            '/stats - статистика\n' +
             '/reset - очистить память\n' +
             '/export - выгрузить базу\n' +
-            '/import - загрузить базу (отправь JSON-файл)\n' +
-            '/stats - статистика\n' +
-            '/list - список пар\n' +
-            '/del вопрос - удалить пару\n' +
-            '/delete вопрос - то же самое'
+            '/import - загрузить базу (отправь JSON-файл)'
         );
         return;
     }
 
     if (text === '/reset') {
-        aiBrain = { vocabulary: {}, relations: {}, lastInput: {}, synonyms: {}, context: {} };
+        aiBrain = { vocabulary: {}, relations: {}, lastInput: {}, synonyms: {}, context: {}, listPage: {} };
         saveBrainNow();
         await sendMessage(chatId, 'Память очищена.');
         return;
@@ -429,27 +517,31 @@ async function handleMessage(msg) {
     }
 
     if (text === '/list') {
-        const items = getList(50);
-        if (!items.length) {
+        if (!Object.keys(aiBrain.relations).length) {
             await sendMessage(chatId, 'База пуста.');
             return;
         }
-        let out = 'Пары:\n';
-        for (const it of items) {
-            out += '"' + it.q + '" -> "' + it.a + '" (' + it.count + ')\n';
-        }
-        await sendMessage(chatId, out);
+        const { text: t, keyboard } = buildListPage(0);
+        await sendMessage(chatId, t, keyboard);
         return;
     }
 
     if (text.startsWith('/del ') || text.startsWith('/delete ')) {
-        const q = text.replace(/^\/(del|delete)\s+/, '').trim();
-        if (!q) {
-            await sendMessage(chatId, 'Использование: /del вопрос');
+        const arg = text.replace(/^\/(del|delete)\s+/, '').trim();
+        if (!arg) {
+            await sendMessage(chatId, 'Использование:\n/del вопрос = ответ\n/del вопрос');
             return;
         }
-        const ok = deletePair(q);
-        await sendMessage(chatId, ok ? 'Удалено.' : 'Не найдено.');
+        if (arg.includes('=')) {
+            const idx = arg.indexOf('=');
+            const q = arg.slice(0, idx).trim();
+            const a = arg.slice(idx + 1).trim();
+            const ok = deleteAnswer(q, a);
+            await sendMessage(chatId, ok ? 'Ответ удалён.' : 'Не найдено.');
+            return;
+        }
+        const ok = deletePair(arg);
+        await sendMessage(chatId, ok ? 'Пара удалена.' : 'Не найдено.');
         return;
     }
 
@@ -471,7 +563,7 @@ async function handleMessage(msg) {
                 return;
             }
             const ok = deleteAllSynonyms(arg);
-            await sendMessage(chatId, ok ? 'Все синонимы слова удалены.' : 'Не найдено.');
+            await sendMessage(chatId, ok ? 'Все синонимы удалены.' : 'Не найдено.');
             return;
         }
 
@@ -566,7 +658,8 @@ async function handleMessage(msg) {
                 relations: parsed.relations || {},
                 lastInput: parsed.lastInput || {},
                 synonyms: parsed.synonyms || {},
-                context: parsed.context || {}
+                context: parsed.context || {},
+                listPage: {}
             };
             saveBrainNow();
             await sendMessage(chatId, 'База загружена.');
@@ -588,7 +681,7 @@ async function handleMessage(msg) {
                 return;
             }
             trainAI(question, answer);
-            await sendMessage(chatId, 'Выучено: "' + question + '" -> "' + answer + '"');
+            await sendMessage(chatId, 'Выучено: ' + question + ' -> ' + answer);
             return;
         }
 
@@ -601,7 +694,7 @@ async function handleMessage(msg) {
             await sendMessage(chatId, 'Использование: /train вопрос = ответ');
         } else {
             trainAI(lastQuestion, correctOutput);
-            await sendMessage(chatId, 'Выучено: "' + lastQuestion + '" -> "' + correctOutput + '"');
+            await sendMessage(chatId, 'Выучено: ' + lastQuestion + ' -> ' + correctOutput);
         }
         return;
     }
