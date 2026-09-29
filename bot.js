@@ -53,6 +53,7 @@ function makeBrain(scope) {
     scope,
     pairs: [],
     syn: new Map(),
+    anchors: new Set(),
     loaded: false,
     loading: null,
     vocab: new Map(),
@@ -120,9 +121,14 @@ function buildSynGroups(brain) {
   const groups = [];
   for (const [, members] of clusters) {
     if (members.length < 2) continue;
-    const sorted = members.slice().sort((a, b) => a.length - b.length || a.localeCompare(b));
-    const main = sorted[0];
-    groups.push({ main, members: members.slice().sort() });
+    const anchors = members.filter(m => brain.anchors.has(m));
+    let main;
+    if (anchors.length) {
+      main = anchors.sort((a, b) => a.length - b.length || a.localeCompare(b))[0];
+    } else {
+      main = members.slice().sort((a, b) => a.length - b.length || a.localeCompare(b))[0];
+    }
+    groups.push({ main, members: members.slice().sort(), hasAnchor: anchors.length > 0 });
   }
   return groups;
 }
@@ -312,6 +318,7 @@ async function persistLocal(brain) {
     scope: brain.scope,
     pairs: brain.pairs.map(p => ({ question: p.question, answer: p.answer, scope: p.scope })),
     syn: [...brain.syn.entries()].map(([w, set]) => [w, [...set]]),
+    anchors: [...brain.anchors],
   };
   const tmp = brain.file + '.tmp';
   await fs.promises.writeFile(tmp, JSON.stringify(data), 'utf8');
@@ -326,6 +333,7 @@ async function loadLocal(brain) {
     brain.pairs = (data.pairs || []).map(p => ({ ...p, scope: p.scope || brain.scope }));
     brain.syn = new Map();
     for (const [w, arr] of (data.syn || [])) brain.syn.set(w, new Set(arr));
+    brain.anchors = new Set(data.anchors || []);
     return true;
   } catch (e) { return false; }
 }
@@ -342,6 +350,7 @@ async function ensureLoaded(brain) {
       if (!local) {
         brain.pairs = [];
         brain.syn = new Map();
+        brain.anchors = new Set();
         await persistLocal(brain);
       }
       brain.loaded = true;
@@ -454,6 +463,7 @@ async function handle(chat, text, isGroup, replyTo) {
         `Слов в словаре: ${brain.vocab.size}`,
         `Векторов слов: ${brain.wordVec.size}`,
         `Синонимов: ${brain.syn.size} (связей ${links})`,
+        `Якорей: ${brain.anchors.size}`,
       ].join('\n'));
     }
 
@@ -472,6 +482,7 @@ async function handle(chat, text, isGroup, replyTo) {
         `В словаре: ${inVocab}`,
         `Вектор есть: ${inVec}`,
         `Частота (df): ${df}`,
+        `Якорь: ${brain.anchors.has(lcW)}`,
         `Синонимы: ${syn && syn.size ? [...syn].join(', ') : '—'}`,
         `Вектор запроса: ${qVec ? 'да' : 'нет'}`,
         `Кандидатов: ${best.length}`,
@@ -524,7 +535,10 @@ async function handle(chat, text, isGroup, replyTo) {
 
       const groups = buildSynGroups(brain);
       if (!groups.length) return send(chat, 'Синонимов нет.');
-      groups.sort((a, b) => a.main.localeCompare(b.main));
+      groups.sort((a, b) => {
+        if (a.hasAnchor !== b.hasAnchor) return a.hasAnchor ? -1 : 1;
+        return a.main.localeCompare(b.main);
+      });
       const totalPages = Math.max(1, Math.ceil(groups.length / LIST_PAGE));
       let page = 1;
       if (arg) {
@@ -549,6 +563,7 @@ async function handle(chat, text, isGroup, replyTo) {
         exportedAt: new Date().toISOString(),
         pairs: brain.pairs.map(p => ({ q: p.question, a: p.answer })),
         syn: [...brain.syn.entries()].filter(([, set]) => set.size).map(([w, set]) => ({ w, s: [...set] })),
+        anchors: [...brain.anchors],
       };
       const filename = `brain_${safeName(scope)}.json`;
       try { await sendDocument(chat, filename, JSON.stringify(data, null, 2)); }
@@ -563,6 +578,7 @@ async function handle(chat, text, isGroup, replyTo) {
         const data = JSON.parse(content);
         const pairs = Array.isArray(data.pairs) ? data.pairs : [];
         const syn = Array.isArray(data.syn) ? data.syn : [];
+        const anchors = Array.isArray(data.anchors) ? data.anchors : [];
         await ensureLoaded(brain);
         let added = 0;
         for (const p of pairs) {
@@ -580,11 +596,12 @@ async function handle(chat, text, isGroup, replyTo) {
           const target = brain.syn.get(w);
           for (const s of item.s) target.add(lc(s));
         }
+        for (const a of anchors) brain.anchors.add(lc(a));
         brain.dirty = true;
         rebuildEmbeddings(brain);
         reindexVectors(brain);
         await persistLocal(brain);
-        return send(chat, `Импортировано пар: ${added}, синонимов: ${syn.length}`);
+        return send(chat, `Импортировано пар: ${added}, синонимов: ${syn.length}, якорей: ${anchors.length}`);
       } catch (e) {
         console.error('import', e.message);
         return send(chat, 'Ошибка импорта: ' + e.message);
@@ -637,31 +654,31 @@ async function handle(chat, text, isGroup, replyTo) {
         }
       }
 
-      let touched = 0;
-      const peers = new Set();
       const own = brain.syn.get(key);
-      if (own) { for (const p of own) peers.add(p); }
+      if (!own && !brain.anchors.has(key)) {
+        let found = false;
+        for (const [, set] of brain.syn) { if (set.has(key)) { found = true; break; } }
+        if (!found) return send(chat, `Не нашёл: ${key}`);
+      }
+
+      const peers = new Set();
+      if (own) for (const p of own) peers.add(p);
       for (const [w, set] of brain.syn) {
         if (set.has(key)) peers.add(w);
       }
-
-      if (own || peers.size) {
-        for (const p of peers) {
-          const s = brain.syn.get(p);
-          if (s) { s.delete(key); touched++; }
-        }
-        if (own) { own.clear(); touched++; }
-        brain.syn.delete(key);
+      for (const p of peers) {
+        const s = brain.syn.get(p);
+        if (s) s.delete(key);
       }
-
-      if (!touched) return send(chat, `Не нашёл: ${key}`);
+      brain.syn.delete(key);
+      brain.anchors.delete(key);
 
       try {
         brain.dirty = true;
         rebuildEmbeddings(brain);
         reindexVectors(brain);
         await persistLocal(brain);
-        return send(chat, `Удалил синоним: ${key} (затронуто связей: ${touched})`);
+        return send(chat, `Удалил синоним: ${key}`);
       } catch (e) {
         console.error('delete syn', e.message);
         return send(chat, 'Ошибка удаления синонима: ' + e.message);
@@ -676,6 +693,7 @@ async function handle(chat, text, isGroup, replyTo) {
       const others = parts[1].split(',').map(s => lc(s.trim())).filter(Boolean);
       if (!main || !others.length) return send(chat, 'Пусто.');
       await ensureLoaded(brain);
+
       if (!brain.syn.has(main)) brain.syn.set(main, new Set());
       const sa = brain.syn.get(main);
       for (const o of others) {
@@ -683,6 +701,20 @@ async function handle(chat, text, isGroup, replyTo) {
         if (!brain.syn.has(o)) brain.syn.set(o, new Set());
         brain.syn.get(o).add(main);
       }
+
+      if (!brain.anchors.has(main)) {
+        let existingAnchor = null;
+        for (const a of brain.anchors) {
+          if (a === main || sa.has(a)) { existingAnchor = a; break; }
+        }
+        if (existingAnchor) {
+          brain.anchors.delete(existingAnchor);
+          brain.anchors.add(main);
+        } else {
+          brain.anchors.add(main);
+        }
+      }
+
       try {
         brain.dirty = true;
         rebuildEmbeddings(brain);
