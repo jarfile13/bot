@@ -10,13 +10,14 @@ if (!BOT_TOKEN) {
 
 const PORT = process.env.PORT || 3000;
 const DATA_FILE = process.env.DATA_FILE || './ai_brain.json';
-const OFFSET_FILE = './ai_brain.offset.json';
+const OFFSET_FILE = process.env.OFFSET_FILE || './ai_brain.offset.json';
 
 http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(PORT);
 
 let aiBrain = {
     vocabulary: {},
     relations: {},
+    originals: {},
     lastInput: {},
     synonyms: {},
     context: {}
@@ -28,6 +29,7 @@ if (fs.existsSync(DATA_FILE)) {
         aiBrain = {
             vocabulary: parsed.vocabulary || {},
             relations: parsed.relations || {},
+            originals: parsed.originals || {},
             lastInput: parsed.lastInput || {},
             synonyms: parsed.synonyms || {},
             context: parsed.context || {}
@@ -48,6 +50,7 @@ function saveBrainNow() {
         const toSave = {
             vocabulary: aiBrain.vocabulary,
             relations: aiBrain.relations,
+            originals: aiBrain.originals,
             lastInput: aiBrain.lastInput,
             synonyms: aiBrain.synonyms,
             context: aiBrain.context
@@ -115,16 +118,31 @@ function stem(word) {
     return w;
 }
 
-function canonical(word) {
-    const syn = aiBrain.synonyms[word];
-    if (syn && syn.length) return syn[0];
-    return word;
+function canonicalPhrase(phrase) {
+    const words = cleanText(phrase).split(' ').filter(Boolean);
+    const out = [];
+    for (const w of words) {
+        const syn = aiBrain.synonyms[w];
+        if (syn && syn.length) {
+            out.push(syn[0]);
+        } else {
+            out.push(w);
+        }
+    }
+    return out;
 }
 
 function tokenize(text) {
     const clean = cleanText(text);
     if (!clean) return [];
-    return clean.split(' ').filter(Boolean).map(w => stem(canonical(w)));
+    const words = clean.split(' ').filter(Boolean);
+    const out = [];
+    for (const w of words) {
+        const syn = aiBrain.synonyms[w];
+        const base = (syn && syn.length) ? syn[0] : w;
+        out.push(stem(base));
+    }
+    return out;
 }
 
 function trainAI(input, output) {
@@ -133,6 +151,7 @@ function trainAI(input, output) {
     if (!inTokens.length || !outClean) return false;
 
     const key = inTokens.join(' ');
+    const original = cleanText(input);
 
     if (!aiBrain.relations[key]) {
         aiBrain.relations[key] = {};
@@ -142,6 +161,10 @@ function trainAI(input, output) {
         aiBrain.relations[key][outClean] = 1;
     } else {
         aiBrain.relations[key][outClean] += 1;
+    }
+
+    if (!aiBrain.originals[key]) {
+        aiBrain.originals[key] = original;
     }
 
     for (const w of inTokens) {
@@ -262,7 +285,24 @@ function sendMessage(chatId, text) {
     return apiRequest('sendMessage', { chat_id: chatId, text });
 }
 
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 10;
+const MAX_LEN = 3500;
+
+function chunkMessage(text, limit) {
+    if (text.length <= limit) return [text];
+    const parts = [];
+    let current = '';
+    const lines = text.split('\n');
+    for (const line of lines) {
+        if ((current + line + '\n').length > limit) {
+            parts.push(current);
+            current = '';
+        }
+        current += line + '\n';
+    }
+    if (current) parts.push(current);
+    return parts;
+}
 
 function buildListPage(page) {
     const items = [];
@@ -281,7 +321,8 @@ function buildListPage(page) {
 
     slice.forEach((it, i) => {
         const num = page * PAGE_SIZE + i + 1;
-        out += num + '. ' + it.q + '\n';
+        const original = aiBrain.originals[it.q] || it.q;
+        out += num + '. ' + original + '\n';
         const opts = Object.keys(it.opts);
         for (const a of opts) {
             out += '   -> ' + a + ' (' + it.opts[a] + ')\n';
@@ -317,19 +358,25 @@ function deletePair(question) {
     if (!key) return false;
     if (!aiBrain.relations[key]) return false;
     delete aiBrain.relations[key];
+    delete aiBrain.originals[key];
     saveBrainNow();
     return true;
 }
 
 function addSynonyms(word, list) {
-    const w = canonical(cleanText(word));
-    if (!w || !list.length) return false;
+    const w = cleanText(word);
+    if (!w) return false;
+    const syns = list.map(s => cleanText(s)).filter(Boolean);
+    if (!syns.length) return false;
+
     if (!aiBrain.synonyms[w]) aiBrain.synonyms[w] = [];
-    for (const s of list) {
-        const cs = cleanText(s);
-        if (cs && !aiBrain.synonyms[w].includes(cs)) {
-            aiBrain.synonyms[w].push(cs);
-            if (!aiBrain.synonyms[cs]) aiBrain.synonyms[cs] = [w];
+    for (const s of syns) {
+        if (!aiBrain.synonyms[w].includes(s)) {
+            aiBrain.synonyms[w].push(s);
+        }
+        if (!aiBrain.synonyms[s]) aiBrain.synonyms[s] = [w];
+        else if (!aiBrain.synonyms[s].includes(w)) {
+            aiBrain.synonyms[s].push(w);
         }
     }
     saveBrain();
@@ -337,7 +384,7 @@ function addSynonyms(word, list) {
 }
 
 function deleteAllSynonyms(word) {
-    const w = canonical(cleanText(word));
+    const w = cleanText(word);
     if (!w || !aiBrain.synonyms[w]) return false;
     const list = [...aiBrain.synonyms[w]];
     delete aiBrain.synonyms[w];
@@ -392,23 +439,28 @@ async function handleMessage(msg) {
 
     if (text === '/start') {
         await sendMessage(chatId,
-            'Команды:\n' +
-            '/train вопрос = ответ - обучить\n' +
-            '/syn слово = синоним1, синоним2 - добавить синонимы\n' +
-            '/syn del слово - удалить все синонимы слова\n' +
+            'Как учить:\n' +
+            '/train вопрос = ответ\n' +
+            '/train привет = Привет!\n\n' +
+            'Синонимы:\n' +
+            '/syn слово = синоним1, синоним2\n\n' +
+            'Смотреть:\n' +
             '/list - стр. 1\n' +
-            '/list n - страница n (по 20 пар)\n' +
-            '/del вопрос - удалить всю пару\n' +
+            '/list 2 - стр. 2\n\n' +
+            'Удалять:\n' +
+            '/del вопрос\n' +
+            '/syn del слово\n\n' +
+            'Ещё:\n' +
             '/stats - статистика\n' +
-            '/reset - очистить память\n' +
-            '/export - выгрузить базу\n' +
-            '/import - загрузить базу (отправь JSON-файл)'
+            '/reset - стереть всё\n' +
+            '/export - скачать базу\n' +
+            '/import - загрузить базу'
         );
         return;
     }
 
     if (text === '/reset') {
-        aiBrain = { vocabulary: {}, relations: {}, lastInput: {}, synonyms: {}, context: {} };
+        aiBrain = { vocabulary: {}, relations: {}, originals: {}, lastInput: {}, synonyms: {}, context: {} };
         saveBrainNow();
         await sendMessage(chatId, 'Память очищена.');
         return;
@@ -417,7 +469,6 @@ async function handleMessage(msg) {
     if (text === '/stats') {
         const s = getStats();
         await sendMessage(chatId,
-            'Статистика:\n' +
             'Вопросов: ' + s.pairs + '\n' +
             'Ответов: ' + s.answers + '\n' +
             'Примеров: ' + s.examples + '\n' +
@@ -448,7 +499,10 @@ async function handleMessage(msg) {
             return;
         }
         const out = buildListPage(page);
-        await sendMessage(chatId, out);
+        const parts = chunkMessage(out, MAX_LEN);
+        for (const part of parts) {
+            await sendMessage(chatId, part);
+        }
         return;
     }
 
@@ -499,6 +553,7 @@ async function handleMessage(msg) {
             const buf = Buffer.from(JSON.stringify({
                 vocabulary: aiBrain.vocabulary,
                 relations: aiBrain.relations,
+                originals: aiBrain.originals,
                 synonyms: aiBrain.synonyms,
                 context: aiBrain.context,
                 lastInput: aiBrain.lastInput
@@ -566,6 +621,7 @@ async function handleMessage(msg) {
             aiBrain = {
                 vocabulary: parsed.vocabulary || {},
                 relations: parsed.relations || {},
+                originals: parsed.originals || {},
                 lastInput: parsed.lastInput || {},
                 synonyms: parsed.synonyms || {},
                 context: parsed.context || {}
