@@ -15,9 +15,15 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(PORT);
 
-const userNetworks = new Map();
+const userData = new Map();
 const pending = new Map();
 const pendingReset = new Map();
+
+const HIDDEN_DIM = 24;
+const LR = 0.15;
+const EPOCHS = 300;
+const CONFIDENCE = 0.72;
+const L2 = 0.0001;
 
 function cleanText(str) {
   return String(str).toLowerCase().replace(/ё/g, 'е').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
@@ -27,43 +33,61 @@ function getWords(str) {
   return cleanText(str).split(' ').filter(w => w.length >= 1);
 }
 
-function initNetwork() {
-  return {
-    vocabulary: [],
-    intents: [],
-    weights_ih: [],
-    weights_ho: [],
-    bias_h: [],
-    bias_o: []
-  };
+function userFile(userId) { return path.join(DATA_DIR, `user_${userId}.json`); }
+
+function emptyUserData() {
+  return { dataset: [], intents: [], vocabulary: [] };
 }
 
-function getUserNetFile(userId) {
-  return path.join(DATA_DIR, `net_${userId}.json`);
-}
-
-function loadUserNet(userId) {
-  if (userNetworks.has(userId)) return userNetworks.get(userId);
-  const file = getUserNetFile(userId);
-  let net = initNetwork();
+function loadUserData(userId) {
+  if (userData.has(userId)) return userData.get(userId);
+  const file = userFile(userId);
+  let data = emptyUserData();
   if (fs.existsSync(file)) {
-    try { net = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { net = initNetwork(); }
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (parsed && Array.isArray(parsed.dataset)) data = parsed;
+    } catch (e) { data = emptyUserData(); }
   }
-  userNetworks.set(userId, net);
-  return net;
+  userData.set(userId, data);
+  return data;
 }
 
-function saveUserNet(userId, net) {
-  userNetworks.set(userId, net);
-  try { fs.writeFileSync(getUserNetFile(userId), JSON.stringify(net, null, 2), 'utf8'); } catch (e) {}
+function saveUserData(userId) {
+  const data = userData.get(userId);
+  if (!data) return;
+  try { fs.writeFileSync(userFile(userId), JSON.stringify(data, null, 2), 'utf8'); } catch (e) {}
 }
 
-function buildBagOfWords(words, vocabulary) {
-  const bag = new Array(vocabulary.length).fill(0);
-  words.forEach(w => {
-    const idx = vocabulary.indexOf(w);
-    if (idx !== -1) bag[idx] = 1;
-  });
+function rebuildVocabulary(data) {
+  const vocab = [];
+  const seen = new Set();
+  for (const ex of data.dataset) {
+    for (const w of getWords(ex.q)) {
+      if (!seen.has(w)) { seen.add(w); vocab.push(w); }
+    }
+  }
+  data.vocabulary = vocab;
+}
+
+function rebuildIntents(data) {
+  const intents = [];
+  const seen = new Set();
+  for (const ex of data.dataset) {
+    const a = ex.a.trim();
+    if (!seen.has(a)) { seen.add(a); intents.push(a); }
+  }
+  data.intents = intents;
+}
+
+function bagOfWords(words, vocab) {
+  const bag = new Array(vocab.length).fill(0);
+  const idx = new Map();
+  vocab.forEach((w, i) => idx.set(w, i));
+  for (const w of words) {
+    const i = idx.get(w);
+    if (i !== undefined) bag[i] = 1;
+  }
   return bag;
 }
 
@@ -73,187 +97,142 @@ function sigmoid(x) {
   return 1 / (1 + Math.exp(-x));
 }
 
-function dSigmoid(y) {
-  return y * (1 - y);
+function initWeights(inputDim, hiddenDim, outputDim) {
+  const rng = () => (Math.random() * 2 - 1);
+  const limitIH = Math.sqrt(6 / (inputDim + hiddenDim));
+  const limitHO = Math.sqrt(6 / (hiddenDim + outputDim));
+  return {
+    wih: Array.from({ length: inputDim }, () => Array.from({ length: hiddenDim }, () => rng() * limitIH)),
+    who: Array.from({ length: hiddenDim }, () => Array.from({ length: outputDim }, () => rng() * limitHO)),
+    bh: new Array(hiddenDim).fill(0),
+    bo: new Array(outputDim).fill(0)
+  };
 }
 
-function forward(inputBag, net) {
-  const hiddenDim = net.bias_h.length;
-  const outputDim = net.bias_o.length;
-
-  const hidden = new Array(hiddenDim).fill(0);
-  for (let h = 0; h < hiddenDim; h++) {
-    let sum = net.bias_h[h];
-    for (let i = 0; i < inputBag.length; i++) {
-      sum += inputBag[i] * net.weights_ih[i][h];
-    }
-    hidden[h] = sigmoid(sum);
+function forward(bag, W) {
+  const hidden = new Array(W.bh.length).fill(0);
+  for (let h = 0; h < W.bh.length; h++) {
+    let s = W.bh[h];
+    for (let i = 0; i < bag.length; i++) if (bag[i]) s += W.wih[i][h];
+    hidden[h] = sigmoid(s);
   }
-
-  const output = new Array(outputDim).fill(0);
-  for (let o = 0; o < outputDim; o++) {
-    let sum = net.bias_o[o];
-    for (let h = 0; h < hiddenDim; h++) {
-      sum += hidden[h] * net.weights_ho[h][o];
-    }
-    output[o] = sigmoid(sum);
+  const output = new Array(W.bo.length).fill(0);
+  for (let o = 0; o < W.bo.length; o++) {
+    let s = W.bo[o];
+    for (let h = 0; h < hidden.length; h++) s += hidden[h] * W.who[h][o];
+    output[o] = sigmoid(s);
   }
-
   return { hidden, output };
 }
 
-function trainNetwork(inputBag, targetIdx, net, lr = 0.6, iterations = 40) {
-  const hiddenDim = net.bias_h.length;
-  const outputDim = net.bias_o.length;
-  const targets = new Array(outputDim).fill(0);
-  targets[targetIdx] = 1;
+function trainFull(data) {
+  const vocab = data.vocabulary;
+  const intents = data.intents;
+  if (vocab.length === 0 || intents.length === 0 || data.dataset.length === 0) return null;
 
-  let firstErr = 0;
-  let lastErr = 0;
+  const inputDim = vocab.length;
+  const hiddenDim = HIDDEN_DIM;
+  const outputDim = intents.length;
 
-  for (let iter = 0; iter < iterations; iter++) {
-    const { hidden, output } = forward(inputBag, net);
+  const W = initWeights(inputDim, hiddenDim, outputDim);
 
-    const outputErrors = new Array(outputDim);
-    let errSum = 0;
-    for (let o = 0; o < outputDim; o++) {
-      outputErrors[o] = targets[o] - output[o];
-      errSum += outputErrors[o] * outputErrors[o];
-    }
-    errSum = Math.sqrt(errSum);
-    if (iter === 0) firstErr = errSum;
-    lastErr = errSum;
+  const examples = data.dataset.map(ex => ({
+    bag: bagOfWords(getWords(ex.q), vocab),
+    target: intents.indexOf(ex.a.trim())
+  })).filter(e => e.target !== -1);
 
-    const hiddenErrors = new Array(hiddenDim).fill(0);
-    for (let h = 0; h < hiddenDim; h++) {
-      let error = 0;
+  if (examples.length === 0) return null;
+
+  let firstErr = 0, lastErr = 0;
+
+  for (let epoch = 0; epoch < EPOCHS; epoch++) {
+    let epochErr = 0;
+    const order = [...examples.keys()].sort(() => Math.random() - 0.5);
+    for (const idx of order) {
+      const { bag, target } = examples[idx];
+      const { hidden, output } = forward(bag, W);
+
+      const outErr = new Array(outputDim);
       for (let o = 0; o < outputDim; o++) {
-        error += outputErrors[o] * dSigmoid(output[o]) * net.weights_ho[h][o];
+        const t = o === target ? 1 : 0;
+        outErr[o] = t - output[o];
+        epochErr += outErr[o] * outErr[o];
       }
-      hiddenErrors[h] = error;
-    }
 
-    for (let o = 0; o < outputDim; o++) {
-      const gradient = outputErrors[o] * dSigmoid(output[o]) * lr;
-      net.bias_o[o] += gradient;
+      const hidErr = new Array(hiddenDim).fill(0);
       for (let h = 0; h < hiddenDim; h++) {
-        net.weights_ho[h][o] += gradient * hidden[h];
+        let e = 0;
+        for (let o = 0; o < outputDim; o++) e += outErr[o] * output[o] * (1 - output[o]) * W.who[h][o];
+        hidErr[h] = e;
       }
-    }
 
-    for (let h = 0; h < hiddenDim; h++) {
-      const gradient = hiddenErrors[h] * dSigmoid(hidden[h]) * lr;
-      net.bias_h[h] += gradient;
-      for (let i = 0; i < inputBag.length; i++) {
-        net.weights_ih[i][h] += gradient * inputBag[i];
+      for (let o = 0; o < outputDim; o++) {
+        const g = outErr[o] * output[o] * (1 - output[o]) * LR;
+        W.bo[o] += g;
+        for (let h = 0; h < hiddenDim; h++) {
+          W.who[h][o] += g * hidden[h] - L2 * W.who[h][o];
+        }
+      }
+
+      for (let h = 0; h < hiddenDim; h++) {
+        const g = hidErr[h] * hidden[h] * (1 - hidden[h]) * LR;
+        W.bh[h] += g;
+        for (let i = 0; i < inputDim; i++) {
+          if (bag[i]) W.wih[i][h] += g - L2 * W.wih[i][h];
+        }
       }
     }
+    epochErr = Math.sqrt(epochErr / examples.length);
+    if (epoch === 0) firstErr = epochErr;
+    lastErr = epochErr;
   }
 
-  return { firstErr, lastErr };
+  return { W, firstErr, lastErr, examples: examples.length, inputDim, outputDim };
 }
 
-function updateNetworkStructure(net, newWords, newResponse) {
-  let vocabChanged = false;
-  newWords.forEach(w => {
-    if (!net.vocabulary.includes(w)) {
-      net.vocabulary.push(w);
-      vocabChanged = true;
-    }
-  });
-
-  let intentIdx = net.intents.findIndex(id => id.response === newResponse);
-  let isNewIntent = false;
-  if (intentIdx === -1) {
-    net.intents.push({ response: newResponse });
-    intentIdx = net.intents.length - 1;
-    isNewIntent = true;
+function predict(data, W, words) {
+  const bag = bagOfWords(words, data.vocabulary);
+  const total = bag.reduce((a, b) => a + b, 0);
+  if (total === 0) return null;
+  const { output } = forward(bag, W);
+  let maxIdx = -1, maxVal = -1;
+  for (let i = 0; i < output.length; i++) {
+    if (output[i] > maxVal) { maxVal = output[i]; maxIdx = i; }
   }
-
-  const inputDim = net.vocabulary.length;
-  const outputDim = net.intents.length;
-  const hiddenDim = 16;
-
-  const needRebuild = vocabChanged || net.bias_h.length === 0 || net.bias_o.length !== outputDim ||
-                      net.weights_ih.length !== inputDim || net.weights_ho.length !== hiddenDim;
-
-  if (needRebuild) {
-    const oldWeightsIH = net.weights_ih;
-    net.weights_ih = Array.from({ length: inputDim }, () => new Array(hiddenDim).fill(0));
-    for (let i = 0; i < inputDim; i++) {
-      for (let h = 0; h < hiddenDim; h++) {
-        if (oldWeightsIH && oldWeightsIH[i] && oldWeightsIH[i][h] !== undefined) {
-          net.weights_ih[i][h] = oldWeightsIH[i][h];
-        } else {
-          net.weights_ih[i][h] = (Math.random() * 2 - 1) * 0.1;
-        }
-      }
-    }
-
-    if (net.bias_h.length !== hiddenDim) {
-      const oldBiasH = net.bias_h;
-      net.bias_h = Array.from({ length: hiddenDim }, (_, h) => {
-        if (oldBiasH && oldBiasH[h] !== undefined) return oldBiasH[h];
-        return (Math.random() * 2 - 1) * 0.1;
-      });
-    }
-
-    const oldWeightsHO = net.weights_ho;
-    net.weights_ho = Array.from({ length: hiddenDim }, () => new Array(outputDim).fill(0));
-    for (let h = 0; h < hiddenDim; h++) {
-      for (let o = 0; o < outputDim; o++) {
-        if (oldWeightsHO && oldWeightsHO[h] && oldWeightsHO[h][o] !== undefined) {
-          net.weights_ho[h][o] = oldWeightsHO[h][o];
-        } else {
-          net.weights_ho[h][o] = (Math.random() * 2 - 1) * 0.1;
-        }
-      }
-    }
-
-    const oldBiasO = net.bias_o;
-    net.bias_o = new Array(outputDim).fill(0);
-    for (let o = 0; o < outputDim; o++) {
-      if (oldBiasO && oldBiasO[o] !== undefined) {
-        net.bias_o[o] = oldBiasO[o];
-      } else {
-        net.bias_o[o] = (Math.random() * 2 - 1) * 0.1;
-      }
-    }
-  }
-
-  return { intentIdx, isNewIntent, vocabChanged };
+  return { idx: maxIdx, val: maxVal, output };
 }
 
 function sendMessage(chatId, text, extra) {
   const payload = { chat_id: chatId, text: text };
   if (extra) Object.assign(payload, extra);
-  const data = JSON.stringify(payload);
+  const body = JSON.stringify(payload);
   const req = https.request(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
   });
   req.on('error', () => {});
-  req.write(data);
+  req.write(body);
   req.end();
 }
 
 function sendDocument(chatId, filePath, caption) {
   try {
-    const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
+    const boundary = '----Boundary' + Math.random().toString(36).slice(2);
     const filename = path.basename(filePath);
     const fileData = fs.readFileSync(filePath);
-    let header = `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`;
-    header += `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`;
-    header += `--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename}"\r\nContent-Type: application/json\r\n\r\n`;
-    const footer = `\r\n--${boundary}--\r\n`;
+    const parts = [];
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`));
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`));
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename}"\r\nContent-Type: application/json\r\n\r\n`));
+    parts.push(fileData);
+    parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+    const body = Buffer.concat(parts);
     const req = https.request(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`, {
       method: 'POST',
-      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length }
     });
     req.on('error', () => {});
-    req.write(header);
-    req.write(fileData);
-    req.write(footer);
+    req.write(body);
     req.end();
   } catch (e) {}
 }
@@ -261,19 +240,17 @@ function sendDocument(chatId, filePath, caption) {
 function downloadFile(fileId, callback) {
   https.get(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`, (res) => {
     let data = '';
-    res.on('data', chunk => data += chunk);
+    res.on('data', c => data += c);
     res.on('end', () => {
       try {
         const json = JSON.parse(data);
         if (json.ok && json.result.file_path) {
-          https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${json.result.file_path}`, (fileRes) => {
-            let content = '';
-            fileRes.on('data', chunk => content += chunk);
-            fileRes.on('end', () => callback(content));
+          https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${json.result.file_path}`, fr => {
+            const chunks = [];
+            fr.on('data', c => chunks.push(c));
+            fr.on('end', () => callback(Buffer.concat(chunks).toString('utf8')));
           });
-        } else {
-          callback(null);
-        }
+        } else callback(null);
       } catch (e) { callback(null); }
     });
   }).on('error', () => callback(null));
@@ -283,106 +260,130 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function teachAndReport(userId, question, answer) {
-  const net = loadUserNet(userId);
-  const words = getWords(question);
-  if (words.length === 0 || !answer.trim()) return null;
+function addExample(userId, question, answer) {
+  const data = loadUserData(userId);
+  const q = question.trim();
+  const a = answer.trim();
+  if (!q || !a) return null;
 
-  const beforeVocab = net.vocabulary.length;
-  const beforeIntents = net.intents.length;
+  const existingIdx = data.dataset.findIndex(ex => cleanText(ex.q) === cleanText(q) && ex.a.trim() === a);
+  let addedNew = false;
+  if (existingIdx === -1) {
+    data.dataset.push({ q, a });
+    addedNew = true;
+  }
 
-  const info = updateNetworkStructure(net, words, answer.trim());
-  const refreshedNet = loadUserNet(userId);
-  const bag = buildBagOfWords(words, refreshedNet.vocabulary);
-  const { firstErr, lastErr } = trainNetwork(bag, info.intentIdx, refreshedNet, 0.6, 40);
-  saveUserNet(userId, refreshedNet);
+  const beforeIntents = data.intents.length;
+  const beforeVocab = data.vocabulary.length;
 
-  const addedWords = refreshedNet.vocabulary.length - beforeVocab;
-  const addedIntents = refreshedNet.intents.length - beforeIntents;
+  rebuildVocabulary(data);
+  rebuildIntents(data);
+
+  const result = trainFull(data);
+  if (!result) return null;
+
+  data.W = result.W;
+  saveUserData(userId);
+
+  const addedIntents = data.intents.length - beforeIntents;
+  const addedVocab = data.vocabulary.length - beforeVocab;
+
   const parts = [];
+  if (addedNew) parts.push('пара добавлена');
+  else parts.push('пара уже была');
   if (addedIntents > 0) parts.push(`+${addedIntents} интент`);
-  if (addedWords > 0) parts.push(`+${addedWords} слов`);
-  parts.push(`ошибка ${firstErr.toFixed(2)}→${lastErr.toFixed(2)}`);
+  if (addedVocab > 0) parts.push(`+${addedVocab} слов`);
+  parts.push(`ошибка ${result.firstErr.toFixed(2)}→${result.lastErr.toFixed(2)}`);
   return parts.join(' · ');
+}
+
+function retrain(userId) {
+  const data = loadUserData(userId);
+  if (data.dataset.length === 0) return null;
+  rebuildVocabulary(data);
+  rebuildIntents(data);
+  const result = trainFull(data);
+  if (!result) return null;
+  data.W = result.W;
+  saveUserData(userId);
+  return result;
+}
+
+function predictFor(userId, text) {
+  const data = loadUserData(userId);
+  if (!data.W || data.vocabulary.length === 0 || data.intents.length === 0) return null;
+  const words = getWords(text);
+  const pred = predict(data, data.W, words);
+  if (!pred) return null;
+  if (pred.val < CONFIDENCE) return { low: true, val: pred.val, response: data.intents[pred.idx] };
+  return { low: false, val: pred.val, response: data.intents[pred.idx] };
 }
 
 function showHelp(chatId) {
   const text =
-    '<b>Нейросеть на JS (backpropagation)</b>\n\n' +
+    '<b>Нейросеть на JS</b>\n\n' +
+    'Обучается на парах «вопрос → ответ». Данные хранятся отдельно, сеть переобучается с нуля после каждой пары — поэтому не забывает старое.\n\n' +
     '<b>Обучение</b>\n' +
-    'Напиши фразу — я повторю её и буду ждать ответ.\n' +
-    'Ответь — запомню пару «вопрос → ответ».\n\n' +
-    'Или сразу:\n' +
-    '<code>/teach вопрос = ответ</code>\n' +
-    '<code>/teach вопрос</code> — и следующим сообщением ответ\n\n' +
+    'Просто напиши фразу — я повторю её и жду ответ.\n' +
+    'Ответь — запомню пару.\n\n' +
+    'Быстро:\n' +
+    '<code>/teach вопрос = ответ</code>\n\n' +
     '<b>Управление</b>\n' +
-    '/list — все выученные пары\n' +
-    '/show &lt;номер&gt; — подробности о паре\n' +
+    '/list — все пары\n' +
+    '/show &lt;номер&gt; — подробности\n' +
     '/del &lt;номер&gt; — удалить пару\n' +
-    '/find &lt;текст&gt; — поиск по выученному\n' +
-    '/forget &lt;текст&gt; — удалить по точному вопросу\n\n' +
+    '/find &lt;текст&gt; — поиск\n' +
+    '/forget &lt;текст&gt; — удалить по вопросу\n' +
+    '/retrain — переобучить сеть\n\n' +
     '<b>Данные</b>\n' +
-    '/export — скачать веса сети (JSON)\n' +
+    '/export — скачать базу\n' +
     '/import — как импортировать (отправь JSON)\n' +
-    '/stats — статистика сети\n' +
-    '/reset — стереть всё (с подтверждением)\n\n' +
-    '<b>Прочее</b>\n' +
-    '/cancel — отменить текущее действие';
+    '/stats — статистика\n' +
+    '/reset — стереть всё\n\n' +
+    '/cancel — отмена';
 
   sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
 
-function getIntents(net) {
-  return net.intents.map((it, i) => ({ idx: i, response: it.response }));
-}
-
-function findIntentByResponse(net, text) {
-  const t = cleanText(text);
-  return net.intents.findIndex(it => cleanText(it.response) === t);
-}
-
-function showList(chatId, net, page) {
-  if (net.intents.length === 0) {
-    sendMessage(chatId, 'сеть пуста');
-    return;
-  }
+function showList(chatId, data, page) {
+  if (data.dataset.length === 0) { sendMessage(chatId, 'база пуста'); return; }
   const PAGE = 10;
-  const totalPages = Math.ceil(net.intents.length / PAGE);
+  const totalPages = Math.ceil(data.dataset.length / PAGE);
   const p = Math.max(1, Math.min(page, totalPages));
   const start = (p - 1) * PAGE;
-  const slice = net.intents.slice(start, start + PAGE);
+  const slice = data.dataset.slice(start, start + PAGE);
 
-  let out = `<b>Выученные ответы</b> (стр. ${p}/${totalPages}, всего ${net.intents.length})\n\n`;
-  slice.forEach((it, i) => {
+  let out = `<b>Пары</b> (стр. ${p}/${totalPages}, всего ${data.dataset.length})\n\n`;
+  slice.forEach((ex, i) => {
     const num = start + i + 1;
-    const preview = it.response.length > 80 ? it.response.slice(0, 80) + '…' : it.response;
-    out += `<b>${num}.</b> ${escapeHtml(preview)}\n`;
+    const q = ex.q.length > 45 ? ex.q.slice(0, 45) + '…' : ex.q;
+    const a = ex.a.length > 45 ? ex.a.slice(0, 45) + '…' : ex.a;
+    out += `<b>${num}.</b> ${escapeHtml(q)}\n     → ${escapeHtml(a)}\n`;
   });
   if (totalPages > 1) out += `\n/list ${p + 1}`;
   sendMessage(chatId, out, { parse_mode: 'HTML' });
 }
 
-function showEntry(chatId, net, num) {
+function showEntry(chatId, data, num) {
   const idx = num - 1;
-  if (idx < 0 || idx >= net.intents.length) {
-    sendMessage(chatId, `нет интента #${num}. всего: ${net.intents.length}`);
+  if (idx < 0 || idx >= data.dataset.length) {
+    sendMessage(chatId, `нет пары #${num}. всего: ${data.dataset.length}`);
     return;
   }
-  const it = net.intents[idx];
-  let out = `<b>Интент #${num}</b>\n\n`;
-  out += `Ответ: ${escapeHtml(it.response)}\n\n`;
-  out += `Слов в словаре: ${net.vocabulary.length}\n`;
-  out += `Всего интентов: ${net.intents.length}`;
+  const ex = data.dataset[idx];
+  let out = `<b>Пара #${num}</b>\n\n`;
+  out += `<b>Вопрос:</b> ${escapeHtml(ex.q)}\n\n`;
+  out += `<b>Ответ:</b> ${escapeHtml(ex.a)}`;
   sendMessage(chatId, out, { parse_mode: 'HTML' });
 }
 
-function findPairs(chatId, net, query) {
+function findPairs(chatId, data, query) {
   const q = cleanText(query);
   if (!q) { sendMessage(chatId, 'формат: /find текст'); return; }
   const results = [];
-  net.intents.forEach((it, i) => {
-    if (cleanText(it.response).includes(q)) {
-      results.push({ num: i + 1, response: it.response });
+  data.dataset.forEach((ex, i) => {
+    if (cleanText(ex.q).includes(q) || cleanText(ex.a).includes(q)) {
+      results.push({ num: i + 1, q: ex.q, a: ex.a });
     }
   });
   if (results.length === 0) {
@@ -391,40 +392,53 @@ function findPairs(chatId, net, query) {
   }
   let out = `<b>Найдено: ${results.length}</b>\n\n`;
   results.slice(0, 15).forEach(r => {
-    const preview = r.response.length > 70 ? r.response.slice(0, 70) + '…' : r.response;
-    out += `<b>#${r.num}</b> ${escapeHtml(preview)}\n`;
+    const q = r.q.length > 40 ? r.q.slice(0, 40) + '…' : r.q;
+    const a = r.a.length > 40 ? r.a.slice(0, 40) + '…' : r.a;
+    out += `<b>#${r.num}</b> ${escapeHtml(q)} → ${escapeHtml(a)}\n`;
   });
   if (results.length > 15) out += `\n…и ещё ${results.length - 15}`;
   sendMessage(chatId, out, { parse_mode: 'HTML' });
 }
 
-function showStats(chatId, net) {
-  const totalWeights = net.weights_ih.reduce((s, row) => s + row.length, 0) +
-                       net.weights_ho.reduce((s, row) => s + row.length, 0);
-  let out = '<b>Статистика сети</b>\n\n';
-  out += `Слов в словаре: <b>${net.vocabulary.length}</b>\n`;
-  out += `Интентов (ответов): <b>${net.intents.length}</b>\n`;
-  out += `Нейронов скрытого слоя: <b>${net.bias_h.length}</b>\n`;
+function showStats(chatId, data) {
+  const totalWeights = data.W ?
+    (data.W.wih.length * HIDDEN_DIM + HIDDEN_DIM * (data.W.bo.length || 0)) : 0;
+
+  let out = '<b>Статистика</b>\n\n';
+  out += `Пар в базе: <b>${data.dataset.length}</b>\n`;
+  out += `Слов в словаре: <b>${data.vocabulary.length}</b>\n`;
+  out += `Интентов (ответов): <b>${data.intents.length}</b>\n`;
+  out += `Нейронов скрытого слоя: <b>${HIDDEN_DIM}</b>\n`;
   out += `Синапсов: <b>${totalWeights}</b>\n`;
-  out += `Параметров (весов и смещений): <b>${totalWeights + net.bias_h.length + net.bias_o.length}</b>`;
+  out += `Порог уверенности: <b>${(CONFIDENCE * 100).toFixed(0)}%</b>`;
   sendMessage(chatId, out, { parse_mode: 'HTML' });
 }
 
 function handleMessage(chatId, userId, text, document) {
-  let net = loadUserNet(userId);
+  const data = loadUserData(userId);
 
   if (document && document.file_name && document.file_name.endsWith('.json')) {
     downloadFile(document.file_id, (content) => {
-      if (!content) { sendMessage(chatId, 'не удалось скачать файл'); return; }
+      if (!content) { sendMessage(chatId, 'не удалось скачать'); return; }
       try {
         const imported = JSON.parse(content);
-        if (imported.weights_ih && imported.intents && imported.vocabulary) {
-          saveUserNet(userId, imported);
+        if (Array.isArray(imported.dataset)) {
+          data.dataset = imported.dataset;
+          rebuildVocabulary(data);
+          rebuildIntents(data);
+          const r = trainFull(data);
+          if (r) { data.W = r.W; saveUserData(userId); }
           pending.delete(userId);
-          pendingReset.delete(userId);
-          sendMessage(chatId, `сеть загружена: ${imported.vocabulary.length} слов, ${imported.intents.length} интентов`);
+          sendMessage(chatId, `импортировано пар: ${data.dataset.length}, обучено заново`);
+        } else if (Array.isArray(imported)) {
+          data.dataset = imported.filter(e => e.q && e.a);
+          rebuildVocabulary(data);
+          rebuildIntents(data);
+          const r = trainFull(data);
+          if (r) { data.W = r.W; saveUserData(userId); }
+          sendMessage(chatId, `импортировано пар: ${data.dataset.length}`);
         } else {
-          sendMessage(chatId, 'неверный формат файла');
+          sendMessage(chatId, 'неверный формат');
         }
       } catch (e) { sendMessage(chatId, 'ошибка чтения файла'); }
     });
@@ -453,71 +467,80 @@ function handleMessage(chatId, userId, text, document) {
 
     if (cmd === '/reset') {
       pendingReset.set(userId, true);
-      sendMessage(chatId, 'Уверен? Вся сеть будет удалена.\n\nНапиши <b>да</b> для подтверждения.', { parse_mode: 'HTML' });
+      sendMessage(chatId, 'Уверен? Вся база и сеть будут удалены.\n\nНапиши <b>да</b> для подтверждения.', { parse_mode: 'HTML' });
       return;
     }
 
     if (cmd === '/export') {
-      if (net.vocabulary.length === 0) { sendMessage(chatId, 'сеть пуста'); return; }
-      sendDocument(chatId, getUserNetFile(userId), `веса сети (${net.vocabulary.length} слов, ${net.intents.length} интентов)`);
+      if (data.dataset.length === 0) { sendMessage(chatId, 'база пуста'); return; }
+      sendDocument(chatId, userFile(userId), `база пар (${data.dataset.length})`);
       return;
     }
 
     if (cmd === '/import') {
-      sendMessage(chatId, 'Отправь JSON-файл с весами сети (полученный через /export).\n\nТекущая сеть будет заменена.');
+      sendMessage(chatId, 'Отправь JSON-файл с полем dataset (из /export).\n\nТекущая база будет заменена.');
       return;
     }
 
-    if (cmd === '/stats') { showStats(chatId, net); return; }
+    if (cmd === '/stats') { showStats(chatId, data); return; }
 
     if (cmd === '/list') {
-      const page = parseInt(arg, 10) || 1;
-      showList(chatId, net, page);
+      showList(chatId, data, parseInt(arg, 10) || 1);
       return;
     }
 
     if (cmd === '/show') {
       const num = parseInt(arg, 10);
       if (!num) { sendMessage(chatId, 'формат: /show <номер>'); return; }
-      showEntry(chatId, net, num);
+      showEntry(chatId, data, num);
       return;
     }
 
-    if (cmd === '/find') {
-      findPairs(chatId, net, arg);
-      return;
-    }
+    if (cmd === '/find') { findPairs(chatId, data, arg); return; }
 
     if (cmd === '/del') {
       const num = parseInt(arg, 10);
-      if (!num || num < 1 || num > net.intents.length) {
-        sendMessage(chatId, `укажи номер 1–${net.intents.length}`);
+      if (!num || num < 1 || num > data.dataset.length) {
+        sendMessage(chatId, `укажи номер 1–${data.dataset.length}`);
         return;
       }
-      const removed = net.intents.splice(num - 1, 1)[0];
-      saveUserNet(userId, net);
-      sendMessage(chatId, `удалён интент #${num}: "${escapeHtml(removed.response.slice(0, 80))}"`, { parse_mode: 'HTML' });
+      const removed = data.dataset.splice(num - 1, 1)[0];
+      rebuildVocabulary(data);
+      rebuildIntents(data);
+      const r = trainFull(data);
+      if (r) { data.W = r.W; saveUserData(userId); }
+      sendMessage(chatId, `удалено #${num}: "${escapeHtml(removed.q.slice(0, 60))}"`, { parse_mode: 'HTML' });
       return;
     }
 
     if (cmd === '/forget') {
       const target = arg.trim();
-      if (!target) { sendMessage(chatId, 'формат: /forget текст ответа'); return; }
-      const idx = findIntentByResponse(net, target);
-      if (idx === -1) {
+      if (!target) { sendMessage(chatId, 'формат: /forget вопрос'); return; }
+      const before = data.dataset.length;
+      data.dataset = data.dataset.filter(ex => cleanText(ex.q) !== cleanText(target));
+      if (data.dataset.length === before) {
         sendMessage(chatId, `не найдено: "${escapeHtml(target)}". попробуй /find`, { parse_mode: 'HTML' });
         return;
       }
-      net.intents.splice(idx, 1);
-      saveUserNet(userId, net);
-      sendMessage(chatId, `удалено: "${escapeHtml(target)}"`, { parse_mode: 'HTML' });
+      rebuildVocabulary(data);
+      rebuildIntents(data);
+      const r = trainFull(data);
+      if (r) { data.W = r.W; saveUserData(userId); }
+      sendMessage(chatId, `удалено пар: ${before - data.dataset.length}`);
+      return;
+    }
+
+    if (cmd === '/retrain') {
+      const r = retrain(userId);
+      if (!r) { sendMessage(chatId, 'нечего обучать'); return; }
+      sendMessage(chatId, `переобучено: ${r.examples} пар, ошибка ${r.firstErr.toFixed(2)}→${r.lastErr.toFixed(2)}`);
       return;
     }
 
     if (cmd === '/teach') {
       const m = trimmed.match(/^\/teach\s+(.+?)\s*=\s*(.+)$/s);
       if (m) {
-        const report = teachAndReport(userId, m[1].trim(), m[2].trim());
+        const report = addExample(userId, m[1].trim(), m[2].trim());
         if (report) sendMessage(chatId, 'запомнил: ' + report);
         else sendMessage(chatId, 'не удалось');
         return;
@@ -537,17 +560,17 @@ function handleMessage(chatId, userId, text, document) {
 
   if (!text) return;
 
-  const rawWords = getWords(text);
   const trimmedText = text.trim();
+  const rawWords = getWords(trimmedText);
 
   if (pendingReset.get(userId)) {
     const a = trimmedText.toLowerCase();
     if (a === 'да' || a === 'yes' || a === 'y') {
-      const file = getUserNetFile(userId);
+      const file = userFile(userId);
       if (fs.existsSync(file)) { try { fs.unlinkSync(file); } catch (e) {} }
-      userNetworks.delete(userId);
+      userData.delete(userId);
       pendingReset.delete(userId);
-      sendMessage(chatId, 'сеть стёрта');
+      sendMessage(chatId, 'всё стёрто');
     } else {
       pendingReset.delete(userId);
       sendMessage(chatId, 'отменено');
@@ -556,56 +579,39 @@ function handleMessage(chatId, userId, text, document) {
   }
 
   const p = pending.get(userId);
-  if (p) {
-    if (p.type === 'teach') {
-      pending.delete(userId);
-      const report = teachAndReport(userId, p.question, trimmedText);
-      if (report) sendMessage(chatId, 'запомнил: ' + report);
-      else sendMessage(chatId, 'не удалось');
-      return;
-    }
-    if (p.type === 'echo') {
-      pending.delete(userId);
-      const report = teachAndReport(userId, p.question, trimmedText);
-      if (report) sendMessage(chatId, 'запомнил: ' + report);
-      else sendMessage(chatId, 'не удалось');
-      return;
-    }
+  if (p && p.type === 'teach') {
+    pending.delete(userId);
+    const report = addExample(userId, p.question, trimmedText);
+    if (report) sendMessage(chatId, 'запомнил: ' + report);
+    else sendMessage(chatId, 'не удалось');
+    return;
+  }
+
+  if (p && p.type === 'echo') {
+    pending.delete(userId);
+    const report = addExample(userId, p.question, trimmedText);
+    if (report) sendMessage(chatId, 'запомнил: ' + report);
+    else sendMessage(chatId, 'не удалось');
+    return;
   }
 
   if (rawWords.length === 0) return;
 
-  if (net.vocabulary.length === 0 || net.intents.length === 0) {
+  if (data.dataset.length === 0 || !data.W) {
     pending.set(userId, { type: 'echo', question: trimmedText });
     sendMessage(chatId, escapeHtml(trimmedText) + '\n\n<i>чему учить?</i>', { parse_mode: 'HTML' });
     return;
   }
 
-  const bag = buildBagOfWords(rawWords, net.vocabulary);
-  const totalInBag = bag.reduce((a, b) => a + b, 0);
-  if (totalInBag === 0) {
-    pending.set(userId, { type: 'echo', question: trimmedText });
-    sendMessage(chatId, escapeHtml(trimmedText) + '\n\n<i>новые слова. чему учить?</i>', { parse_mode: 'HTML' });
+  const pred = predictFor(userId, trimmedText);
+  if (pred && !pred.low) {
+    sendMessage(chatId, pred.response);
     return;
   }
 
-  const { output } = forward(bag, net);
-  let maxIdx = -1;
-  let maxVal = -1;
-  for (let i = 0; i < output.length; i++) {
-    if (output[i] > maxVal) {
-      maxVal = output[i];
-      maxIdx = i;
-    }
-  }
-
-  if (maxIdx !== -1 && maxVal > 0.65) {
-    sendMessage(chatId, net.intents[maxIdx].response);
-  } else {
-    pending.set(userId, { type: 'echo', question: trimmedText });
-    const conf = maxVal > 0 ? ` (уверенность ${(maxVal * 100).toFixed(0)}%)` : '';
-    sendMessage(chatId, escapeHtml(trimmedText) + `\n\n<i>не уверен${conf}. чему учить?</i>`, { parse_mode: 'HTML' });
-  }
+  pending.set(userId, { type: 'echo', question: trimmedText });
+  const conf = pred ? ` (уверенность ${(pred.val * 100).toFixed(0)}%)` : ' (нет сигнала)';
+  sendMessage(chatId, escapeHtml(trimmedText) + `\n\n<i>не уверен${conf}. чему учить?</i>`, { parse_mode: 'HTML' });
 }
 
 let offset = 0;
@@ -617,7 +623,7 @@ function getUpdates() {
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset}&timeout=25`;
   https.get(url, (res) => {
     let data = '';
-    res.on('data', chunk => data += chunk);
+    res.on('data', c => data += c);
     res.on('end', () => {
       polling = false;
       try {
