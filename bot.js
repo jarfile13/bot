@@ -5,619 +5,1000 @@ const path = require('path');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.error('[КРИТИЧЕСКАЯ ОШИБКА] Переменная BOT_TOKEN не задана!');
+  console.error('BOT_TOKEN не задан');
   process.exit(1);
 }
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || './data';
+const MODEL_DIR = path.join(DATA_DIR, 'models');
 
-try {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-} catch (e) {
-  console.error('[ОШИБКА] Не удалось создать папку данных:', e.message);
+for (const d of [DATA_DIR, MODEL_DIR]) {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
 http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(PORT);
 
-const userMemories = new Map();
-const lastMessages = new Map();
+function uniq(arr) { return [...new Set(arr)]; }
+function sum(arr) { return arr.reduce((a, b) => a + b, 0); }
+function log2(x) { return Math.log(x) / Math.LN2; }
+function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
 
-function getUserMemoryFile(userId) {
-  return path.join(DATA_DIR, `mem_${userId}.json`);
-}
-
-function loadUserMemory(userId) {
-  if (userMemories.has(userId)) return userMemories.get(userId);
-  const file = getUserMemoryFile(userId);
-  let memory = [];
-  if (fs.existsSync(file)) {
-    try { memory = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { memory = []; }
-  }
-  if (!Array.isArray(memory)) memory = [];
-  memory = memory.filter(e =>
-    e &&
-    e.tokens &&
-    Array.isArray(e.tokens.words) &&
-    Array.isArray(e.tokens.ngrams) &&
-    Array.isArray(e.answers) &&
-    typeof e.text === 'string'
-  );
-  userMemories.set(userId, memory);
-  return memory;
-}
-
-function saveUserMemory(userId, memory) {
-  userMemories.set(userId, memory);
-  try {
-    fs.writeFileSync(getUserMemoryFile(userId), JSON.stringify(memory, null, 2), 'utf8');
-  } catch (e) {
-    console.error('[ОШИБКА ЗАПИСИ ФАЙЛА]', e.message);
-  }
-}
-
-function cleanText(str) {
+function tokenize(str) {
   return String(str)
     .toLowerCase()
     .replace(/ё/g, 'е')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .split(/\s+/)
+    .filter(w => w.length > 0);
 }
 
-function tokenize(str) {
-  const text = cleanText(str);
-  const words = text.split(' ').filter(w => w.length >= 1);
-  const ngrams = [];
-  for (let i = 0; i < text.length - 2; i++) {
-    ngrams.push(text.substring(i, i + 3));
-  }
-  return { words, ngrams };
+function clean(str) {
+  return String(str).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
 }
 
 function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function sendMessage(chatId, text, extra) {
-  const payload = { chat_id: chatId, text: text };
-  if (extra) Object.assign(payload, extra);
-  const data = JSON.stringify(payload);
-  const req = https.request(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
-  });
-  req.on('error', (e) => console.error('[ОШИБКА ОТПРАВКИ]', e.message));
-  req.write(data);
-  req.end();
+function saveJSON(file, obj) {
+  try { fs.writeFileSync(file, JSON.stringify(obj), 'utf8'); } catch (e) {}
+}
+function loadJSON(file, def) {
+  if (!fs.existsSync(file)) return def;
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return def; }
 }
 
-function sendDocument(chatId, filePath, caption) {
-  try {
-    const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
-    const filename = path.basename(filePath);
-    const fileData = fs.readFileSync(filePath);
-
-    let header = `--${boundary}\r\n`;
-    header += `Content-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`;
-    header += `--${boundary}\r\n`;
-    header += `Content-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`;
-    header += `--${boundary}\r\n`;
-    header += `Content-Disposition: form-data; name="document"; filename="${filename}"\r\n`;
-    header += `Content-Type: application/json\r\n\r\n`;
-
-    const footer = `\r\n--${boundary}--\r\n`;
-
-    const req = https.request(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`, {
-      method: 'POST',
-      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }
-    });
-
-    req.on('error', (e) => console.error('[ОШИБКА ОТПРАВКИ ДОКУМЕНТА]', e.message));
-    req.write(header);
-    req.write(fileData);
-    req.write(footer);
-    req.end();
-  } catch (e) {
-    console.error('[ОШИБКА ЭКСПОРТА]', e.message);
+class NaiveBayes {
+  constructor() {
+    this.classDocs = {};
+    this.classWords = {};
+    this.vocab = new Set();
+    this.totalDocs = 0;
   }
-}
 
-function downloadFile(fileId, callback) {
-  https.get(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`, (res) => {
-    let data = '';
-    res.on('data', chunk => data += chunk);
-    res.on('end', () => {
-      try {
-        const json = JSON.parse(data);
-        if (json.ok && json.result.file_path) {
-          https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${json.result.file_path}`, (fileRes) => {
-            const chunks = [];
-            fileRes.on('data', chunk => chunks.push(chunk));
-            fileRes.on('end', () => callback(Buffer.concat(chunks).toString('utf8')));
-          });
-        } else {
-          console.error('[ОШИБКА ТГ]', json.description);
-        }
-      } catch (e) {
-        console.error('[ОШИБКА СКАЧИВАНИЯ]', e.message);
-      }
-    });
-  }).on('error', (e) => console.error('[ОШИБКА ЗАПРОСА]', e.message));
-}
-
-function similarity(userTokens, entryTokens) {
-  const wInter = userTokens.words.filter(w => entryTokens.words.includes(w));
-  const wUni = new Set([...userTokens.words, ...entryTokens.words]);
-  const wScore = wUni.size > 0 ? wInter.length / wUni.size : 0;
-
-  const nInter = userTokens.ngrams.filter(n => entryTokens.ngrams.includes(n));
-  const nUni = new Set([...userTokens.ngrams, ...entryTokens.ngrams]);
-  const nScore = nUni.size > 0 ? nInter.length / nUni.size : 0;
-
-  return (wScore * 0.4) + (nScore * 0.6);
-}
-
-function findBestAnswer(userTokens, memory) {
-  if (userTokens.words.length === 0 || memory.length === 0) return null;
-  let bestMatch = null;
-  let maxScore = 0.35;
-
-  for (const entry of memory) {
-    const s = similarity(userTokens, entry.tokens);
-    if (s > maxScore) {
-      maxScore = s;
-      bestMatch = entry;
+  train(intent, text) {
+    const words = tokenize(text);
+    if (words.length === 0) return;
+    if (!this.classDocs[intent]) this.classDocs[intent] = 0;
+    if (!this.classWords[intent]) this.classWords[intent] = {};
+    this.classDocs[intent]++;
+    this.totalDocs++;
+    for (const w of words) {
+      this.vocab.add(w);
+      this.classWords[intent][w] = (this.classWords[intent][w] || 0) + 1;
     }
   }
 
-  if (bestMatch && bestMatch.answers.length > 0) {
-    bestMatch.hits = (bestMatch.hits || 0) + 1;
-    return bestMatch.answers[Math.floor(Math.random() * bestMatch.answers.length)];
+  predict(text) {
+    const words = tokenize(text);
+    if (words.length === 0 || this.totalDocs === 0) return null;
+    const V = this.vocab.size || 1;
+    const scores = {};
+    for (const intent in this.classDocs) {
+      const prior = Math.log(this.classDocs[intent] / this.totalDocs);
+      const wordCounts = this.classWords[intent];
+      const totalWords = sum(Object.values(wordCounts)) || 1;
+      let score = prior;
+      for (const w of words) {
+        const c = wordCounts[w] || 0;
+        score += Math.log((c + 1) / (totalWords + V));
+      }
+      scores[intent] = score;
+    }
+    const best = Object.keys(scores).reduce((a, b) => scores[a] > scores[b] ? a : b);
+    const maxS = scores[best];
+    let z = 0;
+    const probs = {};
+    for (const k in scores) { probs[k] = Math.exp(scores[k] - maxS); z += probs[k]; }
+    for (const k in probs) probs[k] /= z;
+    return { intent: best, confidence: probs[best], probs };
+  }
+
+  toJSON() {
+    return {
+      classDocs: this.classDocs,
+      classWords: this.classWords,
+      vocab: [...this.vocab],
+      totalDocs: this.totalDocs
+    };
+  }
+
+  static fromJSON(j) {
+    const nb = new NaiveBayes();
+    if (!j) return nb;
+    nb.classDocs = j.classDocs || {};
+    nb.classWords = j.classWords || {};
+    nb.vocab = new Set(j.vocab || []);
+    nb.totalDocs = j.totalDocs || 0;
+    return nb;
+  }
+}
+
+class TfIdf {
+  constructor() {
+    this.docs = [];
+    this.df = {};
+    this.N = 0;
+  }
+
+  add(id, text, tokens) {
+    const tf = {};
+    for (const w of tokens) tf[w] = (tf[w] || 0) + 1;
+    this.docs.push({ id, text, tokens, tf });
+    for (const w of Object.keys(tf)) this.df[w] = (this.df[w] || 0) + 1;
+    this.N++;
+  }
+
+  idf(w) {
+    return Math.log((this.N + 1) / ((this.df[w] || 0) + 1)) + 1;
+  }
+
+  vec(tf) {
+    const v = {};
+    let norm = 0;
+    for (const w in tf) {
+      const x = tf[w] * this.idf(w);
+      v[w] = x;
+      norm += x * x;
+    }
+    norm = Math.sqrt(norm) || 1;
+    for (const w in v) v[w] /= norm;
+    return v;
+  }
+
+  query(tokens) {
+    const tf = {};
+    for (const w of tokens) tf[w] = (tf[w] || 0) + 1;
+    return this.vec(tf);
+  }
+
+  cosine(a, b) {
+    let s = 0;
+    for (const w in a) if (b[w]) s += a[w] * b[w];
+    return s;
+  }
+
+  search(tokens, topK = 5) {
+    const q = this.query(tokens);
+    const scored = this.docs.map(d => ({ id: d.id, score: this.cosine(q, this.vec(d.tf)) }));
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, topK);
+  }
+}
+
+function matchTemplate(pattern, text) {
+  const parts = pattern.split(/\{(\w+)\}/);
+  let regexStr = '^';
+  const slots = [];
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 1) {
+      slots.push(parts[i]);
+      regexStr += '(.+?)';
+    } else {
+      regexStr += parts[i].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  regexStr += '$';
+  const re = new RegExp(regexStr, 'i');
+  const m = clean(text).match(re);
+  if (!m) return null;
+  const result = {};
+  slots.forEach((name, i) => { result[name] = m[i + 1].trim(); });
+  return result;
+}
+
+function fillTemplate(tpl, slots) {
+  return tpl.replace(/\{(\w+)\}/g, (_, name) => slots[name] !== undefined ? slots[name] : '');
+}
+
+class AssocGraph {
+  constructor() {
+    this.edges = {};
+    this.nodeCount = {};
+  }
+
+  addPair(a, b, w = 1) {
+    if (!a || !b || a === b) return;
+    if (!this.edges[a]) this.edges[a] = {};
+    if (!this.edges[b]) this.edges[b] = {};
+    this.edges[a][b] = (this.edges[a][b] || 0) + w;
+    this.edges[b][a] = (this.edges[b][a] || 0) + w;
+    this.nodeCount[a] = (this.nodeCount[a] || 0) + 1;
+    this.nodeCount[b] = (this.nodeCount[b] || 0) + 1;
+  }
+
+  spread(seeds, steps = 2, decay = 0.6) {
+    const act = {};
+    for (const s of seeds) act[s] = (act[s] || 0) + 1;
+    let frontier = [...seeds];
+    for (let step = 0; step < steps; step++) {
+      const next = {};
+      for (const node of frontier) {
+        const a = act[node] || 0;
+        const nbrs = this.edges[node];
+        if (!nbrs) continue;
+        const total = sum(Object.values(nbrs)) || 1;
+        for (const nb in nbrs) {
+          const contrib = a * (nbrs[nb] / total) * decay;
+          next[nb] = (next[nb] || 0) + contrib;
+        }
+      }
+      for (const k in next) act[k] = (act[k] || 0) + next[k];
+      frontier = Object.keys(next);
+      if (frontier.length === 0) break;
+    }
+    return act;
+  }
+}
+
+class NGramLM {
+  constructor(order = 2) {
+    this.order = order;
+    this.bigrams = {};
+    this.trigrams = {};
+  }
+
+  train(tokens) {
+    for (let i = 0; i < tokens.length - 1; i++) {
+      const a = tokens[i], b = tokens[i + 1];
+      if (!this.bigrams[a]) this.bigrams[a] = {};
+      this.bigrams[a][b] = (this.bigrams[a][b] || 0) + 1;
+    }
+    for (let i = 0; i < tokens.length - 2; i++) {
+      const key = tokens[i] + ' ' + tokens[i + 1];
+      const c = tokens[i + 2];
+      if (!this.trigrams[key]) this.trigrams[key] = {};
+      this.trigrams[key][c] = (this.trigrams[key][c] || 0) + 1;
+    }
+  }
+
+  next(word1, word2) {
+    if (word1 && word2) {
+      const key = word1 + ' ' + word2;
+      const dist = this.trigrams[key];
+      if (dist) {
+        const best = Object.keys(dist).reduce((a, b) => dist[a] > dist[b] ? a : b);
+        return best;
+      }
+    }
+    if (word2) {
+      const dist = this.bigrams[word2];
+      if (dist) {
+        const best = Object.keys(dist).reduce((a, b) => dist[a] > dist[b] ? a : b);
+        return best;
+      }
+    }
+    return null;
+  }
+
+  continueText(tokens, maxWords = 5) {
+    const out = [...tokens];
+    for (let i = 0; i < maxWords; i++) {
+      const n = out.length;
+      const w1 = n >= 2 ? out[n - 2] : null;
+      const w2 = n >= 1 ? out[n - 1] : null;
+      const nxt = this.next(w1, w2);
+      if (!nxt) break;
+      out.push(nxt);
+    }
+    return out;
+  }
+}
+
+class Embeddings {
+  constructor(dim = 30, window = 3) {
+    this.dim = dim;
+    this.window = window;
+    this.vocab = [];
+    this.w2i = {};
+    this.vectors = {};
+  }
+
+  build(corpusTokens) {
+    const freq = {};
+    for (const tokens of corpusTokens) {
+      for (const w of tokens) freq[w] = (freq[w] || 0) + 1;
+    }
+    this.vocab = Object.keys(freq).filter(w => freq[w] >= 2);
+    this.vocab.forEach((w, i) => { this.w2i[w] = i; });
+    const V = this.vocab.length;
+    if (V < 2) return;
+
+    const cooc = {};
+    const rowSum = new Array(V).fill(0);
+    const colSum = new Array(V).fill(0);
+    let total = 0;
+    for (const tokens of corpusTokens) {
+      for (let i = 0; i < tokens.length; i++) {
+        const wi = this.w2i[tokens[i]];
+        if (wi === undefined) continue;
+        for (let j = Math.max(0, i - this.window); j <= Math.min(tokens.length - 1, i + this.window); j++) {
+          if (i === j) continue;
+          const wj = this.w2i[tokens[j]];
+          if (wj === undefined) continue;
+          const key = wi + ',' + wj;
+          cooc[key] = (cooc[key] || 0) + 1;
+          rowSum[wi]++;
+          colSum[wj]++;
+          total++;
+        }
+      }
+    }
+
+    const ppmi = {};
+    for (const key in cooc) {
+      const [i, j] = key.split(',').map(Number);
+      const pmi = log2((cooc[key] * total) / (rowSum[i] * colSum[j]));
+      const v = Math.max(0, pmi);
+      if (v > 0) ppmi[key] = v;
+    }
+
+    const vecs = [];
+    for (let i = 0; i < V; i++) {
+      const v = new Array(this.dim);
+      for (let d = 0; d < this.dim; d++) v[d] = Math.random() * 0.01;
+      vecs.push(v);
+    }
+
+    for (let d = 0; d < this.dim; d++) {
+      for (let prev = 0; prev < d; prev++) {
+        let dot = 0;
+        for (let i = 0; i < V; i++) dot += vecs[i][d] * vecs[i][prev];
+        for (let i = 0; i < V; i++) vecs[i][d] -= dot * vecs[i][prev];
+      }
+      let norm = 0;
+      for (let i = 0; i < V; i++) norm += vecs[i][d] * vecs[i][d];
+      norm = Math.sqrt(norm) || 1;
+      for (let i = 0; i < V; i++) vecs[i][d] /= norm;
+    }
+
+    for (let iter = 0; iter < 30; iter++) {
+      for (let d = 0; d < this.dim; d++) {
+        const y = new Array(V).fill(0);
+        for (const key in ppmi) {
+          const [i, j] = key.split(',').map(Number);
+          y[i] += ppmi[key] * vecs[j][d];
+        }
+        const x = new Array(V).fill(0);
+        for (const key in ppmi) {
+          const [i, j] = key.split(',').map(Number);
+          x[j] += ppmi[key] * y[i];
+        }
+        for (let prev = 0; prev < d; prev++) {
+          let dot = 0;
+          for (let i = 0; i < V; i++) dot += x[i] * vecs[i][prev];
+          for (let i = 0; i < V; i++) x[i] -= dot * vecs[i][prev];
+        }
+        let norm = 0;
+        for (let i = 0; i < V; i++) norm += x[i] * x[i];
+        norm = Math.sqrt(norm) || 1;
+        for (let i = 0; i < V; i++) vecs[i][d] = x[i] / norm;
+      }
+    }
+
+    for (let i = 0; i < V; i++) this.vectors[this.vocab[i]] = vecs[i];
+  }
+
+  vec(word) { return this.vectors[word] || null; }
+
+  cos(a, b) {
+    let s = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) { s += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    return s / (Math.sqrt(na) * Math.sqrt(nb) || 1);
+  }
+
+  similar(word, topK = 5) {
+    const v = this.vec(word);
+    if (!v) return [];
+    const scores = [];
+    for (const w in this.vectors) {
+      if (w === word) continue;
+      scores.push([w, this.cos(v, this.vectors[w])]);
+    }
+    scores.sort((a, b) => b[1] - a[1]);
+    return scores.slice(0, topK);
+  }
+
+  sentenceVec(tokens) {
+    const vs = tokens.map(t => this.vec(t)).filter(Boolean);
+    if (vs.length === 0) return null;
+    const dim = vs[0].length;
+    const out = new Array(dim).fill(0);
+    for (const v of vs) for (let i = 0; i < dim; i++) out[i] += v[i];
+    for (let i = 0; i < dim; i++) out[i] /= vs.length;
+    return out;
+  }
+}
+
+const nb = NaiveBayes.fromJSON(loadJSON(path.join(MODEL_DIR, 'nb.json'), null));
+const emb = new Embeddings(30, 3);
+{
+  const saved = loadJSON(path.join(MODEL_DIR, 'emb.json'), null);
+  if (saved) {
+    emb.vocab = saved.vocab || [];
+    emb.w2i = saved.w2i || {};
+    emb.vectors = saved.vectors || {};
+    emb.dim = saved.dim || 30;
+    emb.window = saved.window || 3;
+  }
+}
+const lm = new NGramLM(3);
+{
+  const saved = loadJSON(path.join(MODEL_DIR, 'lm.json'), null);
+  if (saved) { lm.bigrams = saved.bigrams || {}; lm.trigrams = saved.trigrams || {}; }
+}
+const graph = new AssocGraph();
+{
+  const saved = loadJSON(path.join(MODEL_DIR, 'graph.json'), null);
+  if (saved) { graph.edges = saved.edges || {}; graph.nodeCount = saved.nodeCount || {}; }
+}
+
+function saveModels() {
+  saveJSON(path.join(MODEL_DIR, 'nb.json'), nb.toJSON());
+  saveJSON(path.join(MODEL_DIR, 'emb.json'), {
+    vocab: emb.vocab, w2i: emb.w2i, vectors: emb.vectors, dim: emb.dim, window: emb.window
+  });
+  saveJSON(path.join(MODEL_DIR, 'lm.json'), { bigrams: lm.bigrams, trigrams: lm.trigrams });
+  saveJSON(path.join(MODEL_DIR, 'graph.json'), { edges: graph.edges, nodeCount: graph.nodeCount });
+}
+
+const factsFile = path.join(DATA_DIR, 'facts.json');
+const templatesFile = path.join(DATA_DIR, 'templates.json');
+let facts = loadJSON(factsFile, {});
+let templates = loadJSON(templatesFile, []);
+
+function saveFacts() { saveJSON(factsFile, facts); }
+function saveTemplates() { saveJSON(templatesFile, templates); }
+
+const userMemoryDir = path.join(DATA_DIR, 'users');
+if (!fs.existsSync(userMemoryDir)) fs.mkdirSync(userMemoryDir, { recursive: true });
+
+function userFile(userId) { return path.join(userMemoryDir, `${userId}.json`); }
+const userMemoryCache = new Map();
+
+function getUserMemory(userId) {
+  if (userMemoryCache.has(userId)) return userMemoryCache.get(userId);
+  const data = loadJSON(userFile(userId), { pairs: [], history: [] });
+  if (!Array.isArray(data.pairs)) data.pairs = [];
+  if (!Array.isArray(data.history)) data.history = [];
+  userMemoryCache.set(userId, data);
+  return data;
+}
+function saveUserMemory(userId) {
+  const data = userMemoryCache.get(userId);
+  if (data) saveJSON(userFile(userId), data);
+}
+
+const pending = new Map();
+const lastBotMsg = new Map();
+
+function trainIntent(intent, examples) {
+  for (const ex of examples) nb.train(intent, ex);
+}
+
+function bootstrapIntents() {
+  if (nb.totalDocs > 0) return;
+  trainIntent('greeting', ['привет', 'здравствуй', 'здорово', 'хай', 'добрый день', 'добрый вечер', 'доброе утро', 'приветствую']);
+  trainIntent('farewell', ['пока', 'до свидания', 'до связи', 'прощай', 'увидимся']);
+  trainIntent('thanks', ['спасибо', 'благодарю', 'спс', 'пасибо']);
+  trainIntent('howareyou', ['как дела', 'как ты', 'как жизнь', 'как настроение', 'что нового']);
+  trainIntent('whoareyou', ['кто ты', 'как тебя зовут', 'ты кто', 'что ты такое', 'твое имя']);
+  trainIntent('help', ['помоги', 'помощь', 'что делать', 'подскажи']);
+  trainIntent('math', ['сколько будет', 'посчитай', 'вычисли', 'чему равно', 'реши пример']);
+  saveModels();
+}
+bootstrapIntents();
+
+const intentReplies = {
+  greeting: ['Привет.', 'Здравствуй.', 'Приветствую.'],
+  farewell: ['До связи.', 'Пока.', 'Увидимся.'],
+  thanks: ['Пожалуйста.', 'Не за что.', 'Обращайся.'],
+  howareyou: ['Работаю в штатном режиме.', 'Всё стабильно.', 'Нормально, а у тебя?'],
+  whoareyou: ['Я самообучающийся текстовый бот.', 'Я ассоциативный ИИ, учусь на наших сообщениях.'],
+  help: ['Опиши задачу подробнее.', 'Что именно нужно?', 'Сформулируй вопрос точнее.']
+};
+
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+const wordToNum = {
+  'ноль': 0, 'один': 1, 'одна': 1, 'два': 2, 'две': 2, 'три': 3, 'четыре': 4,
+  'пять': 5, 'шесть': 6, 'семь': 7, 'восемь': 8, 'девять': 9, 'десять': 10,
+  'одиннадцать': 11, 'двенадцать': 12, 'тринадцать': 13, 'четырнадцать': 14,
+  'пятнадцать': 15, 'шестнадцать': 16, 'семнадцать': 17, 'восемнадцать': 18,
+  'девятнадцать': 19, 'двадцать': 20, 'тридцать': 30, 'сорок': 40, 'пятьдесят': 50,
+  'шестьдесят': 60, 'семьдесят': 70, 'восемьдесят': 80, 'девяносто': 90,
+  'сто': 100, 'двести': 200, 'триста': 300, 'четыреста': 400, 'пятьсот': 500,
+  'тысяча': 1000
+};
+
+function wordsToNumbers(text) {
+  const tokens = clean(text).split(' ');
+  const out = [];
+  for (const t of tokens) {
+    if (wordToNum[t] !== undefined) out.push(String(wordToNum[t]));
+    else out.push(t);
+  }
+  return out.join(' ');
+}
+
+function tryMath(text) {
+  const t = wordsToNumbers(text)
+    .replace(/плюс/g, '+').replace(/минус/g, '-')
+    .replace(/умножить на/g, '*').replace(/умножить/g, '*')
+    .replace(/разделить на/g, '/').replace(/делить на/g, '/')
+    .replace(/[^\d+\-*/().\s]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+  const m = t.match(/(\d+(?:\.\d+)?(?:\s*[+\-*/]\s*\d+(?:\.\d+)?)+)/);
+  if (!m) return null;
+  try {
+    const expr = m[1].replace(/\s+/g, '');
+    if (!/^[\d+\-*/().]+$/.test(expr)) return null;
+    const val = Function('"use strict";return (' + expr + ')')();
+    if (typeof val !== 'number' || !isFinite(val)) return null;
+    const r = Math.round(val * 1e10) / 1e10;
+    return `Ответ: ${r}`;
+  } catch (e) { return null; }
+}
+
+function tryRandomNumber(text) {
+  const t = clean(text);
+  const digitWordMatch = t.match(/(\d+)\s*[- ]?\s*значн/);
+  let digits = digitWordMatch ? parseInt(digitWordMatch[1], 10) : null;
+  if (!digits) {
+    const map = { 'однозначн': 1, 'двузначн': 2, 'двухзначн': 2, 'трехзначн': 3, 'трёхзначн': 3,
+      'четырехзначн': 4, 'четырёхзначн': 4, 'пятизначн': 5, 'шестизначн': 6, 'семизначн': 7,
+      'восьмизначн': 8, 'девятизначн': 9, 'десятизначн': 10 };
+    for (const k in map) if (t.includes(k)) { digits = map[k]; break; }
+  }
+  const rangeMatch = t.match(/от\s+(\d+)\s+до\s+(\d+)/);
+  if (rangeMatch) {
+    const lo = parseInt(rangeMatch[1], 10), hi = parseInt(rangeMatch[2], 10);
+    if (hi >= lo) return String(lo + Math.floor(Math.random() * (hi - lo + 1)));
+  }
+  const wantsNum = /(числ|цифр|рандом|случайн)/.test(t);
+  if (!digits || !wantsNum || digits < 1 || digits > 15) return null;
+  let s = '';
+  for (let i = 0; i < digits; i++) s += i === 0 ? String(1 + Math.floor(Math.random() * 9)) : String(Math.floor(Math.random() * 10));
+  return s;
+}
+
+function detectIntent(text) {
+  const p = nb.predict(text);
+  return p && p.confidence > 0.55 ? p : null;
+}
+
+function findFact(text) {
+  const t = clean(text);
+  for (const tpl of templates) {
+    const slots = matchTemplate(tpl.pattern, t);
+    if (slots) {
+      return fillTemplate(tpl.reply, slots);
+    }
+  }
+  const m = t.match(/^(?:что такое|кто такой|кто такая|расскажи про|расскажи о)\s+(.+)$/);
+  if (m) {
+    const key = clean(m[1]);
+    if (facts[key]) return facts[key];
+    if (facts[key.replace(/^(а|the)\s+/, '')]) return facts[key.replace(/^(а|the)\s+/, '')];
+    return null;
+  }
+  const m2 = t.match(/^(.+?)\s+(?:это|—)\s+(.+)$/);
+  if (m2) {
+    const key = clean(m2[1]);
+    if (facts[key]) return facts[key];
   }
   return null;
 }
 
-function learn(userId, question, answer, memory) {
-  const q = String(question || '').trim();
-  const a = String(answer || '').trim();
-  if (!q || !a) return false;
+function findInMemory(userId, text) {
+  const mem = getUserMemory(userId);
+  if (mem.pairs.length === 0) return null;
 
-  const qTokens = tokenize(q);
-  if (qTokens.words.length === 0) return false;
+  const tfidf = new TfIdf();
+  mem.pairs.forEach((p, i) => tfidf.add(i, p.q, tokenize(p.q)));
+  const tokens = tokenize(text);
+  const results = tfidf.search(tokens, 3);
 
-  let existing = null;
-  let bestScore = 0.85;
-  for (const entry of memory) {
-    const s = similarity(qTokens, entry.tokens);
-    if (s > bestScore) {
-      bestScore = s;
-      existing = entry;
+  const act = graph.spread(tokens, 2, 0.5);
+  const expandedTokens = uniq([...tokens, ...Object.keys(act).filter(w => act[w] > 0.1)]);
+
+  const qv = emb.sentenceVec(expandedTokens);
+
+  let best = null, bestScore = 0.35;
+  for (const r of results) {
+    const p = mem.pairs[r.id];
+    let score = r.score;
+    if (qv) {
+      const pv = emb.sentenceVec(tokenize(p.q));
+      if (pv) score = score * 0.6 + emb.cos(qv, pv) * 0.4;
+    }
+    if (score > bestScore) { bestScore = score; best = p; }
+  }
+
+  if (best && best.a && best.a.length > 0) {
+    best.hits = (best.hits || 0) + 1;
+    saveUserMemory(userId);
+    return pick(best.a);
+  }
+  return null;
+}
+
+function teachPair(userId, question, answer) {
+  const mem = getUserMemory(userId);
+  const qTokens = tokenize(question);
+  if (qTokens.length === 0 || !answer.trim()) return false;
+
+  const qv = emb.sentenceVec(qTokens);
+  let existing = null, bestSim = 0.85;
+  for (const p of mem.pairs) {
+    const pv = emb.sentenceVec(tokenize(p.q));
+    if (!pv || !qv) {
+      const inter = qTokens.filter(w => tokenize(p.q).includes(w)).length;
+      const uni = uniq([...qTokens, ...tokenize(p.q)]).length || 1;
+      if (inter / uni > bestSim) { bestSim = inter / uni; existing = p; }
+    } else {
+      const sim = emb.cos(qv, pv);
+      if (sim > bestSim) { bestSim = sim; existing = p; }
     }
   }
 
   if (existing) {
-    if (!existing.answers.includes(a)) existing.answers.push(a);
+    if (!existing.a.includes(answer.trim())) existing.a.push(answer.trim());
   } else {
-    memory.push({
-      tokens: qTokens,
-      text: q,
-      answers: [a],
-      created: Date.now(),
-      hits: 0
-    });
+    mem.pairs.push({ q: question.trim(), a: [answer.trim()], created: Date.now(), hits: 0 });
   }
 
-  saveUserMemory(userId, memory);
+  for (let i = 0; i < qTokens.length; i++) {
+    for (let j = i + 1; j < qTokens.length; j++) graph.addPair(qTokens[i], qTokens[j], 1);
+  }
+  for (const t of tokenize(answer)) {
+    for (const q of qTokens) graph.addPair(q, t, 0.5);
+  }
+
+  saveUserMemory(userId);
+  saveModels();
   return true;
 }
 
-function getMemoryStats(memory) {
-  let answersCount = 0;
-  let totalLength = 0;
-  let oldest = null;
-  let newest = null;
-  let withCreated = 0;
-  let totalHits = 0;
-
-  for (const e of memory) {
-    answersCount += e.answers.length;
-    totalLength += e.text.length;
-    totalHits += e.hits || 0;
-    if (e.created) {
-      withCreated++;
-      if (oldest === null || e.created < oldest) oldest = e.created;
-      if (newest === null || e.created > newest) newest = e.created;
-    }
-  }
-
-  return {
-    phrases: memory.length,
-    answers: answersCount,
-    avgAnswers: memory.length ? (answersCount / memory.length).toFixed(2) : '0',
-    avgLength: memory.length ? Math.round(totalLength / memory.length) : 0,
-    oldest, newest, withCreated, totalHits
-  };
-}
-
-function formatDate(ts) {
-  if (!ts) return '—';
-  const d = new Date(ts);
-  const pad = n => String(n).padStart(2, '0');
-  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function showHelp(chatId) {
-  const text =
-    '<b>Ассоциативный текстовый ИИ</b>\n\n' +
-    'Логика работы:\n' +
-    '1. Ты пишешь фразу.\n' +
-    '2. Если я её знаю — отвечаю из памяти.\n' +
-    '3. Если не знаю — повторяю её эхом и ЖДУ твой ответ.\n' +
-    '4. Твой следующий ответ я запоминаю как ответ на эту фразу.\n\n' +
-    '<b>Команды</b>\n' +
-    '/help — справка и сброс зависшего контекста\n' +
-    '/teach вопрос = ответ — обучить сразу, без эха\n' +
-    '/list [стр] — список фраз\n' +
-    '/show &lt;номер&gt; — подробно о фразе\n' +
-    '/del &lt;номер&gt; — удалить фразу\n' +
-    '/forget &lt;текст&gt; — удалить по точному тексту\n' +
-    '/find &lt;текст&gt; — поиск по подстроке\n' +
-    '/export — скачать базу\n' +
-    '/import — как импортировать (отправь JSON)\n' +
-    '/stats — статистика\n' +
-    '/reset — стереть всё (с подтверждением)\n' +
-    '/cancel — отменить действие / сбросить контекст';
-
-  sendMessage(chatId, text, { parse_mode: 'HTML' });
-}
-
-function showList(chatId, memory, page) {
-  if (memory.length === 0) { sendMessage(chatId, 'База пуста.'); return; }
-  const PAGE_SIZE = 10;
-  const totalPages = Math.ceil(memory.length / PAGE_SIZE);
-  const p = Math.max(1, Math.min(page, totalPages));
-  const start = (p - 1) * PAGE_SIZE;
-  const slice = memory.slice(start, start + PAGE_SIZE);
-
-  let text = `<b>База знаний</b> (стр. ${p}/${totalPages}, всего: ${memory.length})\n\n`;
-  slice.forEach((e, i) => {
-    const num = start + i + 1;
-    const preview = escapeHtml(e.text.length > 60 ? e.text.substring(0, 60) + '…' : e.text);
-    text += `<b>${num}.</b> ${preview}\n     ответов: ${e.answers.length}\n`;
-  });
-  if (totalPages > 1) text += `\nСледующая: /list ${p + 1}`;
-  sendMessage(chatId, text, { parse_mode: 'HTML' });
-}
-
-function showEntry(chatId, memory, num) {
-  const idx = num - 1;
-  if (idx < 0 || idx >= memory.length) {
-    sendMessage(chatId, `Фразы #${num} нет. Всего: ${memory.length}`);
-    return;
-  }
-  const e = memory[idx];
-  let text = `<b>Фраза #${num}</b>\n\n`;
-  text += `<b>Вопрос:</b>\n${escapeHtml(e.text)}\n\n`;
-  text += `<b>Ответы (${e.answers.length}):</b>\n`;
-  e.answers.forEach((a, i) => {
-    text += `${i + 1}. ${escapeHtml(a.length > 200 ? a.substring(0, 200) + '…' : a)}\n`;
-  });
-  if (e.created) text += `\nСоздано: ${formatDate(e.created)}`;
-  if (e.hits) text += `\nИспользований: ${e.hits}`;
-  sendMessage(chatId, text, { parse_mode: 'HTML' });
-}
-
-function findEntries(chatId, memory, query) {
-  const q = cleanText(query);
-  if (!q) { sendMessage(chatId, 'Использование: /find &lt;текст&gt;', { parse_mode: 'HTML' }); return; }
-  const results = [];
-  memory.forEach((e, i) => {
-    if (cleanText(e.text).includes(q) || e.answers.some(a => cleanText(a).includes(q))) {
-      results.push({ num: i + 1, entry: e });
-    }
-  });
-  if (results.length === 0) {
-    sendMessage(chatId, `Ничего не найдено: "${escapeHtml(query)}"`, { parse_mode: 'HTML' });
-    return;
-  }
-  let text = `<b>Найдено: ${results.length}</b>\n\n`;
-  results.slice(0, 15).forEach(r => {
-    const preview = escapeHtml(r.entry.text.length > 70 ? r.entry.text.substring(0, 70) + '…' : r.entry.text);
-    text += `<b>#${r.num}</b> ${preview}\n`;
-  });
-  if (results.length > 15) text += `\n…и ещё ${results.length - 15}`;
-  sendMessage(chatId, text, { parse_mode: 'HTML' });
-}
-
-function showStats(chatId, userId, memory) {
-  const s = getMemoryStats(memory);
-  const file = getUserMemoryFile(userId);
-  let fileSize = 0;
-  if (fs.existsSync(file)) { try { fileSize = fs.statSync(file).size; } catch (e) {} }
-
-  let text = '<b>Статистика</b>\n\n';
-  text += `Уникальных фраз: <b>${s.phrases}</b>\n`;
-  text += `Всего ответов: <b>${s.answers}</b>\n`;
-  text += `Средне ответов на фразу: <b>${s.avgAnswers}</b>\n`;
-  text += `Средняя длина вопроса: <b>${s.avgLength}</b> симв.\n`;
-  text += `Всего использований памяти: <b>${s.totalHits}</b>\n`;
-  text += `Размер файла: <b>${(fileSize / 1024).toFixed(1)}</b> КБ\n`;
-  if (s.oldest) text += `\nПервая запись: ${formatDate(s.oldest)}\n`;
-  if (s.newest) text += `Последняя запись: ${formatDate(s.newest)}\n`;
-  sendMessage(chatId, text, { parse_mode: 'HTML' });
-}
-
-function parseTeach(text) {
-  const m = text.match(/^\/teach\s+(.+?)\s*=\s*(.+)$/s);
-  if (m) return { q: m[1].trim(), a: m[2].trim() };
-  const m2 = text.match(/^запомни[:\s]+(.+?)\s*=\s*(.+)$/i);
-  if (m2) return { q: m2[1].trim(), a: m2[2].trim() };
-  return null;
-}
-
-const pendingReset = new Map();
-const pendingDel = new Map();
-const teachBuffer = new Map();
-
-function handleMessage(chatId, userId, text, document) {
-  let memory = loadUserMemory(userId);
-
-  if (pendingReset.get(userId)) {
-    const a = (text || '').trim().toLowerCase();
-    if (a === 'да' || a === 'yes' || a === 'y') {
-      const file = getUserMemoryFile(userId);
-      if (fs.existsSync(file)) { try { fs.unlinkSync(file); } catch (e) {} }
-      userMemories.delete(userId);
-      lastMessages.delete(userId);
-      pendingReset.delete(userId);
-      sendMessage(chatId, 'Память полностью очищена.');
+function tg(method, payload, isForm = false) {
+  return new Promise((resolve, reject) => {
+    let body, headers;
+    if (isForm) {
+      body = payload;
+      headers = { 'Content-Type': payload.contentType };
     } else {
-      pendingReset.delete(userId);
-      sendMessage(chatId, 'Отменено.');
+      body = JSON.stringify(payload);
+      headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
     }
-    return;
-  }
+    const req = https.request(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, { method: 'POST', headers });
+    req.on('error', reject);
+    req.on('response', res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { resolve(d); } });
+    });
+    req.write(body);
+    req.end();
+  });
+}
 
-  if (pendingDel.get(userId)) {
-    if (text === '/cancel') {
-      pendingDel.delete(userId);
-      sendMessage(chatId, 'Отменено.');
-      return;
-    }
-    const num = pendingDel.get(userId);
-    pendingDel.delete(userId);
-    const idx = num - 1;
-    if (idx < 0 || idx >= memory.length) {
-      sendMessage(chatId, `Фразы #${num} больше нет.`);
-      return;
-    }
-    memory.splice(idx, 1);
-    saveUserMemory(userId, memory);
-    sendMessage(chatId, `Фраза #${num} удалена.`);
-    return;
-  }
+function send(chatId, text, extra) {
+  const payload = { chat_id: chatId, text: String(text).slice(0, 4000) };
+  if (extra) Object.assign(payload, extra);
+  return tg('sendMessage', payload);
+}
 
-  if (teachBuffer.get(userId)) {
-    const q = teachBuffer.get(userId);
-    teachBuffer.delete(userId);
-    if (text === '/cancel') { sendMessage(chatId, 'Отменено.'); return; }
-    if (learn(userId, q, text, memory)) {
-      sendMessage(chatId, `Запомнил: "${q}" → "${text}"`);
-    } else {
-      sendMessage(chatId, 'Не удалось сохранить.');
-    }
-    return;
-  }
+async function sendDocument(chatId, filePath, caption) {
+  const boundary = '----Boundary' + Math.random().toString(36).slice(2);
+  const filename = path.basename(filePath);
+  const fileData = fs.readFileSync(filePath);
+  const parts = [];
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`));
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`));
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename}"\r\nContent-Type: application/json\r\n\r\n`));
+  parts.push(fileData);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  const body = Buffer.concat(parts);
+  return tg('sendDocument', { body, contentType: `multipart/form-data; boundary=${boundary}` }, true);
+}
 
-  if (document && document.file_name && document.file_name.endsWith('.json')) {
-    downloadFile(document.file_id, (content) => {
+async function downloadFile(fileId) {
+  const r = await tg('getFile', { file_id: fileId });
+  if (!r || !r.ok) return null;
+  return new Promise((resolve) => {
+    https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${r.result.file_path}`, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    }).on('error', () => resolve(null));
+  });
+}
+
+async function handleMessage(chatId, userId, text, document) {
+  if (document && document.file_name) {
+    if (document.file_name.endsWith('.json')) {
+      const content = await downloadFile(document.file_id);
+      if (!content) return send(chatId, 'Не удалось скачать файл.');
       try {
         const data = JSON.parse(content);
-        if (Array.isArray(data)) {
-          const valid = data.filter(e => e && e.tokens && Array.isArray(e.tokens.words) && Array.isArray(e.tokens.ngrams) && Array.isArray(e.answers));
-          saveUserMemory(userId, valid);
-          lastMessages.delete(userId);
-          sendMessage(chatId, `Импортировано ${valid.length} фраз.`);
-        } else {
-          sendMessage(chatId, 'Некорректный формат файла.');
+        if (Array.isArray(data.pairs)) {
+          const mem = getUserMemory(userId);
+          mem.pairs = mem.pairs.concat(data.pairs);
+          saveUserMemory(userId);
+          return send(chatId, `Импортировано пар: ${data.pairs.length}`);
         }
-      } catch (e) {
-        sendMessage(chatId, 'Ошибка чтения файла.');
+        if (Array.isArray(data)) {
+          const mem = getUserMemory(userId);
+          mem.pairs = mem.pairs.concat(data);
+          saveUserMemory(userId);
+          return send(chatId, `Импортировано пар: ${data.length}`);
+        }
+        return send(chatId, 'Неизвестный формат.');
+      } catch (e) { return send(chatId, 'Ошибка чтения JSON.'); }
+    }
+    if (document.file_name.endsWith('.txt')) {
+      const content = await downloadFile(document.file_id);
+      if (!content) return send(chatId, 'Не удалось скачать файл.');
+      const tokens = tokenize(content);
+      lm.train(tokens);
+      for (let i = 0; i < tokens.length; i++) {
+        for (let j = i + 1; j < Math.min(tokens.length, i + 5); j++) {
+          graph.addPair(tokens[i], tokens[j], 1);
+        }
       }
-    });
-    return;
+      const sentences = content.split(/[.!?]+/).map(s => tokenize(s)).filter(s => s.length >= 3);
+      emb.build(sentences);
+      saveModels();
+      return send(chatId, `Текст обработан: ${tokens.length} слов, предложений ${sentences.length}. Модель обновлена.`);
+    }
+    return send(chatId, 'Поддерживаются .json и .txt.');
   }
 
-  if (text && text.startsWith('/')) {
-    const parts = text.trim().split(/\s+/);
+  if (!text) return;
+  const trimmed = text.trim();
+  const mem = getUserMemory(userId);
+
+  if (trimmed.startsWith('/')) {
+    const parts = trimmed.split(/\s+/);
     const cmd = parts[0].toLowerCase();
     const arg = parts.slice(1).join(' ');
 
     if (cmd === '/start' || cmd === '/help') {
-      lastMessages.delete(userId);
-      pendingReset.delete(userId);
-      pendingDel.delete(userId);
-      teachBuffer.delete(userId);
-      showHelp(chatId);
-      return;
+      return send(chatId,
+        '<b>Самообучающийся бот</b>\n\n' +
+        '<b>Обучение</b>\n' +
+        '/teach вопрос = ответ\n' +
+        '/fact ключ = значение\n' +
+        '/template что такое {X} = Не знаю, что такое {X}\n' +
+        '/text — пришли .txt, обучится на нём\n' +
+        '/import — пришли .json для импорта\n\n' +
+        '<b>Управление</b>\n' +
+        '/list — список пар\n' +
+        '/del &lt;номер&gt;\n' +
+        '/find &lt;текст&gt;\n' +
+        '/export — выгрузить память\n' +
+        '/stats — статистика моделей\n' +
+        '/similar &lt;слово&gt; — похожие слова\n' +
+        '/continue &lt;начало&gt; — предсказать продолжение\n' +
+        '/reset — стереть память\n' +
+        '/cancel — сброс',
+        { parse_mode: 'HTML' });
     }
 
     if (cmd === '/cancel') {
-      lastMessages.delete(userId);
-      pendingReset.delete(userId);
-      pendingDel.delete(userId);
-      teachBuffer.delete(userId);
-      sendMessage(chatId, 'Контекст сброшен.');
-      return;
+      pending.delete(userId);
+      return send(chatId, 'Сброшено.');
     }
 
     if (cmd === '/reset') {
-      pendingReset.set(userId, true);
-      sendMessage(chatId, '<b>Уверен?</b> Вся база будет удалена.\n\nНапиши <b>да</b> для подтверждения.', { parse_mode: 'HTML' });
-      return;
-    }
-
-    if (cmd === '/export') {
-      if (memory.length === 0) { sendMessage(chatId, 'База пуста.'); return; }
-      sendDocument(chatId, getUserMemoryFile(userId), `Экспорт базы (${memory.length} фраз)`);
-      return;
-    }
-
-    if (cmd === '/import') {
-      sendMessage(chatId, 'Отправь JSON-файл, полученный через /export.');
-      return;
-    }
-
-    if (cmd === '/stats') { showStats(chatId, userId, memory); return; }
-
-    if (cmd === '/list') {
-      showList(chatId, memory, parseInt(arg, 10) || 1);
-      return;
-    }
-
-    if (cmd === '/show') {
-      const num = parseInt(arg, 10);
-      if (!num) { sendMessage(chatId, 'Использование: /show &lt;номер&gt;', { parse_mode: 'HTML' }); return; }
-      showEntry(chatId, memory, num);
-      return;
-    }
-
-    if (cmd === '/find') { findEntries(chatId, memory, arg); return; }
-
-    if (cmd === '/del') {
-      const num = parseInt(arg, 10);
-      if (!num || num < 1 || num > memory.length) {
-        sendMessage(chatId, `Укажи номер 1–${memory.length}.`);
-        return;
-      }
-      pendingDel.set(userId, num);
-      const preview = escapeHtml(memory[num - 1].text.substring(0, 80));
-      sendMessage(chatId, `Удалить #${num}?\n\n"${preview}"\n\n/cancel — отмена, любое другое — подтвердить.`, { parse_mode: 'HTML' });
-      return;
+      pending.set(userId, { type: 'reset' });
+      return send(chatId, 'Уверен? Напиши «да».');
     }
 
     if (cmd === '/teach') {
-      const parsed = parseTeach(text);
-      if (parsed) {
-        if (learn(userId, parsed.q, parsed.a, memory)) {
-          sendMessage(chatId, `Запомнил: "${parsed.q}" → "${parsed.a}"`);
-        } else {
-          sendMessage(chatId, 'Не удалось сохранить.');
-        }
-        return;
+      const m = trimmed.match(/^\/teach\s+(.+?)\s*=\s*(.+)$/s);
+      if (m) {
+        if (teachPair(userId, m[1].trim(), m[2].trim())) return send(chatId, 'Запомнил.');
+        return send(chatId, 'Не удалось.');
       }
-      if (!arg) {
-        sendMessage(chatId, 'Использование: /teach вопрос = ответ\nИли: /teach вопрос (и следующим сообщением — ответ)');
-        return;
+      if (!arg) return send(chatId, 'Использование: /teach вопрос = ответ');
+      pending.set(userId, { type: 'teach', q: arg });
+      return send(chatId, `Какой ответ на "${arg}"?`);
+    }
+
+    if (cmd === '/fact') {
+      const m = trimmed.match(/^\/fact\s+(.+?)\s*=\s*(.+)$/s);
+      if (!m) return send(chatId, 'Использование: /fact ключ = значение');
+      facts[clean(m[1])] = m[2].trim();
+      saveFacts();
+      return send(chatId, 'Факт сохранён.');
+    }
+
+    if (cmd === '/template') {
+      const m = trimmed.match(/^\/template\s+(.+?)\s*=\s*(.+)$/s);
+      if (!m) return send(chatId, 'Использование: /template шаблон с {X} = ответ с {X}');
+      templates.push({ pattern: clean(m[1]), reply: m[2].trim() });
+      saveTemplates();
+      return send(chatId, 'Шаблон добавлен.');
+    }
+
+    if (cmd === '/text') return send(chatId, 'Пришли .txt файл.');
+    if (cmd === '/import') return send(chatId, 'Пришли .json файл.');
+
+    if (cmd === '/list') {
+      if (mem.pairs.length === 0) return send(chatId, 'Пусто.');
+      const PAGE = 10;
+      const totalPages = Math.ceil(mem.pairs.length / PAGE);
+      const p = clamp(parseInt(arg, 10) || 1, 1, totalPages);
+      const slice = mem.pairs.slice((p - 1) * PAGE, p * PAGE);
+      let out = `<b>Пары</b> (${p}/${totalPages}, всего ${mem.pairs.length})\n\n`;
+      slice.forEach((pr, i) => {
+        const num = (p - 1) * PAGE + i + 1;
+        const preview = escapeHtml(pr.q.length > 60 ? pr.q.slice(0, 60) + '…' : pr.q);
+        out += `<b>${num}.</b> ${preview}\n`;
+      });
+      if (totalPages > 1) out += `\n/list ${p + 1}`;
+      return send(chatId, out, { parse_mode: 'HTML' });
+    }
+
+    if (cmd === '/del') {
+      const num = parseInt(arg, 10);
+      if (!num || num < 1 || num > mem.pairs.length) return send(chatId, 'Неверный номер.');
+      mem.pairs.splice(num - 1, 1);
+      saveUserMemory(userId);
+      return send(chatId, `Удалено #${num}.`);
+    }
+
+    if (cmd === '/find') {
+      if (!arg) return send(chatId, 'Использование: /find текст');
+      const tokens = tokenize(arg);
+      const tfidf = new TfIdf();
+      mem.pairs.forEach((p, i) => tfidf.add(i, p.q, tokenize(p.q)));
+      const res = tfidf.search(tokens, 10).filter(r => r.score > 0.05);
+      if (res.length === 0) return send(chatId, 'Ничего не найдено.');
+      let out = '<b>Найдено:</b>\n\n';
+      for (const r of res) {
+        const pr = mem.pairs[r.id];
+        out += `<b>#${r.id + 1}</b> [${r.score.toFixed(2)}] ${escapeHtml(pr.q.slice(0, 80))}\n`;
       }
-      teachBuffer.set(userId, arg.trim());
-      sendMessage(chatId, `Какой ответ на "${arg.trim()}"? Напиши следующим сообщением. /cancel — отмена.`);
+      return send(chatId, out, { parse_mode: 'HTML' });
+    }
+
+    if (cmd === '/export') {
+      const file = userFile(userId);
+      if (!fs.existsSync(file)) return send(chatId, 'Пусто.');
+      await sendDocument(chatId, file, 'Экспорт памяти');
       return;
     }
 
-    if (cmd === '/forget') {
-      const target = arg.trim();
-      if (!target) { sendMessage(chatId, 'Использование: /forget &lt;текст&gt;', { parse_mode: 'HTML' }); return; }
-      const cleanedTarget = cleanText(target);
-      const before = memory.length;
-      memory = memory.filter(e => cleanText(e.text) !== cleanedTarget);
-      if (memory.length < before) {
-        saveUserMemory(userId, memory);
-        lastMessages.delete(userId);
-        sendMessage(chatId, `Удалено фраз: ${before - memory.length}.`);
-      } else {
-        sendMessage(chatId, `Не найдено: "${escapeHtml(target)}". Попробуй /find`, { parse_mode: 'HTML' });
+    if (cmd === '/stats') {
+      const s = {
+        pairs: mem.pairs.length,
+        intents: Object.keys(nb.classDocs).length,
+        intentDocs: nb.totalDocs,
+        vocab: nb.vocab.size,
+        embVocab: Object.keys(emb.vectors).length,
+        embDim: emb.dim,
+        graphNodes: Object.keys(graph.edges).length,
+        graphEdges: Object.values(graph.edges).reduce((s, o) => s + Object.keys(o).length, 0) / 2,
+        bigrams: Object.keys(lm.bigrams).length,
+        trigrams: Object.keys(lm.trigrams).length,
+        facts: Object.keys(facts).length,
+        templates: templates.length
+      };
+      let out = '<b>Модели</b>\n\n';
+      out += `Пар в памяти: ${s.pairs}\n`;
+      out += `Намерений: ${s.intents} (примеров: ${s.intentDocs})\n`;
+      out += `Словарь Байеса: ${s.vocab}\n`;
+      out += `Эмбеддинги: ${s.embVocab} слов × ${s.embDim} мер\n`;
+      out += `Граф: ${s.graphNodes} узлов, ${s.graphEdges} связей\n`;
+      out += `N-грамм: ${s.bigrams} биграмм, ${s.trigrams} триграмм\n`;
+      out += `Фактов: ${s.facts}\n`;
+      out += `Шаблонов: ${s.templates}\n`;
+      return send(chatId, out, { parse_mode: 'HTML' });
+    }
+
+    if (cmd === '/similar') {
+      if (!arg) return send(chatId, 'Использование: /similar слово');
+      const res = emb.similar(clean(arg).split(/\s+/)[0], 10);
+      if (res.length === 0) return send(chatId, 'Нет данных. Сначала обучи на тексте (/text).');
+      let out = `<b>Похожие на «${escapeHtml(arg)}»:</b>\n\n`;
+      res.forEach(([w, s]) => { out += `${escapeHtml(w)} — ${s.toFixed(3)}\n`; });
+      return send(chatId, out, { parse_mode: 'HTML' });
+    }
+
+    if (cmd === '/continue') {
+      if (!arg) return send(chatId, 'Использование: /continue начало фразы');
+      const tokens = tokenize(arg);
+      const result = lm.continueText(tokens, 8);
+      const added = result.slice(tokens.length);
+      if (added.length === 0) return send(chatId, 'Не знаю продолжения. Обучи на тексте.');
+      return send(chatId, result.join(' '));
+    }
+
+    return send(chatId, 'Неизвестная команда. /help');
+  }
+
+  const p = pending.get(userId);
+  if (p) {
+    if (p.type === 'reset') {
+      if (trimmed.toLowerCase() === 'да' || trimmed.toLowerCase() === 'yes') {
+        mem.pairs = [];
+        mem.history = [];
+        saveUserMemory(userId);
+        pending.delete(userId);
+        return send(chatId, 'Память очищена.');
       }
-      return;
+      pending.delete(userId);
+      return send(chatId, 'Отменено.');
     }
-
-    sendMessage(chatId, 'Неизвестная команда. Смотри /help');
-    return;
-  }
-
-  if (!text) return;
-
-  const trimmed = text.trim();
-
-  const parsedTeach = parseTeach(trimmed);
-  if (parsedTeach) {
-    if (learn(userId, parsedTeach.q, parsedTeach.a, memory)) {
-      sendMessage(chatId, `Запомнил: "${parsedTeach.q}" → "${parsedTeach.a}"`);
-    } else {
-      sendMessage(chatId, 'Не удалось сохранить.');
+    if (p.type === 'teach') {
+      pending.delete(userId);
+      if (teachPair(userId, p.q, trimmed)) return send(chatId, 'Запомнил.');
+      return send(chatId, 'Не удалось.');
     }
-    return;
   }
 
-  // ---- АССОЦИАТИВНАЯ ЛОГИКА ----
-
-  // 1. Если ждём ответ на эхо — учим и СРАЗУ сбрасываем контекст
-  const prevBotMessage = lastMessages.get(userId);
-  if (prevBotMessage) {
-    lastMessages.delete(userId);
-    if (learn(userId, prevBotMessage, trimmed, memory)) {
-      sendMessage(chatId, 'Понял, записал.');
-    } else {
-      sendMessage(chatId, 'Не удалось записать.');
-    }
-    return;
+  const lastBot = lastBotMsg.get(userId);
+  if (lastBot && lastBot.type === 'echo') {
+    lastBotMsg.delete(userId);
+    if (teachPair(userId, lastBot.q, trimmed)) return send(chatId, 'Понял, записал.');
   }
 
-  // 2. Ищем ответ в памяти
-  const tokens = tokenize(trimmed);
-  const aiResponse = findBestAnswer(tokens, memory);
+  const math = tryMath(trimmed);
+  if (math) { lastBotMsg.set(userId, { type: 'answer' }); return send(chatId, math); }
 
-  if (aiResponse) {
-    // Знакомая фраза — отвечаем, контекст НЕ ставим (учиться не надо)
-    sendMessage(chatId, aiResponse);
-    return;
+  const rnd = tryRandomNumber(trimmed);
+  if (rnd !== null) { lastBotMsg.set(userId, { type: 'answer' }); return send(chatId, rnd); }
+
+  const intentRes = detectIntent(trimmed);
+  if (intentRes && intentReplies[intentRes.intent]) {
+    const reply = pick(intentReplies[intentRes.intent]);
+    lastBotMsg.set(userId, { type: 'answer' });
+    return send(chatId, reply);
   }
 
-  // 3. Незнакомая — эхо + ставим контекст ожидания ответа
-  sendMessage(chatId, trimmed);
-  lastMessages.set(userId, trimmed);
+  const fact = findFact(trimmed);
+  if (fact) { lastBotMsg.set(userId, { type: 'answer' }); return send(chatId, fact); }
+
+  const memAns = findInMemory(userId, trimmed);
+  if (memAns) {
+    lastBotMsg.set(userId, { type: 'answer' });
+    return send(chatId, memAns);
+  }
+
+  lastBotMsg.set(userId, { type: 'echo', q: trimmed });
+  return send(chatId, trimmed);
 }
 
 let offset = 0;
 let polling = false;
+
 function getUpdates() {
   if (polling) return;
   polling = true;
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset}&timeout=25`;
-  https.get(url, (res) => {
+  https.get(url, res => {
     let data = '';
-    res.on('data', chunk => data += chunk);
+    res.on('data', c => data += c);
     res.on('end', () => {
       polling = false;
       try {
         const json = JSON.parse(data);
-        if (json.ok) {
-          if (json.result.length > 0) {
-            for (const update of json.result) {
-              offset = update.update_id + 1;
-              if (update.message) {
-                handleMessage(
-                  update.message.chat.id,
-                  update.message.from.id,
-                  update.message.text,
-                  update.message.document
-                );
-              }
+        if (json.ok && json.result) {
+          for (const u of json.result) {
+            offset = u.update_id + 1;
+            if (u.message) {
+              handleMessage(u.message.chat.id, u.message.from.id, u.message.text, u.message.document)
+                .catch(e => console.error('handle error', e.message));
             }
           }
-        } else {
-          console.error('[TELEGRAM API]', json.description);
         }
-      } catch (e) {
-        console.error('[ОБРАБОТКА ПАКЕТА]', e.message);
-      }
+      } catch (e) {}
       setTimeout(getUpdates, 300);
     });
-  }).on('error', (e) => {
+  }).on('error', () => {
     polling = false;
     setTimeout(getUpdates, 3000);
   });
