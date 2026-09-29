@@ -9,11 +9,15 @@ const DATA_DIR = process.env.DATA_DIR || './data';
 const WINDOW = 5;
 const MIN_WORD_FREQ = 1;
 const MIN_COOC = 1;
-const SIM_THRESHOLD = 0.55;
-const MIN_SIM = 0.30;
-const W_COS = 0.5;
-const W_JAC = 0.3;
-const W_EXACT = 0.2;
+const SIM_THRESHOLD = 0.45;
+const MIN_SIM = 0.25;
+const W_COS = 0.25;
+const W_JAC = 0.35;
+const W_BM = 0.30;
+const W_EXACT = 0.10;
+const BM25_K1 = 1.5;
+const BM25_B = 0.75;
+const BM25_MID = 1.5;
 const LIST_PAGE = 20;
 const MAX_BRAINS = 200;
 const DEBUG = true;
@@ -62,6 +66,7 @@ function makeBrain(scope) {
     vocab: new Map(),
     idf: new Map(),
     wordVec: new Map(),
+    avgPairLen: 5,
     ready: false,
     dirty: true,
     file: path.join(DATA_DIR, safeName(scope) + '.json'),
@@ -279,9 +284,39 @@ function jaccard(aWords, bWords) {
   return union ? inter / union : 0;
 }
 
+function bm25(brain, queryWords, pairWords) {
+  if (!queryWords.length || !pairWords.length) return 0;
+  const N = brain.pairs.length || 1;
+  const avgdl = brain.avgPairLen || 5;
+  const dl = pairWords.length;
+
+  const counts = new Map();
+  for (const w of pairWords) counts.set(w, (counts.get(w) || 0) + 1);
+
+  let score = 0;
+  const seen = new Set();
+  for (const w of queryWords) {
+    if (seen.has(w)) continue;
+    seen.add(w);
+    const tf = counts.get(w) || 0;
+    if (!tf) continue;
+    const df = brain.df.get(w) || 0;
+    const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1);
+    score += idf * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl));
+  }
+  return score;
+}
+
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
+}
+
 function rebuildEmbeddings(brain) {
   buildVocab(brain);
   buildCooc(brain);
+  let total = 0;
+  for (const p of brain.pairs) total += tokenize(p.question).length;
+  brain.avgPairLen = brain.pairs.length ? total / brain.pairs.length : 5;
   brain.ready = true;
   brain.dirty = false;
 }
@@ -295,6 +330,18 @@ function reindexVectors(brain) {
   log('reindexVectors', brain.scope, 'with vector:', good, '/', brain.pairs.length);
 }
 
+function computeScore(brain, qVec, inputWords, inputKey, p) {
+  const pWords = tokenize(p.question);
+  if (!pWords.length) return null;
+  const exact = lc(p.question) === inputKey ? 1 : 0;
+  const cos = (qVec && p.vector) ? Math.max(0, cosine(qVec, p.vector)) : 0;
+  const jac = jaccard(inputWords, pWords);
+  const bm = bm25(brain, inputWords, pWords);
+  const bmn = sigmoid(bm - BM25_MID);
+  const score = W_COS * cos + W_JAC * jac + W_BM * bmn + W_EXACT * exact;
+  return { score, cos, jac, bm, bmn, exact };
+}
+
 function answerFor(brain, input) {
   if (!brain.pairs.length) { log('answerFor: no pairs'); return null; }
   const key = lc(input);
@@ -304,18 +351,10 @@ function answerFor(brain, input) {
 
   const qVec = embedText(brain, input);
   const scored = [];
-
   for (let i = 0; i < brain.pairs.length; i++) {
-    const p = brain.pairs[i];
-    const pWords = tokenize(p.question);
-    if (!pWords.length) continue;
-
-    const exact = lc(p.question) === key ? 1 : 0;
-    const cos = (qVec && p.vector) ? Math.max(0, cosine(qVec, p.vector)) : 0;
-    const jac = jaccard(inputWords, pWords);
-    const score = W_COS * cos + W_JAC * jac + W_EXACT * exact;
-
-    scored.push({ idx: i, score, cos, jac, exact });
+    const s = computeScore(brain, qVec, inputWords, key, brain.pairs[i]);
+    if (!s) continue;
+    scored.push({ idx: i, ...s });
   }
 
   scored.sort((a, b) => b.score - a.score);
@@ -323,14 +362,14 @@ function answerFor(brain, input) {
   log('answerFor:', input, '=>', JSON.stringify(top.map(t => ({
     q: brain.pairs[t.idx].question,
     s: Number(t.score.toFixed(4)),
-    cos: Number(t.cos.toFixed(4)),
-    jac: Number(t.jac.toFixed(4)),
+    cos: Number(t.cos.toFixed(3)),
+    jac: Number(t.jac.toFixed(3)),
+    bm: Number(t.bm.toFixed(3)),
     exact: t.exact,
   }))));
 
   if (!top.length) return null;
   const best = top[0];
-
   if (best.score >= SIM_THRESHOLD) return { answer: brain.pairs[best.idx].answer, kind: 'exact', score: best.score };
   if (best.score >= MIN_SIM) return { answer: brain.pairs[best.idx].answer, kind: 'close', score: best.score };
   return null;
@@ -489,6 +528,7 @@ async function handle(chat, text, isGroup, replyTo) {
         `Векторов слов: ${brain.wordVec.size}`,
         `Синонимов: ${brain.syn.size} (связей ${links})`,
         `Якорей: ${brain.anchors.size}`,
+        `Средняя длина: ${brain.avgPairLen.toFixed(2)}`,
       ].join('\n'));
     }
 
@@ -504,13 +544,9 @@ async function handle(chat, text, isGroup, replyTo) {
       const qVec = embedText(brain, word);
       const scored = [];
       for (let i = 0; i < brain.pairs.length; i++) {
-        const p = brain.pairs[i];
-        const pWords = tokenize(p.question);
-        if (!pWords.length) continue;
-        const exact = lc(p.question) === lcW ? 1 : 0;
-        const cos = (qVec && p.vector) ? Math.max(0, cosine(qVec, p.vector)) : 0;
-        const jac = jaccard(inputWords, pWords);
-        scored.push({ idx: i, score: W_COS * cos + W_JAC * jac + W_EXACT * exact, cos, jac, exact });
+        const s = computeScore(brain, qVec, inputWords, lcW, brain.pairs[i]);
+        if (!s) continue;
+        scored.push({ idx: i, ...s });
       }
       scored.sort((a, b) => b.score - a.score);
       const top = scored.slice(0, 5);
@@ -524,7 +560,7 @@ async function handle(chat, text, isGroup, replyTo) {
         `Вектор запроса: ${qVec ? 'да' : 'нет'}`,
       ];
       for (const s of top) {
-        lines.push(`  • ${brain.pairs[s.idx].question} → ${s.score.toFixed(4)} (cos=${s.cos.toFixed(3)}, jac=${s.jac.toFixed(3)}, exact=${s.exact})`);
+        lines.push(`  • ${brain.pairs[s.idx].question} → ${s.score.toFixed(4)} (cos=${s.cos.toFixed(3)}, jac=${s.jac.toFixed(3)}, bm=${s.bm.toFixed(3)}, exact=${s.exact})`);
       }
       return send(chat, lines.join('\n'));
     }
