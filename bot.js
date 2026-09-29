@@ -8,9 +8,9 @@ if (!BOT_TOKEN) { console.error('BOT_TOKEN is not set'); process.exit(1); }
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || './data';
-const DATA_FILE = path.join(DATA_DIR, 'brain.json');
 const VEC_FILE = path.join(DATA_DIR, 'vectors.bin');
 const VEC_META = path.join(DATA_DIR, 'vectors.json');
+const SENTS_FILE = path.join(DATA_DIR, 'sentences.json');
 const OFFSET_FILE = path.join(DATA_DIR, 'offset.json');
 const CORPUS_FILE = path.join(DATA_DIR, 'corpus.txt');
 
@@ -18,12 +18,10 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(PORT);
 
-let brain = { vocabulary: {}, relations: {}, lastInput: {}, synonyms: {}, context: [] };
 let vectors = { dim: 50, words: {}, trained: false, tokens: 0 };
+let sentences = [];
+let sentVecs = [];
 
-if (fs.existsSync(DATA_FILE)) {
-    try { brain = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (e) {}
-}
 if (fs.existsSync(VEC_META) && fs.existsSync(VEC_FILE)) {
     try {
         const meta = JSON.parse(fs.readFileSync(VEC_META, 'utf8'));
@@ -42,21 +40,12 @@ if (fs.existsSync(VEC_META) && fs.existsSync(VEC_FILE)) {
     } catch (e) { console.error('vec read error:', e.message); }
 }
 
-let saveTimer = null, saving = false;
-
-function saveBrainNow() {
-    if (saving) return;
-    saving = true;
+if (fs.existsSync(SENTS_FILE)) {
     try {
-        const tmp = DATA_FILE + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify(brain), 'utf8');
-        fs.renameSync(tmp, DATA_FILE);
-    } catch (e) {} finally { saving = false; }
-}
-
-function saveBrain() {
-    if (saveTimer) return;
-    saveTimer = setTimeout(() => { saveTimer = null; saveBrainNow(); }, 2000);
+        const data = JSON.parse(fs.readFileSync(SENTS_FILE, 'utf8'));
+        sentences = data.sentences || [];
+        sentVecs = (data.sentVecs || []).map(a => Float32Array.from(a));
+    } catch (e) { console.error('sent read error:', e.message); }
 }
 
 function saveVectorsNow() {
@@ -75,8 +64,15 @@ function saveVectorsNow() {
     } catch (e) { console.error('saveVectors error:', e.message); }
 }
 
-process.on('SIGINT', () => { saveBrainNow(); saveVectorsNow(); process.exit(0); });
-process.on('SIGTERM', () => { saveBrainNow(); saveVectorsNow(); process.exit(0); });
+function saveSentencesNow() {
+    try {
+        const data = { sentences, sentVecs: sentVecs.map(v => Array.from(v)) };
+        fs.writeFileSync(SENTS_FILE, JSON.stringify(data), 'utf8');
+    } catch (e) { console.error('saveSentences error:', e.message); }
+}
+
+process.on('SIGINT', () => { saveVectorsNow(); saveSentencesNow(); process.exit(0); });
+process.on('SIGTERM', () => { saveVectorsNow(); saveSentencesNow(); process.exit(0); });
 
 function loadOffset() {
     try {
@@ -93,30 +89,10 @@ function clean(text) {
     return String(text).toLowerCase().replace(/ё/g, 'е').replace(/[^а-яa-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-const ENDINGS = ['иями','ями','ами','ией','иям','ием','иях','ию','ия','ий','ый','ой','ая','ое','ые','ими','ыми','ов','ев','ам','ям','ах','ях','ом','ем','ой','ей','ую','юю','ишь','ешь','ете','ите','ует','уют','ал','ял','ил','ел','ла','ло','ли','ть','ся','сь','а','я','о','е','у','ю','ы','и','й','ь'];
-
-function stem(w) {
-    if (w.length <= 3) return w;
-    for (const e of ENDINGS) {
-        if (w.length - e.length >= 3 && w.endsWith(e)) return w.slice(0, w.length - e.length);
-    }
-    return w;
-}
-
 function rawTokens(text) {
     const c = clean(text);
     if (!c) return [];
-    return c.split(' ').filter(Boolean).map(stem);
-}
-
-function tokens(text) {
-    const r = rawTokens(text);
-    const out = [];
-    for (const w of r) {
-        const s = brain.synonyms[w];
-        out.push(s && s.length ? stem(s[0]) : w);
-    }
-    return out;
+    return c.split(' ').filter(Boolean);
 }
 
 function randVec(dim) {
@@ -164,11 +140,11 @@ function trainWord2Vec(opts) {
     const minCount = opts.minCount || 2;
 
     const raw = buildCorpus();
-    if (!raw) return { ok: false, error: 'corpus empty' };
+    if (!raw) return { ok: false, error: 'корпус пуст' };
 
-    const sentences = raw.split(/[\n.!?]+/).map(s => rawTokens(s)).filter(s => s.length > 1);
+    const rawSents = raw.split(/[\n.!?]+/).map(s => rawTokens(s)).filter(s => s.length > 1);
     const freq = {};
-    for (const s of sentences) for (const w of s) freq[w] = (freq[w] || 0) + 1;
+    for (const s of rawSents) for (const w of s) freq[w] = (freq[w] || 0) + 1;
 
     const vocab = Object.keys(freq).filter(w => freq[w] >= minCount);
     const vocabSet = new Set(vocab);
@@ -192,11 +168,11 @@ function trainWord2Vec(opts) {
     for (const w of vocab) vectors.words[w] = randVec(dim);
 
     let tokensCount = 0;
-    for (const s of sentences) for (const w of s) if (vocabSet.has(w)) tokensCount++;
+    for (const s of rawSents) for (const w of s) if (vocabSet.has(w)) tokensCount++;
 
     for (let epoch = 0; epoch < epochs; epoch++) {
         const lr = lr0 * (1 - epoch / epochs);
-        for (const s of sentences) {
+        for (const s of rawSents) {
             const filtered = [];
             for (const w of s) {
                 if (vocabSet.has(w) && Math.random() < keepProb[w]) filtered.push(w);
@@ -239,11 +215,49 @@ function trainWord2Vec(opts) {
     vectors.trained = true;
     vectors.tokens = tokensCount;
     saveVectorsNow();
+
+    sentences = rawSents.map(s => s.join(' '));
+    sentVecs = [];
+    for (const s of rawSents) sentVecs.push(sentVecFromTokens(s));
+    saveSentencesNow();
+
     return { ok: true, vocab: vocab.length, tokens: tokensCount, sentences: sentences.length };
 }
 
+function sentVecFromTokens(tokenList) {
+    const dim = vectors.dim;
+    const v = new Float32Array(dim);
+    let count = 0;
+    for (const w of tokenList) {
+        const wv = vectors.words[w];
+        if (!wv) continue;
+        for (let i = 0; i < dim; i++) v[i] += wv[i];
+        count++;
+    }
+    if (!count) return null;
+    for (let i = 0; i < dim; i++) v[i] /= count;
+    return v;
+}
+
+function sentVec(text) {
+    return sentVecFromTokens(rawTokens(text));
+}
+
+function search(query, top) {
+    const qv = sentVec(query);
+    if (!qv) return [];
+    const out = [];
+    for (let i = 0; i < sentences.length; i++) {
+        const sv = sentVecs[i];
+        if (!sv) continue;
+        out.push({ i, text: sentences[i], score: cosine(qv, sv) });
+    }
+    out.sort((a, b) => b.score - a.score);
+    return out.slice(0, top || 5);
+}
+
 function nearest(word, top) {
-    const w = stem(clean(word));
+    const w = clean(word);
     if (!vectors.words[w]) return [];
     const base = vectors.words[w];
     const out = [];
@@ -253,96 +267,6 @@ function nearest(word, top) {
     }
     out.sort((a, b) => b.score - a.score);
     return out.slice(0, top || 10);
-}
-
-function sentVec(text) {
-    const t = rawTokens(text).filter(w => vectors.words[w]);
-    if (!t.length) return null;
-    const dim = vectors.dim;
-    const v = new Float32Array(dim);
-    for (const w of t) {
-        const wv = vectors.words[w];
-        for (let i = 0; i < dim; i++) v[i] += wv[i];
-    }
-    for (let i = 0; i < dim; i++) v[i] /= t.length;
-    return v;
-}
-
-function semSearch(query, top) {
-    const qv = sentVec(query);
-    if (!qv) return [];
-    const out = [];
-    for (const key in brain.relations) {
-        const ov = sentVec(key);
-        if (!ov) continue;
-        out.push({ key, score: cosine(qv, ov) });
-    }
-    out.sort((a, b) => b.score - a.score);
-    return out.slice(0, top || 5);
-}
-
-function pickWeighted(o) {
-    const keys = Object.keys(o);
-    if (!keys.length) return null;
-    let total = 0;
-    for (const k of keys) total += o[k];
-    let r = Math.random() * total;
-    for (const k of keys) {
-        r -= o[k];
-        if (r <= 0) return k;
-    }
-    return keys[keys.length - 1];
-}
-
-function trainAI(input, output) {
-    const t = tokens(input);
-    const a = String(output).trim();
-    if (!t.length || !a) return false;
-    const key = t.join(' ');
-    if (!brain.relations[key]) brain.relations[key] = {};
-    brain.relations[key][a] = (brain.relations[key][a] || 0) + 1;
-    for (const w of t) brain.vocabulary[w] = (brain.vocabulary[w] || 0) + 1;
-    saveBrain();
-    return true;
-}
-
-function wordWeight(w) {
-    const total = Object.values(brain.vocabulary).reduce((a, b) => a + b, 0) || 1;
-    return Math.log((total + 1) / ((brain.vocabulary[w] || 0) + 1)) + 1;
-}
-
-function lexScore(inputT, knownKey) {
-    const known = knownKey.split(' ');
-    let s = 0;
-    for (const t of inputT) if (known.includes(t)) s += wordWeight(t);
-    return s;
-}
-
-function thinkAI(text, userId) {
-    const t = tokens(text);
-    if (!t.length) return null;
-    const key = t.join(' ');
-    if (brain.relations[key]) {
-        const b = pickWeighted(brain.relations[key]);
-        if (b) return b;
-    }
-    if (vectors.trained) {
-        for (const s of semSearch(text, 3)) {
-            if (s.score < 0.5) continue;
-            const b = pickWeighted(brain.relations[s.key]);
-            if (b) return b;
-        }
-    }
-    let bestKey = null, bestScore = 0;
-    for (const k in brain.relations) {
-        const s = lexScore(t, k);
-        if (s > bestScore) { bestScore = s; bestKey = k; }
-    }
-    if (bestKey && bestScore > 0) {
-        const b = pickWeighted(brain.relations[bestKey]);
-        if (b) return b;
-    }
-    return null;
 }
 
 function apiRequest(method, data) {
@@ -368,104 +292,13 @@ function apiRequest(method, data) {
 }
 
 function send(chatId, text) {
-    return apiRequest('sendMessage', { chat_id: chatId, text: text.slice(0, 4000) });
-}
-
-const PAGE = 10;
-
-function listPage(page) {
-    const items = Object.keys(brain.relations).sort();
-    const total = Math.max(1, Math.ceil(items.length / PAGE));
-    if (page < 0) page = 0;
-    if (page >= total) page = total - 1;
-    const slice = items.slice(page * PAGE, page * PAGE + PAGE);
-    let out = 'Пар: ' + items.length + ' | стр. ' + (page + 1) + '/' + total + '\n\n';
-    slice.forEach((k, i) => {
-        out += (page * PAGE + i + 1) + '. ' + k + '\n';
-        for (const a of Object.keys(brain.relations[k])) out += '   -> ' + a + ' (' + brain.relations[k][a] + ')\n';
-        const syns = brain.synonyms[k];
-        if (syns && syns.length) out += '   ~ ' + syns.join(', ') + '\n';
-        out += '\n';
-    });
-    return out;
-}
-
-function synPage(page) {
-    const seen = new Set();
-    const groups = [];
-    for (const w in brain.synonyms) {
-        if (seen.has(w)) continue;
-        const list = brain.synonyms[w];
-        if (!list || !list.length) continue;
-        const g = [w, ...list];
-        for (const x of g) seen.add(x);
-        groups.push(g);
-    }
-    groups.sort((a, b) => a[0].localeCompare(b[0]));
-    const total = Math.max(1, Math.ceil(groups.length / PAGE));
-    if (page < 0) page = 0;
-    if (page >= total) page = total - 1;
-    const slice = groups.slice(page * PAGE, page * PAGE + PAGE);
-    let out = 'Групп: ' + groups.length + ' | стр. ' + (page + 1) + '/' + total + '\n\n';
-    slice.forEach((g, i) => {
-        out += (page * PAGE + i + 1) + '. ' + g[0] + '\n';
-        if (g.length > 1) out += '   ~ ' + g.slice(1).join(', ') + '\n';
-        out += '\n';
-    });
-    return out;
-}
-
-function delPair(q) {
-    const key = tokens(q).join(' ');
-    if (!key || !brain.relations[key]) return false;
-    delete brain.relations[key];
-    saveBrainNow();
-    return true;
-}
-
-function delAnswer(q, a) {
-    const key = tokens(q).join(' ');
-    if (!key || !brain.relations[key]) return false;
-    const ans = String(a).trim();
-    if (!brain.relations[key][ans]) return false;
-    delete brain.relations[key][ans];
-    if (!Object.keys(brain.relations[key]).length) delete brain.relations[key];
-    saveBrainNow();
-    return true;
-}
-
-function addSyns(word, list) {
-    const w = clean(word);
-    if (!w) return false;
-    const syns = list.map(clean).filter(Boolean);
-    if (!syns.length) return false;
-    if (!brain.synonyms[w]) brain.synonyms[w] = [];
-    for (const s of syns) {
-        if (!brain.synonyms[w].includes(s)) brain.synonyms[w].push(s);
-        if (!brain.synonyms[s]) brain.synonyms[s] = [w];
-        else if (!brain.synonyms[s].includes(w)) brain.synonyms[s].push(w);
-    }
-    saveBrain();
-    return true;
-}
-
-function delSyns(word) {
-    const w = clean(word);
-    if (!w || !brain.synonyms[w]) return false;
-    const list = [...brain.synonyms[w]];
-    delete brain.synonyms[w];
-    for (const s of list) {
-        if (brain.synonyms[s]) {
-            brain.synonyms[s] = brain.synonyms[s].filter(x => x !== w);
-            if (!brain.synonyms[s].length) delete brain.synonyms[s];
-        }
-    }
-    saveBrainNow();
-    return true;
+    return apiRequest('sendMessage', { chat_id: chatId, text: String(text).slice(0, 4000) });
 }
 
 let pendingReset = false;
 let polling = false;
+let training = false;
+let writing = {};   // userId -> true, если идёт запись в корпус
 
 async function getUpdates(offset) {
     if (polling) return;
@@ -476,7 +309,7 @@ async function getUpdates(offset) {
         for (const u of res.result) {
             offset = u.update_id + 1;
             saveOffset(offset);
-            if (u.message && typeof u.message.text === 'string') {
+            if (u.message && (typeof u.message.text === 'string' || u.message.document)) {
                 try { await handle(u.message); } catch (e) { console.error('handle:', e.message); }
             }
         }
@@ -489,39 +322,41 @@ async function getUpdates(offset) {
 async function handle(msg) {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
-    const text = msg.text.trim();
-    if (!text) return;
+    const text = (msg.text || '').trim();
 
     if (text === '/start') {
         await send(chatId,
-            'Команды бота:\n\n' +
-            '/train вопрос = ответ — обучить бота. Можно повторять с тем же вопросом и разными ответами, тогда бот будет выбирать случайно.\n\n' +
-            '/syn слово = синоним1, синоним2 — добавить синонимы. Слова из одной группы бот считает одинаковыми.\n' +
-            '/syn del слово — удалить все синонимы слова.\n' +
-            '/synlist [n] — список групп синонимов. Без n — первая страница, с n — страница n.\n\n' +
-            '/list [n] — список выученных пар. Показывает все ответы и веса. Листается через /list 2, /list 3 и т.д.\n\n' +
-            '/del вопрос — удалить всю пару со всеми ответами.\n' +
-            '/del вопрос = ответ — удалить только один конкретный ответ.\n\n' +
-            '/learn — отправить .txt файл для обучения модели. Бот добавит текст в корпус.\n' +
-            '/retrain — обучить модель на собранных текстах. Занимает время, зависит от объёма.\n' +
-            '/similar слово — показать слова, близкие по смыслу (после обучения модели).\n\n' +
-            '/stats — статистика: пары, ответы, слова, синонимы, размер модели.\n' +
-            '/reset — стереть всё. Спросит подтверждение, надо написать "да".\n\n' +
-            '/export — скачать базу и модель файлом.\n' +
-            '/import — загрузить базу из файла.\n\n' +
-            'Как учить: пиши /train привет = Привет! Потом просто напиши боту "привет" — он ответит.\n' +
-            'Если хочешь несколько ответов — повтори /train с тем же вопросом и другим ответом.\n' +
-            'Если хочешь, чтобы бот понимал смысл — кинь ему .txt с текстами и сделай /retrain.'
+            'Бот на семантической модели.\n\n' +
+            'Как учить:\n' +
+            '/add — начать писать текст в корпус. Пиши сообщения подряд, они добавятся.\n' +
+            '/stop — закончить запись.\n' +
+            '/retrain — обучить модель на том, что записал.\n\n' +
+            'Или можно просто кинуть .txt файл в чат — он тоже пойдёт в корпус.\n\n' +
+            'Как спрашивать:\n' +
+            'Просто пиши боту вопрос или фразу — он найдёт самое близкое по смыслу в корпусе.\n' +
+            '/ask вопрос — показать топ-3 близких предложения.\n' +
+            '/similar слово — похожие по смыслу слова.\n\n' +
+            'Другое:\n' +
+            '/stats — что в модели.\n' +
+            '/reset — стереть всё (с подтверждением "да").\n' +
+            '/export — скачать корпус.\n' +
+            '/import — загрузить корпус из файла.'
         );
         return;
     }
 
     if (pendingReset) {
         if (text.toLowerCase() === 'да') {
-            brain = { vocabulary: {}, relations: {}, lastInput: {}, synonyms: {}, context: [] };
+            vectors = { dim: 50, words: {}, trained: false, tokens: 0 };
+            sentences = [];
+            sentVecs = [];
+            writing = {};
             pendingReset = false;
-            saveBrainNow();
-            await send(chatId, 'Память очищена.');
+            try { fs.unlinkSync(CORPUS_FILE); } catch {}
+            try { fs.unlinkSync(VEC_FILE); } catch {}
+            try { fs.unlinkSync(VEC_META); } catch {}
+            try { fs.unlinkSync(SENTS_FILE); } catch {}
+            await send(chatId, 'Стёрто.');
         } else {
             pendingReset = false;
             await send(chatId, 'Отменено.');
@@ -535,109 +370,70 @@ async function handle(msg) {
         return;
     }
 
-    if (text === '/train' || text.startsWith('/train ')) {
-        const rest = text.replace(/^\/train\s*/, '').trim();
-        if (rest.includes('=')) {
-            const i = rest.indexOf('=');
-            const q = rest.slice(0, i).trim();
-            const a = rest.slice(i + 1).trim();
-            if (q && a) {
-                trainAI(q, a);
-                await send(chatId, 'OK');
-            } else await send(chatId, '/train вопрос = ответ');
+    if (writing[userId]) {
+        if (text === '/stop') {
+            writing[userId] = false;
+            await send(chatId, 'Запись закончена. Теперь /retrain.');
             return;
         }
-        const last = brain.lastInput[userId];
-        if (!last) await send(chatId, 'Сначала спроси.');
-        else if (!rest) await send(chatId, '/train вопрос = ответ');
-        else {
-            trainAI(last, rest);
-            await send(chatId, 'OK');
-        }
-        return;
-    }
-
-    if (text.startsWith('/syn')) {
-        const rest = text.replace(/^\/syn\s*/, '').trim();
-        if (rest.startsWith('del ')) {
-            const w = rest.slice(4).trim();
-            const ok = delSyns(w);
-            await send(chatId, ok ? 'Удалено.' : 'Не найдено.');
+        if (text) {
+            appendCorpus(text);
+            await send(chatId, 'Добавлено.');
             return;
         }
-        if (!rest.includes('=')) {
-            await send(chatId, '/syn слово = синоним1, синоним2');
-            return;
-        }
-        const i = rest.indexOf('=');
-        const w = rest.slice(0, i).trim();
-        const list = rest.slice(i + 1).split(',').map(s => s.trim()).filter(Boolean);
-        addSyns(w, list);
-        await send(chatId, 'OK');
+    }
+
+    if (text === '/add') {
+        writing[userId] = true;
+        await send(chatId, 'Пиши текст. Каждое сообщение пойдёт в корпус. Когда закончишь — /stop.');
         return;
     }
 
-    if (text === '/synlist' || text.startsWith('/synlist ')) {
-        if (!Object.keys(brain.synonyms).length) { await send(chatId, 'Пусто.'); return; }
-        const p = parseInt(text.slice(8).trim(), 10);
-        await send(chatId, synPage(isNaN(p) ? 0 : p - 1));
-        return;
-    }
-
-    if (text === '/list' || text.startsWith('/list ')) {
-        if (!Object.keys(brain.relations).length) { await send(chatId, 'Пусто.'); return; }
-        const p = parseInt(text.slice(5).trim(), 10);
-        await send(chatId, listPage(isNaN(p) ? 0 : p - 1));
-        return;
-    }
-
-    if (text.startsWith('/del ')) {
-        const arg = text.slice(5).trim();
-        if (!arg) { await send(chatId, '/del вопрос  ИЛИ  /del вопрос = ответ'); return; }
-        if (arg.includes('=')) {
-            const i = arg.indexOf('=');
-            const ok = delAnswer(arg.slice(0, i).trim(), arg.slice(i + 1).trim());
-            await send(chatId, ok ? 'Удалено.' : 'Не найдено.');
-        } else {
-            const ok = delPair(arg);
-            await send(chatId, ok ? 'Удалено.' : 'Не найдено.');
-        }
+    if (text === '/stop') {
+        await send(chatId, 'Ты не в режиме записи. Начни с /add.');
         return;
     }
 
     if (text === '/stats') {
-        const pairs = Object.keys(brain.relations).length;
-        let ans = 0, ex = 0;
-        for (const q in brain.relations) {
-            const o = brain.relations[q];
-            ans += Object.keys(o).length;
-            for (const a in o) ex += o[a];
-        }
         await send(chatId,
-            'Пар: ' + pairs + '\n' +
-            'Ответов: ' + ans + '\n' +
-            'Примеров: ' + ex + '\n' +
-            'Слов: ' + Object.keys(brain.vocabulary).length + '\n' +
-            'Синонимов: ' + Object.keys(brain.synonyms).length + '\n' +
-            'Векторов: ' + Object.keys(vectors.words).length + ' (dim ' + vectors.dim + ')\n' +
-            'Обучена: ' + (vectors.trained ? 'да' : 'нет'));
-        return;
-    }
-
-    if (text === '/learn') {
-        await send(chatId, 'Кинь .txt файл.');
+            'Слов в модели: ' + Object.keys(vectors.words).length + '\n' +
+            'Размер вектора: ' + vectors.dim + '\n' +
+            'Токенов обучено: ' + (vectors.tokens || 0) + '\n' +
+            'Предложений: ' + sentences.length + '\n' +
+            'Обучена: ' + (vectors.trained ? 'да' : 'нет') + '\n' +
+            'Корпус: ' + (fs.existsSync(CORPUS_FILE) ? (fs.statSync(CORPUS_FILE).size + ' байт') : 'пусто'));
         return;
     }
 
     if (text === '/retrain') {
-        await send(chatId, 'Обучаю... Это займёт время.');
-        const r = trainWord2Vec({});
-        await send(chatId, r.ok ? ('Готово. Слов: ' + r.vocab + ', токенов: ' + r.tokens) : ('Ошибка: ' + r.error));
+        if (training) { await send(chatId, 'Уже обучается.'); return; }
+        training = true;
+        await send(chatId, 'Обучаю...');
+        try {
+            const r = trainWord2Vec({});
+            await send(chatId, r.ok ? ('Готово. Слов: ' + r.vocab + ', токенов: ' + r.tokens + ', предложений: ' + r.sentences) : ('Ошибка: ' + r.error));
+        } catch (e) {
+            await send(chatId, 'Ошибка: ' + e.message);
+        }
+        training = false;
+        return;
+    }
+
+    if (text.startsWith('/ask ')) {
+        const q = text.slice(5).trim();
+        if (!q) { await send(chatId, '/ask вопрос'); return; }
+        if (!vectors.trained) { await send(chatId, 'Сначала /retrain.'); return; }
+        const res = search(q, 3);
+        if (!res.length) { await send(chatId, 'Ничего не нашёл.'); return; }
+        let out = 'Ближайшее по смыслу:\n\n';
+        for (const r of res) out += '[' + r.score.toFixed(3) + '] ' + r.text + '\n\n';
+        await send(chatId, out);
         return;
     }
 
     if (text.startsWith('/similar ')) {
         const w = text.slice(9).trim();
+        if (!vectors.trained) { await send(chatId, 'Сначала /retrain.'); return; }
         const list = nearest(w, 15);
         if (!list.length) { await send(chatId, 'Нет в модели.'); return; }
         let out = 'Похожие на "' + w + '":\n';
@@ -648,9 +444,10 @@ async function handle(msg) {
 
     if (text === '/export') {
         try {
-            const buf = Buffer.from(JSON.stringify({ brain, vectorsMeta: { dim: vectors.dim, trained: vectors.trained, tokens: vectors.tokens } }, null, 2), 'utf8');
+            const corpus = fs.existsSync(CORPUS_FILE) ? fs.readFileSync(CORPUS_FILE, 'utf8') : '';
+            const buf = Buffer.from(JSON.stringify({ corpus }), 'utf8');
             const b = '----B' + Date.now();
-            const head = '--' + b + '\r\nContent-Disposition: form-data; name="document"; filename="brain.json"\r\nContent-Type: application/json\r\n\r\n';
+            const head = '--' + b + '\r\nContent-Disposition: form-data; name="document"; filename="corpus.json"\r\nContent-Type: application/json\r\n\r\n';
             const tail = '\r\n--' + b + '--\r\n';
             const body = Buffer.concat([Buffer.from(head, 'utf8'), buf, Buffer.from(tail, 'utf8')]);
             await new Promise((resolve) => {
@@ -671,7 +468,10 @@ async function handle(msg) {
         return;
     }
 
-    if (text === '/import') { await send(chatId, 'Кинь brain.json.'); return; }
+    if (text === '/import') {
+        await send(chatId, 'Кинь corpus.json.');
+        return;
+    }
 
     if (msg.document) {
         try {
@@ -688,24 +488,35 @@ async function handle(msg) {
             const name = (msg.document.file_name || '').toLowerCase();
             if (name.endsWith('.txt')) {
                 appendCorpus(fd.toString('utf8'));
-                await send(chatId, 'Добавлено. Теперь /retrain.');
+                await send(chatId, 'Добавлено. Корпус: ' + fs.statSync(CORPUS_FILE).size + ' байт. Теперь /retrain.');
                 return;
             }
-            const p = JSON.parse(fd.toString('utf8'));
-            if (p.brain) brain = p.brain;
-            saveBrainNow();
-            await send(chatId, 'OK');
+            if (name.endsWith('.json')) {
+                const p = JSON.parse(fd.toString('utf8'));
+                if (p.corpus) {
+                    fs.writeFileSync(CORPUS_FILE, p.corpus, 'utf8');
+                    await send(chatId, 'Корпус загружен. Теперь /retrain.');
+                    return;
+                }
+            }
+            await send(chatId, 'Неизвестный файл.');
         } catch (e) { await send(chatId, 'Ошибка: ' + e.message); }
         return;
     }
 
-    brain.lastInput[userId] = text;
-    brain.context.push(text);
-    if (brain.context.length > 5) brain.context.shift();
-    saveBrain();
+    if (!text) return;
 
-    const a = thinkAI(text, userId);
-    await send(chatId, a || 'Не знаю. /train вопрос = ответ');
+    if (!vectors.trained) {
+        await send(chatId, 'Модель не обучена. Напиши /add, накидай текст, потом /retrain.');
+        return;
+    }
+
+    const res = search(text, 1);
+    if (!res.length || res[0].score < 0.3) {
+        await send(chatId, 'Ничего близкого не нашёл.');
+        return;
+    }
+    await send(chatId, res[0].text);
 }
 
 const start = loadOffset();
