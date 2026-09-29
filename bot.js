@@ -9,6 +9,8 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
+const PORT = process.env.PORT || 3000;
+
 const DATA_DIR = process.env.DATA_DIR || './data';
 try {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -16,7 +18,9 @@ try {
   console.error('[ОШИБКА] Не удалось создать папку данных:', e.message);
 }
 
-http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(3000);
+http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(PORT, () => {
+  console.log(`[HTTP] Сервер слушает порт ${PORT}`);
+});
 
 const userMemories = new Map();
 const lastMessages = new Map();
@@ -68,7 +72,7 @@ function sendMessage(chatId, text) {
   const data = JSON.stringify({ chat_id: chatId, text: text });
   const req = https.request(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': data.length }
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
   });
   req.on('error', (e) => console.error('[ОШИБКА ОТПРАВКИ СООБЩЕНИЯ]', e.message));
   req.write(data);
@@ -267,11 +271,16 @@ function handleMessage(chatId, userId, text, document) {
 }
 
 let offset = 0;
+let polling = false;
 function getUpdates() {
-  https.get(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset}&timeout=30`, (res) => {
+  if (polling) return;
+  polling = true;
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset}&timeout=25`;
+  https.get(url, (res) => {
     let data = '';
     res.on('data', chunk => data += chunk);
     res.on('end', () => {
+      polling = false;
       try {
         const json = JSON.parse(data);
         if (json.ok) {
@@ -285,15 +294,19 @@ function getUpdates() {
           }
         } else {
           console.error('[ОШИБКА TELEGRAM API]', json.description);
+          if (json.error_code === 409) {
+            console.error('[КОНФЛИКТ] Удалите webhook или запустите только один экземпляр бота');
+          }
         }
       } catch (e) {
         console.error('[ОШИБКА ОБРАБОТКИ ПАКЕТА]', e.message);
       }
-      getUpdates();
+      setTimeout(getUpdates, 500);
     });
   }).on('error', (e) => {
+    polling = false;
     console.error('[ОШИБКА СЕТИ getUpdates]', e.message);
-    setTimeout(getUpdates, 2000);
+    setTimeout(getUpdates, 3000);
   });
 }
 
