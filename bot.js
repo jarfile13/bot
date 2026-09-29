@@ -22,10 +22,6 @@ http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(P
 
 const userMemories = new Map();
 const lastMessages = new Map();
-const pendingReset = new Map();
-const pendingForget = new Map();
-
-const PAGE_SIZE = 10;
 
 function getUserMemoryFile(userId) {
   return path.join(DATA_DIR, `mem_${userId}.json`);
@@ -39,7 +35,14 @@ function loadUserMemory(userId) {
     try { memory = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { memory = []; }
   }
   if (!Array.isArray(memory)) memory = [];
-  memory = memory.filter(e => e && e.tokens && Array.isArray(e.tokens.words) && Array.isArray(e.tokens.ngrams) && Array.isArray(e.answers));
+  memory = memory.filter(e =>
+    e &&
+    e.tokens &&
+    Array.isArray(e.tokens.words) &&
+    Array.isArray(e.tokens.ngrams) &&
+    Array.isArray(e.answers) &&
+    typeof e.text === 'string'
+  );
   userMemories.set(userId, memory);
   return memory;
 }
@@ -64,7 +67,7 @@ function cleanText(str) {
 
 function tokenize(str) {
   const text = cleanText(str);
-  const words = text.split(' ').filter(word => word.length >= 1);
+  const words = text.split(' ').filter(w => w.length >= 1);
   const ngrams = [];
   for (let i = 0; i < text.length - 2; i++) {
     ngrams.push(text.substring(i, i + 3));
@@ -146,59 +149,70 @@ function downloadFile(fileId, callback) {
   }).on('error', (e) => console.error('[ОШИБКА ЗАПРОСА]', e.message));
 }
 
+function similarity(userTokens, entryTokens) {
+  const wInter = userTokens.words.filter(w => entryTokens.words.includes(w));
+  const wUni = new Set([...userTokens.words, ...entryTokens.words]);
+  const wScore = wUni.size > 0 ? wInter.length / wUni.size : 0;
+
+  const nInter = userTokens.ngrams.filter(n => entryTokens.ngrams.includes(n));
+  const nUni = new Set([...userTokens.ngrams, ...entryTokens.ngrams]);
+  const nScore = nUni.size > 0 ? nInter.length / nUni.size : 0;
+
+  return (wScore * 0.4) + (nScore * 0.6);
+}
+
 function findBestAnswer(userTokens, memory) {
-  if (userTokens.words.length === 0) return null;
+  if (userTokens.words.length === 0 || memory.length === 0) return null;
   let bestMatch = null;
-  let maxScore = 0.15;
+  let maxScore = 0.35;
 
   for (const entry of memory) {
-    const wordInter = userTokens.words.filter(w => entry.tokens.words.includes(w));
-    const wordUni = new Set([...userTokens.words, ...entry.tokens.words]);
-    const wordScore = wordUni.size > 0 ? wordInter.length / wordUni.size : 0;
-
-    const ngramInter = userTokens.ngrams.filter(n => entry.tokens.ngrams.includes(n));
-    const ngramUni = new Set([...userTokens.ngrams, ...entry.tokens.ngrams]);
-    const ngramScore = ngramUni.size > 0 ? ngramInter.length / ngramUni.size : 0;
-
-    const finalScore = (wordScore * 0.4) + (ngramScore * 0.6);
-
-    if (finalScore > maxScore) {
-      maxScore = finalScore;
+    const s = similarity(userTokens, entry.tokens);
+    if (s > maxScore) {
+      maxScore = s;
       bestMatch = entry;
     }
   }
 
   if (bestMatch && bestMatch.answers.length > 0) {
+    bestMatch.hits = (bestMatch.hits || 0) + 1;
     return bestMatch.answers[Math.floor(Math.random() * bestMatch.answers.length)];
   }
   return null;
 }
 
 function learn(userId, question, answer, memory) {
-  const qTokens = tokenize(question);
-  if (qTokens.words.length === 0 || !answer.trim()) return;
+  const q = String(question || '').trim();
+  const a = String(answer || '').trim();
+  if (!q || !a) return false;
 
-  const existing = memory.find(entry => {
-    const inter = qTokens.words.filter(w => entry.tokens.words.includes(w));
-    const uni = new Set([...qTokens.words, ...entry.tokens.words]);
-    return uni.size > 0 && (inter.length / uni.size) > 0.85;
-  });
+  const qTokens = tokenize(q);
+  if (qTokens.words.length === 0) return false;
+
+  let existing = null;
+  let bestScore = 0.85;
+  for (const entry of memory) {
+    const s = similarity(qTokens, entry.tokens);
+    if (s > bestScore) {
+      bestScore = s;
+      existing = entry;
+    }
+  }
 
   if (existing) {
-    if (!existing.answers.includes(answer.trim())) {
-      existing.answers.push(answer.trim());
-    }
+    if (!existing.answers.includes(a)) existing.answers.push(a);
   } else {
     memory.push({
       tokens: qTokens,
-      text: question.trim(),
-      answers: [answer.trim()],
+      text: q,
+      answers: [a],
       created: Date.now(),
       hits: 0
     });
   }
 
   saveUserMemory(userId, memory);
+  return true;
 }
 
 function getMemoryStats(memory) {
@@ -207,10 +221,12 @@ function getMemoryStats(memory) {
   let oldest = null;
   let newest = null;
   let withCreated = 0;
+  let totalHits = 0;
 
   for (const e of memory) {
     answersCount += e.answers.length;
     totalLength += e.text.length;
+    totalHits += e.hits || 0;
     if (e.created) {
       withCreated++;
       if (oldest === null || e.created < oldest) oldest = e.created;
@@ -223,9 +239,7 @@ function getMemoryStats(memory) {
     answers: answersCount,
     avgAnswers: memory.length ? (answersCount / memory.length).toFixed(2) : '0',
     avgLength: memory.length ? Math.round(totalLength / memory.length) : 0,
-    oldest,
-    newest,
-    withCreated
+    oldest, newest, withCreated, totalHits
   };
 }
 
@@ -238,32 +252,32 @@ function formatDate(ts) {
 
 function showHelp(chatId) {
   const text =
-    '<b>Персональный текстовый ИИ</b>\n\n' +
-    'Я учусь в процессе общения. Каждое твоё сообщение становится ответом на моё предыдущее.\n\n' +
-    '<b>Управление знаниями</b>\n' +
-    '/list [стр] — список всех фраз с номерами\n' +
+    '<b>Ассоциативный текстовый ИИ</b>\n\n' +
+    'Логика работы:\n' +
+    '1. Ты пишешь фразу.\n' +
+    '2. Если я её знаю — отвечаю из памяти.\n' +
+    '3. Если не знаю — повторяю её эхом и ЖДУ твой ответ.\n' +
+    '4. Твой следующий ответ я запоминаю как ответ на эту фразу.\n\n' +
+    '<b>Команды</b>\n' +
+    '/help — справка и сброс зависшего контекста\n' +
+    '/teach вопрос = ответ — обучить сразу, без эха\n' +
+    '/list [стр] — список фраз\n' +
     '/show &lt;номер&gt; — подробно о фразе\n' +
-    '/edit &lt;номер&gt; — заменить ответ у фразы\n' +
-    '/del &lt;номер&gt; — удалить фразу по номеру\n' +
-    '/forget &lt;текст&gt; — удалить по тексту\n' +
-    '/find &lt;текст&gt; — найти фразы по подстроке\n\n' +
-    '<b>Данные</b>\n' +
-    '/export — скачать базу знаний (JSON)\n' +
-    '/import — как импортировать (отправь JSON-файл)\n' +
-    '/stats — подробная статистика\n' +
-    '/reset — полностью стереть память (с подтверждением)\n\n' +
-    '<b>Прочее</b>\n' +
-    '/help — эта справка\n' +
-    '/cancel — отменить текущее действие';
+    '/del &lt;номер&gt; — удалить фразу\n' +
+    '/forget &lt;текст&gt; — удалить по точному тексту\n' +
+    '/find &lt;текст&gt; — поиск по подстроке\n' +
+    '/export — скачать базу\n' +
+    '/import — как импортировать (отправь JSON)\n' +
+    '/stats — статистика\n' +
+    '/reset — стереть всё (с подтверждением)\n' +
+    '/cancel — отменить действие / сбросить контекст';
 
   sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
 
-function showList(chatId, userId, memory, page) {
-  if (memory.length === 0) {
-    sendMessage(chatId, 'База знаний пуста.');
-    return;
-  }
+function showList(chatId, memory, page) {
+  if (memory.length === 0) { sendMessage(chatId, 'База пуста.'); return; }
+  const PAGE_SIZE = 10;
   const totalPages = Math.ceil(memory.length / PAGE_SIZE);
   const p = Math.max(1, Math.min(page, totalPages));
   const start = (p - 1) * PAGE_SIZE;
@@ -273,22 +287,16 @@ function showList(chatId, userId, memory, page) {
   slice.forEach((e, i) => {
     const num = start + i + 1;
     const preview = escapeHtml(e.text.length > 60 ? e.text.substring(0, 60) + '…' : e.text);
-    const cnt = e.answers.length;
-    text += `<b>${num}.</b> ${preview}\n     └ ответов: ${cnt}\n`;
+    text += `<b>${num}.</b> ${preview}\n     ответов: ${e.answers.length}\n`;
   });
-
-  text += `\n/show &lt;номер&gt; · /edit &lt;номер&gt; · /del &lt;номер&gt;`;
-  if (totalPages > 1) {
-    text += `\n\nСледующая: /list ${p + 1}`;
-  }
-
+  if (totalPages > 1) text += `\nСледующая: /list ${p + 1}`;
   sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
 
 function showEntry(chatId, memory, num) {
   const idx = num - 1;
   if (idx < 0 || idx >= memory.length) {
-    sendMessage(chatId, `Фразы с номером ${num} нет. Всего: ${memory.length}`);
+    sendMessage(chatId, `Фразы #${num} нет. Всего: ${memory.length}`);
     return;
   }
   const e = memory[idx];
@@ -299,36 +307,29 @@ function showEntry(chatId, memory, num) {
     text += `${i + 1}. ${escapeHtml(a.length > 200 ? a.substring(0, 200) + '…' : a)}\n`;
   });
   if (e.created) text += `\nСоздано: ${formatDate(e.created)}`;
-
+  if (e.hits) text += `\nИспользований: ${e.hits}`;
   sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
 
 function findEntries(chatId, memory, query) {
   const q = cleanText(query);
-  if (!q) {
-    sendMessage(chatId, 'Укажи текст для поиска: /find &lt;текст&gt;', { parse_mode: 'HTML' });
-    return;
-  }
+  if (!q) { sendMessage(chatId, 'Использование: /find &lt;текст&gt;', { parse_mode: 'HTML' }); return; }
   const results = [];
   memory.forEach((e, i) => {
     if (cleanText(e.text).includes(q) || e.answers.some(a => cleanText(a).includes(q))) {
       results.push({ num: i + 1, entry: e });
     }
   });
-
   if (results.length === 0) {
-    sendMessage(chatId, `Ничего не найдено по запросу: "${escapeHtml(query)}"`, { parse_mode: 'HTML' });
+    sendMessage(chatId, `Ничего не найдено: "${escapeHtml(query)}"`, { parse_mode: 'HTML' });
     return;
   }
-
   let text = `<b>Найдено: ${results.length}</b>\n\n`;
   results.slice(0, 15).forEach(r => {
     const preview = escapeHtml(r.entry.text.length > 70 ? r.entry.text.substring(0, 70) + '…' : r.entry.text);
     text += `<b>#${r.num}</b> ${preview}\n`;
   });
   if (results.length > 15) text += `\n…и ещё ${results.length - 15}`;
-  text += `\n\nИспользуй /show &lt;номер&gt; для подробностей`;
-
   sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
 
@@ -336,31 +337,38 @@ function showStats(chatId, userId, memory) {
   const s = getMemoryStats(memory);
   const file = getUserMemoryFile(userId);
   let fileSize = 0;
-  if (fs.existsSync(file)) {
-    try { fileSize = fs.statSync(file).size; } catch (e) {}
-  }
+  if (fs.existsSync(file)) { try { fileSize = fs.statSync(file).size; } catch (e) {} }
 
-  let text = '<b>Статистика базы знаний</b>\n\n';
+  let text = '<b>Статистика</b>\n\n';
   text += `Уникальных фраз: <b>${s.phrases}</b>\n`;
   text += `Всего ответов: <b>${s.answers}</b>\n`;
-  text += `В среднем ответов на фразу: <b>${s.avgAnswers}</b>\n`;
-  text += `Средняя длина фразы: <b>${s.avgLength}</b> симв.\n`;
+  text += `Средне ответов на фразу: <b>${s.avgAnswers}</b>\n`;
+  text += `Средняя длина вопроса: <b>${s.avgLength}</b> симв.\n`;
+  text += `Всего использований памяти: <b>${s.totalHits}</b>\n`;
   text += `Размер файла: <b>${(fileSize / 1024).toFixed(1)}</b> КБ\n`;
   if (s.oldest) text += `\nПервая запись: ${formatDate(s.oldest)}\n`;
   if (s.newest) text += `Последняя запись: ${formatDate(s.newest)}\n`;
-  if (s.withCreated < s.phrases) {
-    text += `\n${s.phrases - s.withCreated} старых фраз без даты создания`;
-  }
-
   sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
+
+function parseTeach(text) {
+  const m = text.match(/^\/teach\s+(.+?)\s*=\s*(.+)$/s);
+  if (m) return { q: m[1].trim(), a: m[2].trim() };
+  const m2 = text.match(/^запомни[:\s]+(.+?)\s*=\s*(.+)$/i);
+  if (m2) return { q: m2[1].trim(), a: m2[2].trim() };
+  return null;
+}
+
+const pendingReset = new Map();
+const pendingDel = new Map();
+const teachBuffer = new Map();
 
 function handleMessage(chatId, userId, text, document) {
   let memory = loadUserMemory(userId);
 
   if (pendingReset.get(userId)) {
-    const answer = (text || '').trim().toLowerCase();
-    if (answer === 'да' || answer === 'yes' || answer === 'y') {
+    const a = (text || '').trim().toLowerCase();
+    if (a === 'да' || a === 'yes' || a === 'y') {
       const file = getUserMemoryFile(userId);
       if (fs.existsSync(file)) { try { fs.unlinkSync(file); } catch (e) {} }
       userMemories.delete(userId);
@@ -369,43 +377,56 @@ function handleMessage(chatId, userId, text, document) {
       sendMessage(chatId, 'Память полностью очищена.');
     } else {
       pendingReset.delete(userId);
-      sendMessage(chatId, 'Отменено. Память не тронута.');
+      sendMessage(chatId, 'Отменено.');
     }
     return;
   }
 
-  if (pendingForget.get(userId)) {
-    const state = pendingForget.get(userId);
+  if (pendingDel.get(userId)) {
     if (text === '/cancel') {
-      pendingForget.delete(userId);
+      pendingDel.delete(userId);
       sendMessage(chatId, 'Отменено.');
       return;
     }
-    const idx = state.num - 1;
-    pendingForget.delete(userId);
+    const num = pendingDel.get(userId);
+    pendingDel.delete(userId);
+    const idx = num - 1;
     if (idx < 0 || idx >= memory.length) {
-      sendMessage(chatId, `Фразы с номером ${state.num} больше нет.`);
+      sendMessage(chatId, `Фразы #${num} больше нет.`);
       return;
     }
     memory.splice(idx, 1);
     saveUserMemory(userId, memory);
-    sendMessage(chatId, `Фраза #${state.num} удалена.`);
+    sendMessage(chatId, `Фраза #${num} удалена.`);
+    return;
+  }
+
+  if (teachBuffer.get(userId)) {
+    const q = teachBuffer.get(userId);
+    teachBuffer.delete(userId);
+    if (text === '/cancel') { sendMessage(chatId, 'Отменено.'); return; }
+    if (learn(userId, q, text, memory)) {
+      sendMessage(chatId, `Запомнил: "${q}" → "${text}"`);
+    } else {
+      sendMessage(chatId, 'Не удалось сохранить.');
+    }
     return;
   }
 
   if (document && document.file_name && document.file_name.endsWith('.json')) {
     downloadFile(document.file_id, (content) => {
       try {
-        const importedData = JSON.parse(content);
-        if (Array.isArray(importedData)) {
-          const valid = importedData.filter(e => e && e.tokens && Array.isArray(e.tokens.words) && Array.isArray(e.tokens.ngrams) && Array.isArray(e.answers));
+        const data = JSON.parse(content);
+        if (Array.isArray(data)) {
+          const valid = data.filter(e => e && e.tokens && Array.isArray(e.tokens.words) && Array.isArray(e.tokens.ngrams) && Array.isArray(e.answers));
           saveUserMemory(userId, valid);
+          lastMessages.delete(userId);
           sendMessage(chatId, `Импортировано ${valid.length} фраз.`);
         } else {
           sendMessage(chatId, 'Некорректный формат файла.');
         }
       } catch (e) {
-        sendMessage(chatId, 'Ошибка при чтении файла.');
+        sendMessage(chatId, 'Ошибка чтения файла.');
       }
     });
     return;
@@ -419,41 +440,42 @@ function handleMessage(chatId, userId, text, document) {
     if (cmd === '/start' || cmd === '/help') {
       lastMessages.delete(userId);
       pendingReset.delete(userId);
-      pendingForget.delete(userId);
+      pendingDel.delete(userId);
+      teachBuffer.delete(userId);
       showHelp(chatId);
       return;
     }
 
     if (cmd === '/cancel') {
-      pendingReset.delete(userId);
-      pendingForget.delete(userId);
       lastMessages.delete(userId);
-      sendMessage(chatId, 'Действие отменено.');
+      pendingReset.delete(userId);
+      pendingDel.delete(userId);
+      teachBuffer.delete(userId);
+      sendMessage(chatId, 'Контекст сброшен.');
       return;
     }
 
     if (cmd === '/reset') {
       pendingReset.set(userId, true);
-      sendMessage(chatId, '<b>Ты уверен?</b>\nВся база знаний будет безвозвратно удалена.\n\nНапиши <b>да</b> для подтверждения или что-то другое для отмены.', { parse_mode: 'HTML' });
+      sendMessage(chatId, '<b>Уверен?</b> Вся база будет удалена.\n\nНапиши <b>да</b> для подтверждения.', { parse_mode: 'HTML' });
       return;
     }
 
     if (cmd === '/export') {
-      if (memory.length === 0) { sendMessage(chatId, 'База знаний пуста.'); return; }
-      sendDocument(chatId, getUserMemoryFile(userId), `Экспорт базы знаний (${memory.length} фраз)`);
+      if (memory.length === 0) { sendMessage(chatId, 'База пуста.'); return; }
+      sendDocument(chatId, getUserMemoryFile(userId), `Экспорт базы (${memory.length} фраз)`);
       return;
     }
 
     if (cmd === '/import') {
-      sendMessage(chatId, 'Отправь JSON-файл, ранее полученный через /export.\n\nТекущая база будет заменена.');
+      sendMessage(chatId, 'Отправь JSON-файл, полученный через /export.');
       return;
     }
 
     if (cmd === '/stats') { showStats(chatId, userId, memory); return; }
 
     if (cmd === '/list') {
-      const page = parseInt(arg, 10) || 1;
-      showList(chatId, userId, memory, page);
+      showList(chatId, memory, parseInt(arg, 10) || 1);
       return;
     }
 
@@ -464,31 +486,36 @@ function handleMessage(chatId, userId, text, document) {
       return;
     }
 
-    if (cmd === '/find') {
-      findEntries(chatId, memory, arg);
-      return;
-    }
+    if (cmd === '/find') { findEntries(chatId, memory, arg); return; }
 
     if (cmd === '/del') {
       const num = parseInt(arg, 10);
       if (!num || num < 1 || num > memory.length) {
-        sendMessage(chatId, `Укажи корректный номер (1–${memory.length}).`);
+        sendMessage(chatId, `Укажи номер 1–${memory.length}.`);
         return;
       }
-      pendingForget.set(userId, { num });
+      pendingDel.set(userId, num);
       const preview = escapeHtml(memory[num - 1].text.substring(0, 80));
-      sendMessage(chatId, `Удалить фразу #${num}?\n\n"${preview}"\n\nНапиши /cancel чтобы отменить.`, { parse_mode: 'HTML' });
+      sendMessage(chatId, `Удалить #${num}?\n\n"${preview}"\n\n/cancel — отмена, любое другое — подтвердить.`, { parse_mode: 'HTML' });
       return;
     }
 
-    if (cmd === '/edit') {
-      const num = parseInt(arg, 10);
-      if (!num || num < 1 || num > memory.length) {
-        sendMessage(chatId, `Укажи корректный номер (1–${memory.length}).`);
+    if (cmd === '/teach') {
+      const parsed = parseTeach(text);
+      if (parsed) {
+        if (learn(userId, parsed.q, parsed.a, memory)) {
+          sendMessage(chatId, `Запомнил: "${parsed.q}" → "${parsed.a}"`);
+        } else {
+          sendMessage(chatId, 'Не удалось сохранить.');
+        }
         return;
       }
-      sendMessage(chatId, `Чтобы добавить ответ к фразе #${num}, просто напиши его следующим сообщением (без слэша). Он добавится как новый вариант.`);
-      lastMessages.set(userId, memory[num - 1].text);
+      if (!arg) {
+        sendMessage(chatId, 'Использование: /teach вопрос = ответ\nИли: /teach вопрос (и следующим сообщением — ответ)');
+        return;
+      }
+      teachBuffer.set(userId, arg.trim());
+      sendMessage(chatId, `Какой ответ на "${arg.trim()}"? Напиши следующим сообщением. /cancel — отмена.`);
       return;
     }
 
@@ -497,12 +524,13 @@ function handleMessage(chatId, userId, text, document) {
       if (!target) { sendMessage(chatId, 'Использование: /forget &lt;текст&gt;', { parse_mode: 'HTML' }); return; }
       const cleanedTarget = cleanText(target);
       const before = memory.length;
-      memory = memory.filter(entry => cleanText(entry.text) !== cleanedTarget);
+      memory = memory.filter(e => cleanText(e.text) !== cleanedTarget);
       if (memory.length < before) {
         saveUserMemory(userId, memory);
+        lastMessages.delete(userId);
         sendMessage(chatId, `Удалено фраз: ${before - memory.length}.`);
       } else {
-        sendMessage(chatId, `Фраза "${escapeHtml(target)}" не найдена. Попробуй /find`, { parse_mode: 'HTML' });
+        sendMessage(chatId, `Не найдено: "${escapeHtml(target)}". Попробуй /find`, { parse_mode: 'HTML' });
       }
       return;
     }
@@ -513,23 +541,45 @@ function handleMessage(chatId, userId, text, document) {
 
   if (!text) return;
 
-  const cleanTextStr = text.trim();
-  const tokens = tokenize(cleanTextStr);
+  const trimmed = text.trim();
 
-  const prevBotMessage = lastMessages.get(userId);
-  if (prevBotMessage) {
-    learn(userId, prevBotMessage, cleanTextStr, memory);
+  const parsedTeach = parseTeach(trimmed);
+  if (parsedTeach) {
+    if (learn(userId, parsedTeach.q, parsedTeach.a, memory)) {
+      sendMessage(chatId, `Запомнил: "${parsedTeach.q}" → "${parsedTeach.a}"`);
+    } else {
+      sendMessage(chatId, 'Не удалось сохранить.');
+    }
+    return;
   }
 
+  // ---- АССОЦИАТИВНАЯ ЛОГИКА ----
+
+  // 1. Если ждём ответ на эхо — учим и СРАЗУ сбрасываем контекст
+  const prevBotMessage = lastMessages.get(userId);
+  if (prevBotMessage) {
+    lastMessages.delete(userId);
+    if (learn(userId, prevBotMessage, trimmed, memory)) {
+      sendMessage(chatId, 'Понял, записал.');
+    } else {
+      sendMessage(chatId, 'Не удалось записать.');
+    }
+    return;
+  }
+
+  // 2. Ищем ответ в памяти
+  const tokens = tokenize(trimmed);
   const aiResponse = findBestAnswer(tokens, memory);
 
   if (aiResponse) {
+    // Знакомая фраза — отвечаем, контекст НЕ ставим (учиться не надо)
     sendMessage(chatId, aiResponse);
-    lastMessages.set(userId, aiResponse);
-  } else {
-    sendMessage(chatId, cleanTextStr);
-    lastMessages.set(userId, cleanTextStr);
+    return;
   }
+
+  // 3. Незнакомая — эхо + ставим контекст ожидания ответа
+  sendMessage(chatId, trimmed);
+  lastMessages.set(userId, trimmed);
 }
 
 let offset = 0;
@@ -550,7 +600,12 @@ function getUpdates() {
             for (const update of json.result) {
               offset = update.update_id + 1;
               if (update.message) {
-                handleMessage(update.message.chat.id, update.message.from.id, update.message.text, update.message.document);
+                handleMessage(
+                  update.message.chat.id,
+                  update.message.from.id,
+                  update.message.text,
+                  update.message.document
+                );
               }
             }
           }
