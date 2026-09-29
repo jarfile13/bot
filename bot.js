@@ -1,11 +1,10 @@
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
-const path = require('path');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
-    console.error('[КРИТИЧЕСКАЯ ОШИБКА] Переменная BOT_TOKEN не задана!');
+    console.error('BOT_TOKEN is not set');
     process.exit(1);
 }
 
@@ -15,7 +14,13 @@ const OFFSET_FILE = './ai_brain.offset.json';
 
 http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(PORT);
 
-let aiBrain = { vocabulary: {}, relations: {}, lastInput: {} };
+let aiBrain = {
+    vocabulary: {},
+    relations: {},
+    lastInput: {},
+    synonyms: {},
+    context: {}
+};
 
 if (fs.existsSync(DATA_FILE)) {
     try {
@@ -23,10 +28,12 @@ if (fs.existsSync(DATA_FILE)) {
         aiBrain = {
             vocabulary: parsed.vocabulary || {},
             relations: parsed.relations || {},
-            lastInput: parsed.lastInput || {}
+            lastInput: parsed.lastInput || {},
+            synonyms: parsed.synonyms || {},
+            context: parsed.context || {}
         };
     } catch (e) {
-        console.error('[ОШИБКА] Не удалось прочитать', DATA_FILE, e.message);
+        console.error('Failed to read', DATA_FILE, e.message);
     }
 }
 
@@ -38,10 +45,17 @@ function saveBrainNow() {
     saving = true;
     const tmp = DATA_FILE + '.tmp';
     try {
-        fs.writeFileSync(tmp, JSON.stringify(aiBrain, null, 2), 'utf8');
+        const toSave = {
+            vocabulary: aiBrain.vocabulary,
+            relations: aiBrain.relations,
+            lastInput: aiBrain.lastInput,
+            synonyms: aiBrain.synonyms,
+            context: aiBrain.context
+        };
+        fs.writeFileSync(tmp, JSON.stringify(toSave, null, 2), 'utf8');
         fs.renameSync(tmp, DATA_FILE);
     } catch (e) {
-        console.error('[ОШИБКА] saveBrain:', e.message);
+        console.error('saveBrain error:', e.message);
     } finally {
         saving = false;
     }
@@ -83,27 +97,54 @@ function cleanText(text) {
         .trim();
 }
 
-function escapeHtml(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const ENDINGS = [
+    'иями', 'ями', 'ами', 'ией', 'иям', 'ием', 'иях', 'ию', 'ия', 'ий', 'ый', 'ой', 'ая', 'ое', 'ые', 'ими', 'ыми',
+    'ов', 'ев', 'ам', 'ям', 'ах', 'ях', 'ом', 'ем', 'ой', 'ей', 'ую', 'юю', 'ишь', 'ешь', 'ете', 'ите', 'ует', 'уют',
+    'ал', 'ял', 'ил', 'ел', 'ла', 'ло', 'ли', 'ть', 'ся', 'сь', 'а', 'я', 'о', 'е', 'у', 'ю', 'ы', 'и', 'й', 'ь'
+];
+
+function stem(word) {
+    let w = word;
+    if (w.length <= 3) return w;
+    for (const end of ENDINGS) {
+        if (w.length - end.length >= 3 && w.endsWith(end)) {
+            w = w.slice(0, w.length - end.length);
+            break;
+        }
+    }
+    return w;
+}
+
+function canonical(word) {
+    const syn = aiBrain.synonyms[word];
+    if (syn && syn.length) return syn[0];
+    return word;
+}
+
+function tokenize(text) {
+    const clean = cleanText(text);
+    if (!clean) return [];
+    return clean.split(' ').filter(Boolean).map(w => stem(canonical(w)));
 }
 
 function trainAI(input, output) {
-    const inClean = cleanText(input);
+    const inTokens = tokenize(input);
     const outClean = String(output).trim();
-    if (!inClean || !outClean) return false;
+    if (!inTokens.length || !outClean) return false;
 
-    if (!aiBrain.relations[inClean]) {
-        aiBrain.relations[inClean] = {};
+    const key = inTokens.join(' ');
+
+    if (!aiBrain.relations[key]) {
+        aiBrain.relations[key] = {};
     }
 
-    if (!aiBrain.relations[inClean][outClean]) {
-        aiBrain.relations[inClean][outClean] = 1;
+    if (!aiBrain.relations[key][outClean]) {
+        aiBrain.relations[key][outClean] = 1;
     } else {
-        aiBrain.relations[inClean][outClean] += 1;
+        aiBrain.relations[key][outClean] += 1;
     }
 
-    for (const w of inClean.split(' ')) {
-        if (!w) continue;
+    for (const w of inTokens) {
         aiBrain.vocabulary[w] = (aiBrain.vocabulary[w] || 0) + 1;
     }
 
@@ -111,54 +152,82 @@ function trainAI(input, output) {
     return true;
 }
 
-function pickBestAnswer(options) {
-    let bestKey = null;
-    let bestVal = -1;
-    for (const k in options) {
-        if (options[k] > bestVal) {
-            bestVal = options[k];
-            bestKey = k;
-        }
-    }
-    return bestKey;
+function wordWeight(word) {
+    const total = Object.values(aiBrain.vocabulary).reduce((a, b) => a + b, 0) || 1;
+    const freq = aiBrain.vocabulary[word] || 0;
+    return Math.log((total + 1) / (freq + 1)) + 1;
 }
 
-function thinkAI(userInput) {
-    const cleanInput = cleanText(userInput);
+function pickWeighted(options) {
+    const keys = Object.keys(options);
+    if (!keys.length) return null;
+    let total = 0;
+    for (const k of keys) total += options[k];
+    let r = Math.random() * total;
+    for (const k of keys) {
+        r -= options[k];
+        if (r <= 0) return k;
+    }
+    return keys[keys.length - 1];
+}
 
-    if (aiBrain.relations[cleanInput]) {
-        const options = aiBrain.relations[cleanInput];
-        const best = pickBestAnswer(options);
+function scoreMatch(inputTokens, knownKey) {
+    const knownTokens = knownKey.split(' ');
+    let score = 0;
+    for (const t of inputTokens) {
+        if (knownTokens.includes(t)) {
+            score += wordWeight(t);
+        }
+    }
+    return score;
+}
+
+function thinkAI(userInput, userId) {
+    const inputTokens = tokenize(userInput);
+    if (!inputTokens.length) {
+        return 'Я пока не знаю, что ответить. Обучи меня: /train вопрос = ответ';
+    }
+
+    const key = inputTokens.join(' ');
+    if (aiBrain.relations[key]) {
+        const best = pickWeighted(aiBrain.relations[key]);
         if (best) return best;
     }
 
-    let bestMatch = null;
-    let maxScore = 0;
-    const inputWords = cleanInput.split(' ').filter(Boolean);
-
-    if (inputWords.length === 0) {
-        return "Я пока не знаю, что ответить. Обучи меня! Напиши: /train [ответ]";
-    }
-
-    for (const knownInput in aiBrain.relations) {
-        const knownWords = knownInput.split(' ');
-        let intersection = 0;
-        for (const word of inputWords) {
-            if (knownWords.includes(word)) intersection++;
-        }
-
-        if (intersection > maxScore) {
-            maxScore = intersection;
-            const options = aiBrain.relations[knownInput];
-            bestMatch = pickBestAnswer(options);
+    let bestKey = null;
+    let bestScore = 0;
+    for (const knownKey in aiBrain.relations) {
+        const s = scoreMatch(inputTokens, knownKey);
+        if (s > bestScore) {
+            bestScore = s;
+            bestKey = knownKey;
         }
     }
 
-    if (maxScore === 0 || !bestMatch) {
-        return "Я пока не знаю, что ответить. Обучи меня! Напиши: /train [ответ]";
+    if (bestKey && bestScore > 0) {
+        const best = pickWeighted(aiBrain.relations[bestKey]);
+        if (best) return best;
     }
 
-    return bestMatch;
+    if (userId) {
+        const ctx = aiBrain.context[userId] || [];
+        for (let i = ctx.length - 1; i >= 0; i--) {
+            const ctxTokens = tokenize(ctx[i]);
+            for (const knownKey in aiBrain.relations) {
+                const s = scoreMatch(ctxTokens, knownKey);
+                if (s > bestScore) {
+                    bestScore = s;
+                    bestKey = knownKey;
+                }
+            }
+        }
+        if (bestKey && bestScore > 0) {
+            const best = pickWeighted(aiBrain.relations[bestKey]);
+            if (best) return best;
+        }
+    }
+
+    return null;
 }
 
 function apiRequest(method, data) {
@@ -189,289 +258,96 @@ function apiRequest(method, data) {
     });
 }
 
-function sendMessage(chatId, text, extra) {
-    const payload = { chat_id: chatId, text: text };
-    if (extra) Object.assign(payload, extra);
-    return apiRequest('sendMessage', payload);
+function sendMessage(chatId, text) {
+    return apiRequest('sendMessage', { chat_id: chatId, text });
 }
 
-function sendDocument(chatId, filePath, caption) {
-    return new Promise((resolve) => {
-        try {
-            const boundary = '----Boundary' + Math.random().toString(36).slice(2);
-            const filename = path.basename(filePath);
-            const fileData = fs.readFileSync(filePath);
-            const parts = [];
-            parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`));
-            parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`));
-            parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename}"\r\nContent-Type: application/json\r\n\r\n`));
-            parts.push(fileData);
-            parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
-            const body = Buffer.concat(parts);
-            const req = https.request(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`, {
-                method: 'POST',
-                headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
-                timeout: 60000
-            }, (res) => {
-                let d = '';
-                res.on('data', c => d += c);
-                res.on('end', () => resolve({ ok: true }));
-            });
-            req.on('error', () => resolve({ ok: false }));
-            req.on('timeout', () => { req.destroy(); resolve({ ok: false }); });
-            req.write(body);
-            req.end();
-        } catch (e) { resolve({ ok: false }); }
-    });
-}
-
-function downloadFile(fileId) {
-    return new Promise((resolve) => {
-        https.get(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`, (res) => {
-            let data = '';
-            res.on('data', c => data += c);
-            res.on('end', () => {
-                try {
-                    const json = JSON.parse(data);
-                    if (json.ok && json.result.file_path) {
-                        https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${json.result.file_path}`, fr => {
-                            const chunks = [];
-                            fr.on('data', c => chunks.push(c));
-                            fr.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-                        }).on('error', () => resolve(null));
-                    } else resolve(null);
-                } catch { resolve(null); }
-            });
-        }).on('error', () => resolve(null));
-    });
-}
-
-const pendingReset = new Map();
-
-function showHelp(chatId) {
-    const text =
-        '<b>Команды</b>\n\n' +
-        '<code>/train ответ</code> — обучить на последнем сообщении\n' +
-        '<code>/list [стр]</code> — список выученных пар\n' +
-        '<code>/show &lt;номер&gt;</code> — подробности пары\n' +
-        '<code>/del &lt;номер&gt;</code> — удалить пару\n' +
-        '<code>/forget &lt;фраза&gt;</code> — удалить по фразе\n' +
-        '<code>/stats</code> — статистика\n' +
-        '<code>/export</code> — скачать базу\n' +
-        '<code>/import</code> — импорт базы\n' +
-        '<code>/reset</code> — стереть всё\n' +
-        '<code>/cancel</code> — отмена';
-    sendMessage(chatId, text, { parse_mode: 'HTML' });
-}
-
-function showStats(chatId) {
-    const relationCount = Object.keys(aiBrain.relations).length;
-    const answerSet = new Set();
-    for (const inKey in aiBrain.relations) {
-        for (const outKey in aiBrain.relations[inKey]) answerSet.add(outKey);
+function getStats() {
+    const pairs = Object.keys(aiBrain.relations).length;
+    let answers = 0;
+    let examples = 0;
+    for (const q in aiBrain.relations) {
+        const opts = aiBrain.relations[q];
+        const keys = Object.keys(opts);
+        answers += keys.length;
+        for (const a of keys) examples += opts[a];
     }
-    const vocabCount = Object.keys(aiBrain.vocabulary).length;
-    let fileSize = 0;
-    try { fileSize = fs.statSync(DATA_FILE).size; } catch {}
-    const sizeKb = (fileSize / 1024).toFixed(1);
-
-    let out = '<b>Статистика</b>\n\n';
-    out += `Фраз: <b>${relationCount}</b>\n`;
-    out += `Ответов: <b>${answerSet.size}</b>\n`;
-    out += `Слов: <b>${vocabCount}</b>\n`;
-    out += `Размер: <b>${sizeKb} КБ</b>`;
-    sendMessage(chatId, out, { parse_mode: 'HTML' });
+    const words = Object.keys(aiBrain.vocabulary).length;
+    const syns = Object.keys(aiBrain.synonyms).length;
+    return { pairs, answers, examples, words, syns };
 }
 
-function showList(chatId, page) {
-    const keys = Object.keys(aiBrain.relations);
-    if (keys.length === 0) { sendMessage(chatId, 'база пуста'); return; }
-    const PAGE = 10;
-    const totalPages = Math.ceil(keys.length / PAGE);
-    const p = Math.max(1, Math.min(page, totalPages));
-    const start = (p - 1) * PAGE;
-    const slice = keys.slice(start, start + PAGE);
-
-    let out = `<b>Пары</b> (${p}/${totalPages}, всего ${keys.length})\n\n`;
-    slice.forEach((key, i) => {
-        const num = start + i + 1;
-        const best = pickBestAnswer(aiBrain.relations[key]);
-        const q = key.length > 45 ? key.slice(0, 45) + '…' : key;
-        const a = best.length > 45 ? best.slice(0, 45) + '…' : best;
-        out += `<b>${num}.</b> ${escapeHtml(q)}\n     ${escapeHtml(a)}\n`;
-    });
-    if (totalPages > 1) out += `\n/list ${p + 1}`;
-    sendMessage(chatId, out, { parse_mode: 'HTML' });
+function getList(limit) {
+    const items = [];
+    for (const q in aiBrain.relations) {
+        const opts = aiBrain.relations[q];
+        const best = pickWeighted(opts);
+        const count = opts[best] || 0;
+        items.push({ q, a: best, count });
+    }
+    items.sort((a, b) => b.count - a.count);
+    return items.slice(0, limit || 50);
 }
 
-function showEntry(chatId, num) {
-    const keys = Object.keys(aiBrain.relations);
-    const idx = num - 1;
-    if (idx < 0 || idx >= keys.length) {
-        sendMessage(chatId, `нет пары #${num}. всего: ${keys.length}`);
-        return;
-    }
-    const key = keys[idx];
-    const options = aiBrain.relations[key];
-    let out = `<b>Пара #${num}</b>\n\n`;
-    out += `<b>Вопрос:</b> ${escapeHtml(key)}\n\n`;
-    out += `<b>Ответы:</b>\n`;
-    for (const ans in options) {
-        out += `  ${options[ans]}× ${escapeHtml(ans)}\n`;
-    }
-    sendMessage(chatId, out, { parse_mode: 'HTML' });
-}
-
-function deleteByIndex(chatId, num) {
-    const keys = Object.keys(aiBrain.relations);
-    const idx = num - 1;
-    if (idx < 0 || idx >= keys.length) {
-        sendMessage(chatId, `укажи номер 1–${keys.length}`);
-        return;
-    }
-    const key = keys[idx];
+function deletePair(question) {
+    const tokens = tokenize(question);
+    const key = tokens.join(' ');
+    if (!key) return false;
+    if (!aiBrain.relations[key]) return false;
     delete aiBrain.relations[key];
-    saveBrain();
-    sendMessage(chatId, `удалено #${num}`);
+    saveBrainNow();
+    return true;
 }
 
-function deleteByText(chatId, phrase) {
-    const key = cleanText(phrase);
-    if (!key) { sendMessage(chatId, 'формат: /forget фраза'); return; }
-    if (!aiBrain.relations[key]) {
-        sendMessage(chatId, 'не найдено');
-        return;
+function addSynonyms(word, list) {
+    const w = canonical(cleanText(word));
+    if (!w || !list.length) return false;
+    if (!aiBrain.synonyms[w]) aiBrain.synonyms[w] = [];
+    for (const s of list) {
+        const cs = cleanText(s);
+        if (cs && !aiBrain.synonyms[w].includes(cs)) {
+            aiBrain.synonyms[w].push(cs);
+            if (!aiBrain.synonyms[cs]) aiBrain.synonyms[cs] = [w];
+        }
     }
-    delete aiBrain.relations[key];
     saveBrain();
-    sendMessage(chatId, 'удалено');
+    return true;
 }
 
-async function handleMessage(msg) {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-
-    if (msg.document && msg.document.file_name && msg.document.file_name.endsWith('.json')) {
-        const content = await downloadFile(msg.document.file_id);
-        if (!content) { sendMessage(chatId, 'не удалось скачать'); return; }
-        try {
-            const imported = JSON.parse(content);
-            if (imported && typeof imported === 'object' && imported.relations) {
-                aiBrain.relations = imported.relations || {};
-                aiBrain.vocabulary = imported.vocabulary || {};
-                aiBrain.lastInput = {};
-                saveBrainNow();
-                sendMessage(chatId, `импортировано: ${Object.keys(aiBrain.relations).length}`);
-            } else {
-                sendMessage(chatId, 'неверный формат');
-            }
-        } catch { sendMessage(chatId, 'ошибка чтения'); }
-        return;
+function deleteSynonym(word, target) {
+    const w = canonical(cleanText(word));
+    const t = cleanText(target);
+    if (!w || !t) return false;
+    let changed = false;
+    if (aiBrain.synonyms[w]) {
+        const before = aiBrain.synonyms[w].length;
+        aiBrain.synonyms[w] = aiBrain.synonyms[w].filter(s => s !== t);
+        if (aiBrain.synonyms[w].length !== before) changed = true;
+        if (!aiBrain.synonyms[w].length) delete aiBrain.synonyms[w];
     }
-
-    const text = (msg.text || '').trim();
-    if (!text) return;
-
-    if (text.startsWith('/')) {
-        const parts = text.split(/\s+/);
-        const cmd = parts[0].toLowerCase();
-        const arg = parts.slice(1).join(' ').trim();
-
-        if (cmd === '/start' || cmd === '/help') {
-            pendingReset.delete(userId);
-            showHelp(chatId);
-            return;
-        }
-
-        if (cmd === '/cancel') {
-            pendingReset.delete(userId);
-            sendMessage(chatId, 'отменено');
-            return;
-        }
-
-        if (cmd === '/stats') { showStats(chatId); return; }
-
-        if (cmd === '/list') {
-            showList(chatId, parseInt(arg, 10) || 1);
-            return;
-        }
-
-        if (cmd === '/show') {
-            const num = parseInt(arg, 10);
-            if (!num) { sendMessage(chatId, 'формат: /show <номер>'); return; }
-            showEntry(chatId, num);
-            return;
-        }
-
-        if (cmd === '/del') {
-            const num = parseInt(arg, 10);
-            if (!num) { sendMessage(chatId, 'формат: /del <номер>'); return; }
-            deleteByIndex(chatId, num);
-            return;
-        }
-
-        if (cmd === '/forget') {
-            if (!arg) { sendMessage(chatId, 'формат: /forget фраза'); return; }
-            deleteByText(chatId, arg);
-            return;
-        }
-
-        if (cmd === '/export') {
-            const count = Object.keys(aiBrain.relations).length;
-            if (count === 0) { sendMessage(chatId, 'база пуста'); return; }
-            saveBrainNow();
-            await sendDocument(chatId, DATA_FILE, `база (${count})`);
-            return;
-        }
-
-        if (cmd === '/import') {
-            sendMessage(chatId, 'отправь JSON-файл из /export');
-            return;
-        }
-
-        if (cmd === '/reset') {
-            pendingReset.set(userId, true);
-            sendMessage(chatId, 'напиши да для подтверждения');
-            return;
-        }
-
-        if (cmd === '/train') {
-            const correctOutput = text.replace(/^\/train\s*/, '').trim();
-            const lastQuestion = aiBrain.lastInput[userId];
-
-            if (!lastQuestion) {
-                sendMessage(chatId, "сначала задай вопрос");
-            } else if (!correctOutput) {
-                sendMessage(chatId, "формат: /train ответ");
-            } else {
-                trainAI(lastQuestion, correctOutput);
-                sendMessage(chatId, `запомнил: "${lastQuestion}" -> "${correctOutput}"`);
-            }
-            return;
-        }
-
-        sendMessage(chatId, 'неизвестная команда, /start');
-        return;
+    if (aiBrain.synonyms[t]) {
+        const before = aiBrain.synonyms[t].length;
+        aiBrain.synonyms[t] = aiBrain.synonyms[t].filter(s => s !== w);
+        if (aiBrain.synonyms[t].length !== before) changed = true;
+        if (!aiBrain.synonyms[t].length) delete aiBrain.synonyms[t];
     }
+    if (changed) saveBrainNow();
+    return changed;
+}
 
-    if (pendingReset.get(userId)) {
-        const a = text.toLowerCase();
-        if (a === 'да' || a === 'yes' || a === 'y') {
-            aiBrain = { vocabulary: {}, relations: {}, lastInput: {} };
-            saveBrainNow();
-            pendingReset.delete(userId);
-            sendMessage(chatId, 'стёрто');
-        } else {
-            pendingReset.delete(userId);
-            sendMessage(chatId, 'отменено');
+function deleteAllSynonyms(word) {
+    const w = canonical(cleanText(word));
+    if (!w || !aiBrain.synonyms[w]) return false;
+    const list = [...aiBrain.synonyms[w]];
+    delete aiBrain.synonyms[w];
+    for (const s of list) {
+        if (aiBrain.synonyms[s]) {
+            aiBrain.synonyms[s] = aiBrain.synonyms[s].filter(x => x !== w);
+            if (!aiBrain.synonyms[s].length) delete aiBrain.synonyms[s];
         }
-        return;
     }
-
-    aiBrain.lastInput[userId] = text;
-    saveBrain();
-    const aiAnswer = thinkAI(text);
-    sendMessage(chatId, aiAnswer);
+    saveBrainNow();
+    return true;
 }
 
 let polling = false;
@@ -492,11 +368,11 @@ async function getUpdates(offset) {
         for (const update of res.result) {
             offset = update.update_id + 1;
             saveOffset(offset);
-            if (update.message) {
+            if (update.message && typeof update.message.text === 'string') {
                 try {
                     await handleMessage(update.message);
                 } catch (e) {
-                    console.error('[ОШИБКА] handleMessage:', e.message);
+                    console.error('handleMessage error:', e.message);
                 }
             }
         }
@@ -507,6 +383,246 @@ async function getUpdates(offset) {
     }
 }
 
+async function handleMessage(msg) {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const text = msg.text.trim();
+    if (!text) return;
+
+    if (text === '/start') {
+        await sendMessage(chatId,
+            'Команды:\n' +
+            '/start - это сообщение\n' +
+            '/train вопрос = ответ - обучить\n' +
+            '/syn слово = синоним1, синоним2 - добавить синонимы\n' +
+            '/syn del слово = синоним - удалить один синоним\n' +
+            '/syn del слово - удалить все синонимы слова\n' +
+            '/reset - очистить память\n' +
+            '/export - выгрузить базу\n' +
+            '/import - загрузить базу (отправь JSON-файл)\n' +
+            '/stats - статистика\n' +
+            '/list - список пар\n' +
+            '/del вопрос - удалить пару\n' +
+            '/delete вопрос - то же самое'
+        );
+        return;
+    }
+
+    if (text === '/reset') {
+        aiBrain = { vocabulary: {}, relations: {}, lastInput: {}, synonyms: {}, context: {} };
+        saveBrainNow();
+        await sendMessage(chatId, 'Память очищена.');
+        return;
+    }
+
+    if (text === '/stats') {
+        const s = getStats();
+        await sendMessage(chatId,
+            'Статистика:\n' +
+            'Вопросов: ' + s.pairs + '\n' +
+            'Ответов: ' + s.answers + '\n' +
+            'Примеров: ' + s.examples + '\n' +
+            'Слов: ' + s.words + '\n' +
+            'Синонимов: ' + s.syns
+        );
+        return;
+    }
+
+    if (text === '/list') {
+        const items = getList(50);
+        if (!items.length) {
+            await sendMessage(chatId, 'База пуста.');
+            return;
+        }
+        let out = 'Пары:\n';
+        for (const it of items) {
+            out += '"' + it.q + '" -> "' + it.a + '" (' + it.count + ')\n';
+        }
+        await sendMessage(chatId, out);
+        return;
+    }
+
+    if (text.startsWith('/del ') || text.startsWith('/delete ')) {
+        const q = text.replace(/^\/(del|delete)\s+/, '').trim();
+        if (!q) {
+            await sendMessage(chatId, 'Использование: /del вопрос');
+            return;
+        }
+        const ok = deletePair(q);
+        await sendMessage(chatId, ok ? 'Удалено.' : 'Не найдено.');
+        return;
+    }
+
+    if (text.startsWith('/syn')) {
+        const rest = text.replace(/^\/syn\s*/, '').trim();
+
+        if (rest.startsWith('del ')) {
+            const arg = rest.slice(4).trim();
+            if (!arg) {
+                await sendMessage(chatId, 'Использование:\n/syn del слово = синоним\n/syn del слово');
+                return;
+            }
+            if (arg.includes('=')) {
+                const idx = arg.indexOf('=');
+                const word = arg.slice(0, idx).trim();
+                const target = arg.slice(idx + 1).trim();
+                const ok = deleteSynonym(word, target);
+                await sendMessage(chatId, ok ? 'Синоним удалён.' : 'Не найдено.');
+                return;
+            }
+            const ok = deleteAllSynonyms(arg);
+            await sendMessage(chatId, ok ? 'Все синонимы слова удалены.' : 'Не найдено.');
+            return;
+        }
+
+        if (!rest.includes('=')) {
+            await sendMessage(chatId, 'Использование: /syn слово = синоним1, синоним2');
+            return;
+        }
+        const idx = rest.indexOf('=');
+        const word = rest.slice(0, idx).trim();
+        const listRaw = rest.slice(idx + 1).trim();
+        const list = listRaw.split(',').map(s => s.trim()).filter(Boolean);
+        if (!word || !list.length) {
+            await sendMessage(chatId, 'Использование: /syn слово = синоним1, синоним2');
+            return;
+        }
+        addSynonyms(word, list);
+        await sendMessage(chatId, 'Синонимы добавлены: ' + word + ' = ' + list.join(', '));
+        return;
+    }
+
+    if (text === '/export') {
+        try {
+            const buf = Buffer.from(JSON.stringify({
+                vocabulary: aiBrain.vocabulary,
+                relations: aiBrain.relations,
+                synonyms: aiBrain.synonyms,
+                context: aiBrain.context,
+                lastInput: aiBrain.lastInput
+            }, null, 2), 'utf8');
+            const boundary = '----AIBrainBoundary' + Date.now();
+            const head = '--' + boundary + '\r\n' +
+                'Content-Disposition: form-data; name="document"; filename="ai_brain.json"\r\n' +
+                'Content-Type: application/json\r\n\r\n';
+            const tail = '\r\n--' + boundary + '--\r\n';
+            const body = Buffer.concat([Buffer.from(head, 'utf8'), buf, Buffer.from(tail, 'utf8')]);
+
+            await new Promise((resolve) => {
+                const options = {
+                    hostname: 'api.telegram.org',
+                    path: `/bot${BOT_TOKEN}/sendDocument`,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'multipart/form-data; boundary=' + boundary,
+                        'Content-Length': body.length
+                    },
+                    timeout: 40000
+                };
+                const req = https.request(options, (res) => {
+                    let b = '';
+                    res.on('data', c => b += c);
+                    res.on('end', () => resolve());
+                });
+                req.on('error', () => resolve());
+                req.on('timeout', () => { req.destroy(); resolve(); });
+                req.write(body);
+                req.end();
+            });
+        } catch (e) {
+            await sendMessage(chatId, 'Ошибка экспорта.');
+        }
+        return;
+    }
+
+    if (text === '/import') {
+        await sendMessage(chatId, 'Отправь JSON-файл с базой.');
+        return;
+    }
+
+    if (msg.document) {
+        try {
+            const fileId = msg.document.file_id;
+            const fileRes = await apiRequest('getFile', { file_id: fileId });
+            if (!fileRes.ok) {
+                await sendMessage(chatId, 'Не удалось получить файл.');
+                return;
+            }
+            const filePath = fileRes.result.file_path;
+            const fileData = await new Promise((resolve) => {
+                https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`, (res) => {
+                    let chunks = [];
+                    res.on('data', c => chunks.push(c));
+                    res.on('end', () => resolve(Buffer.concat(chunks)));
+                }).on('error', () => resolve(null));
+            });
+            if (!fileData) {
+                await sendMessage(chatId, 'Не удалось скачать файл.');
+                return;
+            }
+            const parsed = JSON.parse(fileData.toString('utf8'));
+            aiBrain = {
+                vocabulary: parsed.vocabulary || {},
+                relations: parsed.relations || {},
+                lastInput: parsed.lastInput || {},
+                synonyms: parsed.synonyms || {},
+                context: parsed.context || {}
+            };
+            saveBrainNow();
+            await sendMessage(chatId, 'База загружена.');
+        } catch (e) {
+            await sendMessage(chatId, 'Ошибка импорта.');
+        }
+        return;
+    }
+
+    if (text.startsWith('/train')) {
+        const rest = text.replace(/^\/train\s*/, '').trim();
+
+        if (rest.includes('=')) {
+            const idx = rest.indexOf('=');
+            const question = rest.slice(0, idx).trim();
+            const answer = rest.slice(idx + 1).trim();
+            if (!question || !answer) {
+                await sendMessage(chatId, 'Использование: /train вопрос = ответ');
+                return;
+            }
+            trainAI(question, answer);
+            await sendMessage(chatId, 'Выучено: "' + question + '" -> "' + answer + '"');
+            return;
+        }
+
+        const correctOutput = rest;
+        const lastQuestion = aiBrain.lastInput[userId];
+
+        if (!lastQuestion) {
+            await sendMessage(chatId, 'Сначала спроси меня о чем-нибудь.');
+        } else if (!correctOutput) {
+            await sendMessage(chatId, 'Использование: /train вопрос = ответ');
+        } else {
+            trainAI(lastQuestion, correctOutput);
+            await sendMessage(chatId, 'Выучено: "' + lastQuestion + '" -> "' + correctOutput + '"');
+        }
+        return;
+    }
+
+    aiBrain.lastInput[userId] = text;
+
+    if (!aiBrain.context[userId]) aiBrain.context[userId] = [];
+    aiBrain.context[userId].push(text);
+    if (aiBrain.context[userId].length > 5) aiBrain.context[userId].shift();
+
+    saveBrain();
+
+    const aiAnswer = thinkAI(text, userId);
+
+    if (aiAnswer) {
+        await sendMessage(chatId, aiAnswer);
+    } else {
+        await sendMessage(chatId, 'Я пока не знаю, что ответить. Обучи меня: /train вопрос = ответ');
+    }
+}
+
 const startOffset = loadOffset();
-console.log("ИИ-Бот запущен. Offset:", startOffset);
+console.log('Bot started. Offset:', startOffset);
 getUpdates(startOffset);
