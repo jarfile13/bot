@@ -24,6 +24,7 @@ const LR = 0.15;
 const EPOCHS = 300;
 const CONFIDENCE = 0.72;
 const L2 = 0.0001;
+const MAX_LEVENSHTEIN = 2;
 
 function cleanText(str) {
   return String(str).toLowerCase().replace(/ё/g, 'е').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
@@ -31,6 +32,62 @@ function cleanText(str) {
 
 function getWords(str) {
   return cleanText(str).split(' ').filter(w => w.length >= 1);
+}
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  const al = a.length, bl = b.length;
+  if (al === 0) return bl;
+  if (bl === 0) return al;
+  if (Math.abs(al - bl) > MAX_LEVENSHTEIN) return MAX_LEVENSHTEIN + 1;
+
+  let prev = new Array(bl + 1);
+  let curr = new Array(bl + 1);
+  for (let j = 0; j <= bl; j++) prev[j] = j;
+
+  for (let i = 1; i <= al; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= bl; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    const t = prev; prev = curr; curr = t;
+  }
+  return prev[bl];
+}
+
+function correctWord(word, vocabIndex) {
+  if (vocabIndex.has(word)) return { word, corrected: false };
+  if (word.length < 3) return { word, corrected: false };
+
+  let best = null;
+  let bestDist = MAX_LEVENSHTEIN + 1;
+  const maxLen = word.length + MAX_LEVENSHTEIN;
+  const minLen = Math.max(1, word.length - MAX_LEVENSHTEIN);
+
+  for (const v of vocabIndex.keys()) {
+    if (v.length < minLen || v.length > maxLen) continue;
+    const d = levenshtein(word, v);
+    if (d < bestDist) {
+      bestDist = d;
+      best = v;
+      if (d === 1) break;
+    }
+  }
+
+  if (best && bestDist <= MAX_LEVENSHTEIN) return { word: best, corrected: true };
+  return { word, corrected: false };
+}
+
+function correctWords(words, vocabIndex) {
+  const out = [];
+  let anyCorrected = false;
+  for (const w of words) {
+    const r = correctWord(w, vocabIndex);
+    if (r.corrected) anyCorrected = true;
+    out.push(r.word);
+  }
+  return { words: out, anyCorrected };
 }
 
 function userFile(userId) { return path.join(DATA_DIR, `user_${userId}.json`); }
@@ -199,7 +256,7 @@ function predict(data, W, words) {
   for (let i = 0; i < output.length; i++) {
     if (output[i] > maxVal) { maxVal = output[i]; maxIdx = i; }
   }
-  return { idx: maxIdx, val: maxVal, output };
+  return { idx: maxIdx, val: maxVal };
 }
 
 function sendMessage(chatId, text, extra) {
@@ -297,38 +354,15 @@ function addExample(userId, question, answer) {
   return parts.join(' · ');
 }
 
-function retrain(userId) {
-  const data = loadUserData(userId);
-  if (data.dataset.length === 0) return null;
-  rebuildVocabulary(data);
-  rebuildIntents(data);
-  const result = trainFull(data);
-  if (!result) return null;
-  data.W = result.W;
-  saveUserData(userId);
-  return result;
-}
-
-function predictFor(userId, text) {
-  const data = loadUserData(userId);
-  if (!data.W || data.vocabulary.length === 0 || data.intents.length === 0) return null;
-  const words = getWords(text);
-  const pred = predict(data, data.W, words);
-  if (!pred) return null;
-  if (pred.val < CONFIDENCE) return { low: true, val: pred.val, response: data.intents[pred.idx] };
-  return { low: false, val: pred.val, response: data.intents[pred.idx] };
-}
-
 function showHelp(chatId) {
   const text =
     '<b>Нейросеть на JS</b>\n\n' +
-    'Обучается на парах «вопрос → ответ». Данные хранятся отдельно, сеть переобучается с нуля после каждой пары — поэтому не забывает старое.\n\n' +
+    'Обучение — только через <code>/teach</code>. Обычные сообщения — это вопросы.\n' +
+    'Бот распознаёт опечатки (до 2 символов разницы в слове).\n\n' +
     '<b>Обучение</b>\n' +
-    'Просто напиши фразу — я повторю её и жду ответ.\n' +
-    'Ответь — запомню пару.\n\n' +
-    'Быстро:\n' +
-    '<code>/teach вопрос = ответ</code>\n\n' +
-    '<b>Управление</b>\n' +
+    '<code>/teach вопрос = ответ</code> — сразу\n' +
+    '<code>/teach вопрос</code> — и следующим сообщением ответ\n\n' +
+    '<b>Управление парами</b>\n' +
     '/list — все пары\n' +
     '/show &lt;номер&gt; — подробности\n' +
     '/del &lt;номер&gt; — удалить пару\n' +
@@ -337,7 +371,7 @@ function showHelp(chatId) {
     '/retrain — переобучить сеть\n\n' +
     '<b>Данные</b>\n' +
     '/export — скачать базу\n' +
-    '/import — как импортировать (отправь JSON)\n' +
+    '/import — как импортировать\n' +
     '/stats — статистика\n' +
     '/reset — стереть всё\n\n' +
     '/cancel — отмена';
@@ -410,7 +444,8 @@ function showStats(chatId, data) {
   out += `Интентов (ответов): <b>${data.intents.length}</b>\n`;
   out += `Нейронов скрытого слоя: <b>${HIDDEN_DIM}</b>\n`;
   out += `Синапсов: <b>${totalWeights}</b>\n`;
-  out += `Порог уверенности: <b>${(CONFIDENCE * 100).toFixed(0)}%</b>`;
+  out += `Порог уверенности: <b>${(CONFIDENCE * 100).toFixed(0)}%</b>\n`;
+  out += `Макс. опечаток в слове: <b>${MAX_LEVENSHTEIN}</b>`;
   sendMessage(chatId, out, { parse_mode: 'HTML' });
 }
 
@@ -531,8 +566,13 @@ function handleMessage(chatId, userId, text, document) {
     }
 
     if (cmd === '/retrain') {
-      const r = retrain(userId);
-      if (!r) { sendMessage(chatId, 'нечего обучать'); return; }
+      if (data.dataset.length === 0) { sendMessage(chatId, 'нечего обучать'); return; }
+      rebuildVocabulary(data);
+      rebuildIntents(data);
+      const r = trainFull(data);
+      if (!r) { sendMessage(chatId, 'не удалось'); return; }
+      data.W = r.W;
+      saveUserData(userId);
       sendMessage(chatId, `переобучено: ${r.examples} пар, ошибка ${r.firstErr.toFixed(2)}→${r.lastErr.toFixed(2)}`);
       return;
     }
@@ -587,31 +627,42 @@ function handleMessage(chatId, userId, text, document) {
     return;
   }
 
-  if (p && p.type === 'echo') {
-    pending.delete(userId);
-    const report = addExample(userId, p.question, trimmedText);
-    if (report) sendMessage(chatId, 'запомнил: ' + report);
-    else sendMessage(chatId, 'не удалось');
-    return;
-  }
-
   if (rawWords.length === 0) return;
 
   if (data.dataset.length === 0 || !data.W) {
-    pending.set(userId, { type: 'echo', question: trimmedText });
-    sendMessage(chatId, escapeHtml(trimmedText) + '\n\n<i>чему учить?</i>', { parse_mode: 'HTML' });
+    sendMessage(chatId, 'я ещё ничего не знаю. обучи через /teach');
     return;
   }
 
-  const pred = predictFor(userId, trimmedText);
-  if (pred && !pred.low) {
-    sendMessage(chatId, pred.response);
+  const vocabIndex = new Map();
+  data.vocabulary.forEach(w => vocabIndex.set(w, true));
+
+  const { words: correctedWords, anyCorrected } = correctWords(rawWords, vocabIndex);
+
+  const pred = predict(data, data.W, correctedWords);
+  if (!pred) {
+    sendMessage(chatId, 'не понял. обучи через /teach');
     return;
   }
 
-  pending.set(userId, { type: 'echo', question: trimmedText });
-  const conf = pred ? ` (уверенность ${(pred.val * 100).toFixed(0)}%)` : ' (нет сигнала)';
-  sendMessage(chatId, escapeHtml(trimmedText) + `\n\n<i>не уверен${conf}. чему учить?</i>`, { parse_mode: 'HTML' });
+  if (pred.val < CONFIDENCE) {
+    sendMessage(chatId, `не уверен (${(pred.val * 100).toFixed(0)}%). обучи через /teach`);
+    return;
+  }
+
+  let reply = data.intents[pred.idx];
+
+  if (anyCorrected) {
+    const original = rawWords.join(' ');
+    const fixed = correctedWords.join(' ');
+    if (original !== fixed) {
+      reply += `\n\n<i>исправил: «${escapeHtml(original)}» → «${escapeHtml(fixed)}»</i>`;
+      sendMessage(chatId, reply, { parse_mode: 'HTML' });
+      return;
+    }
+  }
+
+  sendMessage(chatId, reply);
 }
 
 let offset = 0;
