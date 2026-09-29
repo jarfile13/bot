@@ -24,7 +24,6 @@ const userMemories = new Map();
 const lastMessages = new Map();
 const pendingReset = new Map();
 const pendingForget = new Map();
-const lastList = new Map();
 
 const PAGE_SIZE = 10;
 
@@ -39,6 +38,8 @@ function loadUserMemory(userId) {
   if (fs.existsSync(file)) {
     try { memory = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { memory = []; }
   }
+  if (!Array.isArray(memory)) memory = [];
+  memory = memory.filter(e => e && e.tokens && Array.isArray(e.tokens.words) && Array.isArray(e.tokens.ngrams) && Array.isArray(e.answers));
   userMemories.set(userId, memory);
   return memory;
 }
@@ -62,9 +63,9 @@ function cleanText(str) {
 }
 
 function tokenize(str) {
-  const words = cleanText(str).split(' ').filter(word => word.length >= 1);
-  const ngrams = [];
   const text = cleanText(str);
+  const words = text.split(' ').filter(word => word.length >= 1);
+  const ngrams = [];
   for (let i = 0; i < text.length - 2; i++) {
     ngrams.push(text.substring(i, i + 3));
   }
@@ -153,7 +154,7 @@ function findBestAnswer(userTokens, memory) {
   for (const entry of memory) {
     const wordInter = userTokens.words.filter(w => entry.tokens.words.includes(w));
     const wordUni = new Set([...userTokens.words, ...entry.tokens.words]);
-    const wordScore = wordInter.length / wordUni.size;
+    const wordScore = wordUni.size > 0 ? wordInter.length / wordUni.size : 0;
 
     const ngramInter = userTokens.ngrams.filter(n => entry.tokens.ngrams.includes(n));
     const ngramUni = new Set([...userTokens.ngrams, ...entry.tokens.ngrams]);
@@ -180,7 +181,7 @@ function learn(userId, question, answer, memory) {
   const existing = memory.find(entry => {
     const inter = qTokens.words.filter(w => entry.tokens.words.includes(w));
     const uni = new Set([...qTokens.words, ...entry.tokens.words]);
-    return (inter.length / uni.size) > 0.85;
+    return uni.size > 0 && (inter.length / uni.size) > 0.85;
   });
 
   if (existing) {
@@ -281,7 +282,6 @@ function showList(chatId, userId, memory, page) {
     text += `\n\nСледующая: /list ${p + 1}`;
   }
 
-  lastList.set(userId, p);
   sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
 
@@ -397,9 +397,10 @@ function handleMessage(chatId, userId, text, document) {
     downloadFile(document.file_id, (content) => {
       try {
         const importedData = JSON.parse(content);
-        if (Array.isArray(importedData) && importedData.every(e => e.tokens && Array.isArray(e.answers))) {
-          saveUserMemory(userId, importedData);
-          sendMessage(chatId, `Импортировано ${importedData.length} фраз.`);
+        if (Array.isArray(importedData)) {
+          const valid = importedData.filter(e => e && e.tokens && Array.isArray(e.tokens.words) && Array.isArray(e.tokens.ngrams) && Array.isArray(e.answers));
+          saveUserMemory(userId, valid);
+          sendMessage(chatId, `Импортировано ${valid.length} фраз.`);
         } else {
           sendMessage(chatId, 'Некорректный формат файла.');
         }
@@ -415,11 +416,18 @@ function handleMessage(chatId, userId, text, document) {
     const cmd = parts[0].toLowerCase();
     const arg = parts.slice(1).join(' ');
 
-    if (cmd === '/start' || cmd === '/help') { showHelp(chatId); return; }
+    if (cmd === '/start' || cmd === '/help') {
+      lastMessages.delete(userId);
+      pendingReset.delete(userId);
+      pendingForget.delete(userId);
+      showHelp(chatId);
+      return;
+    }
 
     if (cmd === '/cancel') {
       pendingReset.delete(userId);
       pendingForget.delete(userId);
+      lastMessages.delete(userId);
       sendMessage(chatId, 'Действие отменено.');
       return;
     }
