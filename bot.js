@@ -66,7 +66,7 @@ function tokenize(str) {
 
 function sendMessage(chatId, text) {
   const data = JSON.stringify({ chat_id: chatId, text: text });
-  const req = https.request(`https://telegram.org{BOT_TOKEN}/sendMessage`, {
+  const req = https.request(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Content-Length': data.length }
   });
@@ -91,7 +91,7 @@ function sendDocument(chatId, filePath, caption) {
 
     const footer = `\r\n--${boundary}--\r\n`;
 
-    const req = https.request(`https://telegram.org{BOT_TOKEN}/sendDocument`, {
+    const req = https.request(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`, {
       method: 'POST',
       headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }
     });
@@ -107,14 +107,14 @@ function sendDocument(chatId, filePath, caption) {
 }
 
 function downloadFile(fileId, callback) {
-  https.get(`https://telegram.org{BOT_TOKEN}/getFile?file_id=${fileId}`, (res) => {
+  https.get(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`, (res) => {
     let data = '';
     res.on('data', chunk => data += chunk);
     res.on('end', () => {
       try {
         const json = JSON.parse(data);
         if (json.ok && json.result.file_path) {
-          https.get(`https://telegram.org{BOT_TOKEN}/${json.result.file_path}`, (fileRes) => {
+          https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${json.result.file_path}`, (fileRes) => {
             let fileContent = '';
             fileRes.on('data', chunk => fileContent += chunk);
             fileRes.on('end', () => callback(fileContent));
@@ -162,7 +162,7 @@ function learn(userId, question, answer, memory) {
   if (qTokens.words.length === 0 || !answer.trim()) return;
 
   let existing = memory.find(entry => {
-    const inter = qWords.filter(w => entry.tokens.words.includes(w));
+    const inter = qTokens.words.filter(w => entry.tokens.words.includes(w));
     const uni = new Set([...qTokens.words, ...entry.tokens.words]);
     return (inter.length / uni.size) > 0.85;
   });
@@ -204,7 +204,7 @@ function handleMessage(chatId, userId, text, document) {
 
   if (text && text.startsWith('/')) {
     if (text === '/start' || text === '/help') {
-      sendMessage(chatId, 'Привет! Я твой персональный текстовый ИИ. Я учусь прямо в процессе нашего общения.\n\nКоманды:\n/start или /help - Вывод этой справки\n/reset - Полностью стереть свою память\n/export - Скачать свою базу знаний\n/forget [фраза] - Забыть конкретную фразу\n/stats - Посмотреть объем памяти');
+      sendMessage(chatId, 'Привет! Я учусь прямо в процессе нашего общения.\n\nКоманды:\n/start или /help - Вывод этой справки\n/reset - Полностью стереть свою память\n/export - Скачать свою базу знаний\n/forget [фраза] - Забыть конкретную фразу\n/stats - Посмотреть объем памяти');
       return;
     }
     if (text === '/reset') {
@@ -268,7 +268,7 @@ function handleMessage(chatId, userId, text, document) {
 
 let offset = 0;
 function getUpdates() {
-  https.get(`https://telegram.org{BOT_TOKEN}/getUpdates?offset=${offset}&timeout=30`, (res) => {
+  https.get(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset}&timeout=30`, (res) => {
     let data = '';
     res.on('data', chunk => data += chunk);
     res.on('end', () => {
