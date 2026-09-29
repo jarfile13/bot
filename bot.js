@@ -424,8 +424,7 @@ const HELP = [
   '',
   '/teach вопрос = ответ',
   '/learn слово = синоним1, синоним2',
-  '/delete вопрос',
-  '/forget слово = синоним',
+  '/delete <вопрос или слово> — удалить пару или синоним',
   '/list [стр] — список пар',
   '/syn [стр] — список синонимов',
   '/syn слово — синонимы конкретного слова',
@@ -619,21 +618,53 @@ async function handle(chat, text, isGroup, replyTo) {
 
     if (t.startsWith('/delete')) {
       const rest = t.slice(7).trim();
-      if (!rest) return send(chat, 'Формат: /delete вопрос');
+      if (!rest) return send(chat, 'Формат: /delete <вопрос или слово>');
       await ensureLoaded(brain);
       const key = lc(rest);
+
       const idx = brain.pairs.findIndex(p => lc(p.question) === key);
-      if (idx < 0) return send(chat, `Не нашёл: ${key}`);
+      if (idx >= 0) {
+        try {
+          brain.pairs.splice(idx, 1);
+          brain.dirty = true;
+          rebuildEmbeddings(brain);
+          reindexVectors(brain);
+          await persistLocal(brain);
+          return send(chat, `Удалил пару: ${rest}`);
+        } catch (e) {
+          console.error('delete pair', e.message);
+          return send(chat, 'Ошибка удаления пары: ' + e.message);
+        }
+      }
+
+      let touched = 0;
+      const peers = new Set();
+      const own = brain.syn.get(key);
+      if (own) { for (const p of own) peers.add(p); }
+      for (const [w, set] of brain.syn) {
+        if (set.has(key)) peers.add(w);
+      }
+
+      if (own || peers.size) {
+        for (const p of peers) {
+          const s = brain.syn.get(p);
+          if (s) { s.delete(key); touched++; }
+        }
+        if (own) { own.clear(); touched++; }
+        brain.syn.delete(key);
+      }
+
+      if (!touched) return send(chat, `Не нашёл: ${key}`);
+
       try {
-        brain.pairs.splice(idx, 1);
         brain.dirty = true;
         rebuildEmbeddings(brain);
         reindexVectors(brain);
         await persistLocal(brain);
-        return send(chat, `Удалил: ${rest}`);
+        return send(chat, `Удалил синоним: ${key} (затронуто связей: ${touched})`);
       } catch (e) {
-        console.error('delete', e.message);
-        return send(chat, 'Ошибка удаления: ' + e.message);
+        console.error('delete syn', e.message);
+        return send(chat, 'Ошибка удаления синонима: ' + e.message);
       }
     }
 
@@ -661,29 +692,6 @@ async function handle(chat, text, isGroup, replyTo) {
       } catch (e) {
         console.error('learn', e.message);
         return send(chat, 'Ошибка сохранения: ' + e.message);
-      }
-    }
-
-    if (t.startsWith('/forget')) {
-      const rest = t.slice(7).trim();
-      const parts = rest.split('=');
-      if (parts.length < 2) return send(chat, 'Формат: /forget слово = синоним');
-      const a = lc(parts[0].trim());
-      const b = lc(parts[1].trim());
-      if (!a || !b) return send(chat, 'Пусто.');
-      await ensureLoaded(brain);
-      const sa = brain.syn.get(a), sb = brain.syn.get(b);
-      if (sa) sa.delete(b);
-      if (sb) sb.delete(a);
-      try {
-        brain.dirty = true;
-        rebuildEmbeddings(brain);
-        reindexVectors(brain);
-        await persistLocal(brain);
-        return send(chat, `Разъединил: ${a} ✕ ${b}`);
-      } catch (e) {
-        console.error('forget', e.message);
-        return send(chat, 'Ошибка: ' + e.message);
       }
     }
 
