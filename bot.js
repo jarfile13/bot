@@ -6,18 +6,11 @@ const path = require('path');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATA_DIR = process.env.DATA_DIR || './data';
 
-const WINDOW = 5;
-const MIN_WORD_FREQ = 1;
-const MIN_COOC = 1;
-const SIM_THRESHOLD = 0.45;
+const SIM_THRESHOLD = 0.55;
 const MIN_SIM = 0.25;
-const W_COS = 0.25;
-const W_JAC = 0.35;
-const W_BM = 0.30;
-const W_EXACT = 0.10;
+const MIN_COVERAGE = 0.25;
 const BM25_K1 = 1.5;
 const BM25_B = 0.75;
-const BM25_MID = 1.5;
 const LIST_PAGE = 20;
 const MAX_BRAINS = 200;
 const DEBUG = true;
@@ -63,11 +56,9 @@ function makeBrain(scope) {
     anchors: new Set(),
     loaded: false,
     loading: null,
-    vocab: new Map(),
+    df: new Map(),
     idf: new Map(),
-    wordVec: new Map(),
-    avgPairLen: 5,
-    ready: false,
+    avgLen: 5,
     dirty: true,
     file: path.join(DATA_DIR, safeName(scope) + '.json'),
   };
@@ -94,6 +85,12 @@ function expand(brain, word) {
   const out = new Set([word]);
   const s = brain.syn.get(word);
   if (s) for (const x of s) out.add(x);
+  return out;
+}
+
+function expandAll(brain, ws) {
+  const out = new Set();
+  for (const w of ws) for (const v of expand(brain, w)) out.add(v);
   return out;
 }
 
@@ -150,210 +147,98 @@ function sortedSynGroups(brain) {
   return groups;
 }
 
-function buildVocab(brain) {
+function buildStats(brain) {
   const df = new Map();
+  let totalLen = 0;
   for (const p of brain.pairs) {
+    const ws = tokenize(p.question);
+    totalLen += ws.length;
     const seen = new Set();
-    for (const w of tokenize(p.question)) {
+    for (const w of ws) {
       if (!seen.has(w)) { seen.add(w); df.set(w, (df.get(w) || 0) + 1); }
     }
   }
-  const vocab = new Map();
-  let id = 0;
-  for (const [w, c] of df) {
-    if (c >= MIN_WORD_FREQ) vocab.set(w, id++);
-  }
-  brain.vocab = vocab;
-  brain.df = df;
   const N = brain.pairs.length || 1;
   const idf = new Map();
   for (const [w, c] of df) {
-    idf.set(w, Math.log((N + 1) / (c + 1)) + 1);
+    idf.set(w, Math.log((N - c + 0.5) / (c + 0.5) + 1));
   }
+  brain.df = df;
   brain.idf = idf;
-  log('buildVocab', brain.scope, 'words:', vocab.size, 'pairs:', brain.pairs.length);
+  brain.avgLen = brain.pairs.length ? totalLen / brain.pairs.length : 5;
+  log('buildStats', brain.scope, 'words:', df.size, 'pairs:', brain.pairs.length, 'avgLen:', brain.avgLen.toFixed(2));
 }
 
-function buildCooc(brain) {
-  const V = brain.vocab.size;
-  if (!V) { brain.wordVec = new Map(); return; }
-  const rows = new Map();
-  const addEntry = (a, b) => {
-    let r = rows.get(a);
-    if (!r) { r = new Map(); rows.set(a, r); }
-    r.set(b, (r.get(b) || 0) + 1);
-  };
-  for (const p of brain.pairs) {
-    const ws = tokenize(p.question).filter(w => brain.vocab.has(w));
-    for (let i = 0; i < ws.length; i++) {
-      for (let j = i + 1; j < ws.length && j <= i + WINDOW; j++) {
-        addEntry(ws[i], ws[j]);
-        addEntry(ws[j], ws[i]);
-      }
-    }
-  }
-  const total = new Map();
-  let sum = 0;
-  for (const [w, m] of rows) {
-    let t = 0;
-    for (const c of m.values()) t += c;
-    total.set(w, t);
-    sum += t;
-  }
-  if (!sum) {
-    const fallback = new Map();
-    for (const [w, id] of brain.vocab) {
-      const v = new Float64Array(V);
-      v[id] = 1;
-      fallback.set(w, v);
-    }
-    brain.wordVec = fallback;
-    log('buildCooc', brain.scope, 'empty cooc, using one-hot');
-    return;
-  }
-
-  const wordVec = new Map();
-  for (const [w, id] of brain.vocab) {
-    const vec = new Float64Array(V);
-    const m = rows.get(w);
-    const tw = total.get(w) || 1;
-    if (m) {
-      for (const [c, cnt] of m) {
-        if (cnt < MIN_COOC) continue;
-        if (!brain.vocab.has(c)) continue;
-        const tc = total.get(c) || 1;
-        const pmi = Math.log((cnt * sum) / (tw * tc));
-        if (pmi > 0) vec[brain.vocab.get(c)] = pmi;
-      }
-    }
-    let norm = 0;
-    for (let i = 0; i < V; i++) norm += vec[i] * vec[i];
-    norm = Math.sqrt(norm);
-    if (norm === 0) {
-      vec[id] = 1;
-    } else {
-      for (let i = 0; i < V; i++) vec[i] /= norm;
-    }
-    wordVec.set(w, vec);
-  }
-  brain.wordVec = wordVec;
-  log('buildCooc', brain.scope, 'vocab:', V, 'vecs:', wordVec.size);
+function idfOf(brain, w) {
+  return brain.idf.get(w) || 0;
 }
 
-function embedText(brain, text) {
-  if (!brain.wordVec || !brain.wordVec.size) return null;
-  const dim = brain.vocab.size;
-  if (!dim) return null;
-  const ws = tokenize(text);
-  if (!ws.length) return null;
-  const acc = new Float64Array(dim);
-  let count = 0;
-  for (const w of ws) {
-    for (const v of expand(brain, w)) {
-      const vec = brain.wordVec.get(v);
-      if (!vec) continue;
-      const weight = brain.idf.get(v) || 1;
-      for (let i = 0; i < dim; i++) acc[i] += vec[i] * weight;
-      count++;
-    }
-  }
-  if (!count) return null;
-  let norm = 0;
-  for (let i = 0; i < dim; i++) norm += acc[i] * acc[i];
-  norm = Math.sqrt(norm);
-  if (norm === 0) return null;
-  const out = new Float64Array(dim);
-  for (let i = 0; i < dim; i++) out[i] = acc[i] / norm;
-  return out;
-}
-
-function cosine(a, b) {
-  const len = Math.min(a.length, b.length);
-  let dot = 0;
-  for (let i = 0; i < len; i++) dot += a[i] * b[i];
-  return dot;
-}
-
-function jaccard(aWords, bWords) {
-  if (!aWords.length || !bWords.length) return 0;
-  const setA = new Set(aWords);
-  const setB = new Set(bWords);
-  let inter = 0;
-  for (const w of setA) if (setB.has(w)) inter++;
-  const union = setA.size + setB.size - inter;
-  return union ? inter / union : 0;
-}
-
-function bm25(brain, queryWords, pairWords) {
-  if (!queryWords.length || !pairWords.length) return 0;
-  const N = brain.pairs.length || 1;
-  const avgdl = brain.avgPairLen || 5;
+function bm25(brain, querySet, pairWords) {
+  if (!pairWords.length || !querySet.size) return 0;
   const dl = pairWords.length;
-
+  const avgdl = brain.avgLen || 5;
   const counts = new Map();
   for (const w of pairWords) counts.set(w, (counts.get(w) || 0) + 1);
-
   let score = 0;
-  const seen = new Set();
-  for (const w of queryWords) {
-    if (seen.has(w)) continue;
-    seen.add(w);
+  for (const w of querySet) {
     const tf = counts.get(w) || 0;
     if (!tf) continue;
-    const df = brain.df.get(w) || 0;
-    const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1);
+    const idf = idfOf(brain, w);
     score += idf * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / avgdl));
   }
   return score;
 }
 
-function sigmoid(x) {
-  return 1 / (1 + Math.exp(-x));
+function coverage(brain, queryWords, querySet, pairSet) {
+  if (!queryWords.length) return 0;
+  let totalW = 0;
+  let foundW = 0;
+  const seen = new Set();
+  for (const w of queryWords) {
+    if (seen.has(w)) continue;
+    seen.add(w);
+    const idf = idfOf(brain, w);
+    if (idf <= 0) continue;
+    totalW += idf;
+    let hit = false;
+    for (const v of expand(brain, w)) {
+      if (pairSet.has(v)) { hit = true; break; }
+    }
+    if (hit) foundW += idf;
+  }
+  return totalW ? foundW / totalW : 0;
 }
 
-function rebuildEmbeddings(brain) {
-  buildVocab(brain);
-  buildCooc(brain);
-  let total = 0;
-  for (const p of brain.pairs) total += tokenize(p.question).length;
-  brain.avgPairLen = brain.pairs.length ? total / brain.pairs.length : 5;
-  brain.ready = true;
+function rebuild(brain) {
+  buildStats(brain);
   brain.dirty = false;
 }
 
-function reindexVectors(brain) {
-  for (const p of brain.pairs) {
-    const v = embedText(brain, p.question);
-    p.vector = v;
-  }
-  const good = brain.pairs.filter(p => p.vector).length;
-  log('reindexVectors', brain.scope, 'with vector:', good, '/', brain.pairs.length);
-}
-
-function computeScore(brain, qVec, inputWords, inputKey, p) {
-  const pWords = tokenize(p.question);
+function computeScore(brain, queryWords, querySet, inputKey, pair) {
+  const pWords = tokenize(pair.question);
   if (!pWords.length) return null;
-  const exact = lc(p.question) === inputKey ? 1 : 0;
-  const cos = (qVec && p.vector) ? Math.max(0, cosine(qVec, p.vector)) : 0;
-  const jac = jaccard(inputWords, pWords);
-  const bm = bm25(brain, inputWords, pWords);
-  const bmn = sigmoid(bm - BM25_MID);
-  const score = W_COS * cos + W_JAC * jac + W_BM * bmn + W_EXACT * exact;
-  return { score, cos, jac, bm, bmn, exact };
+  const pSet = new Set(pWords);
+  const bm = bm25(brain, querySet, pWords);
+  const cov = coverage(brain, queryWords, querySet, pSet);
+  const exact = lc(pair.question) === inputKey ? 1 : 0;
+  const idfSum = [...querySet].reduce((s, w) => s + idfOf(brain, w), 0) || 1;
+  const bmNorm = bm / (bm + idfSum);
+  const score = 0.6 * bmNorm + 0.3 * cov + 0.1 * exact;
+  return { score, bm, bmNorm, cov, exact };
 }
 
 function answerFor(brain, input) {
-  if (!brain.pairs.length) { log('answerFor: no pairs'); return null; }
+  if (!brain.pairs.length) return null;
   const key = lc(input);
-  const inputWords = tokenize(input);
-  if (!inputWords.length) return null;
-  if (!brain.ready) { log('answerFor: not ready'); return null; }
+  const queryWords = tokenize(input);
+  if (!queryWords.length) return null;
+  const querySet = expandAll(brain, queryWords);
 
-  const qVec = embedText(brain, input);
   const scored = [];
   for (let i = 0; i < brain.pairs.length; i++) {
-    const s = computeScore(brain, qVec, inputWords, key, brain.pairs[i]);
+    const s = computeScore(brain, queryWords, querySet, key, brain.pairs[i]);
     if (!s) continue;
+    if (s.cov < MIN_COVERAGE && s.exact === 0) continue;
     scored.push({ idx: i, ...s });
   }
 
@@ -362,9 +247,8 @@ function answerFor(brain, input) {
   log('answerFor:', input, '=>', JSON.stringify(top.map(t => ({
     q: brain.pairs[t.idx].question,
     s: Number(t.score.toFixed(4)),
-    cos: Number(t.cos.toFixed(3)),
-    jac: Number(t.jac.toFixed(3)),
     bm: Number(t.bm.toFixed(3)),
+    cov: Number(t.cov.toFixed(3)),
     exact: t.exact,
   }))));
 
@@ -402,7 +286,7 @@ async function loadLocal(brain) {
 
 async function ensureLoaded(brain) {
   if (brain.loaded) {
-    if (brain.dirty) { rebuildEmbeddings(brain); reindexVectors(brain); }
+    if (brain.dirty) rebuild(brain);
     return brain;
   }
   if (brain.loading) return brain.loading;
@@ -416,9 +300,8 @@ async function ensureLoaded(brain) {
         await persistLocal(brain);
       }
       brain.loaded = true;
-      rebuildEmbeddings(brain);
-      reindexVectors(brain);
-      log('Loaded', brain.scope, 'pairs:', brain.pairs.length, 'vocab:', brain.vocab.size, 'vecs:', brain.wordVec.size);
+      rebuild(brain);
+      log('Loaded', brain.scope, 'pairs:', brain.pairs.length, 'words:', brain.df.size);
       return brain;
     } finally {
       brain.loading = null;
@@ -491,7 +374,7 @@ async function downloadFile(fileId) {
 }
 
 const HELP = [
-  'Бот с самообучающимися эмбеддингами (чистый JS).',
+  'Бот с поисковым движком BM25 (чистый JS, без хардкода слов).',
   '',
   '/teach вопрос = ответ',
   '/learn слово = синоним1, синоним2',
@@ -503,7 +386,7 @@ const HELP = [
   '/syn слово — синонимы конкретного слова',
   '/stats',
   '/debug слово — что видит бот',
-  '/reindex — пересчитать эмбеддинги',
+  '/reindex — пересчитать статистику',
   '/export — выгрузить свой мозг',
   '/import (реплай на JSON) — залить мозг',
 ].join('\n');
@@ -519,16 +402,13 @@ async function handle(chat, text, isGroup, replyTo) {
     if (t === '/stats') {
       await ensureLoaded(brain);
       const links = [...brain.syn.values()].reduce((s, set) => s + set.size, 0);
-      const withVec = brain.pairs.filter(p => p.vector).length;
       return send(chat, [
         `Скоуп: ${scope}`,
         `Пар: ${brain.pairs.length}`,
-        `С вектором: ${withVec}`,
-        `Слов в словаре: ${brain.vocab.size}`,
-        `Векторов слов: ${brain.wordVec.size}`,
+        `Уникальных слов: ${brain.df.size}`,
         `Синонимов: ${brain.syn.size} (связей ${links})`,
         `Якорей: ${brain.anchors.size}`,
-        `Средняя длина: ${brain.avgPairLen.toFixed(2)}`,
+        `Средняя длина: ${brain.avgLen.toFixed(2)}`,
       ].join('\n'));
     }
 
@@ -536,15 +416,14 @@ async function handle(chat, text, isGroup, replyTo) {
       await ensureLoaded(brain);
       const word = t.slice(7).trim();
       const lcW = lc(word);
-      const inVocab = brain.vocab.has(lcW);
-      const inVec = brain.wordVec.has(lcW);
       const syn = brain.syn.get(lcW);
       const df = brain.df.get(lcW) || 0;
-      const inputWords = tokenize(word);
-      const qVec = embedText(brain, word);
+      const idf = idfOf(brain, lcW);
+      const queryWords = tokenize(word);
+      const querySet = expandAll(brain, queryWords);
       const scored = [];
       for (let i = 0; i < brain.pairs.length; i++) {
-        const s = computeScore(brain, qVec, inputWords, lcW, brain.pairs[i]);
+        const s = computeScore(brain, queryWords, querySet, lcW, brain.pairs[i]);
         if (!s) continue;
         scored.push({ idx: i, ...s });
       }
@@ -552,25 +431,23 @@ async function handle(chat, text, isGroup, replyTo) {
       const top = scored.slice(0, 5);
       const lines = [
         `Слово: "${lcW}"`,
-        `В словаре: ${inVocab}`,
-        `Вектор есть: ${inVec}`,
         `Частота (df): ${df}`,
+        `IDF: ${idf.toFixed(3)}`,
         `Якорь: ${brain.anchors.has(lcW)}`,
         `Синонимы: ${syn && syn.size ? [...syn].join(', ') : '—'}`,
-        `Вектор запроса: ${qVec ? 'да' : 'нет'}`,
+        `Слов в запросе: ${queryWords.length}, с синонимами: ${querySet.size}`,
       ];
       for (const s of top) {
-        lines.push(`  • ${brain.pairs[s.idx].question} → ${s.score.toFixed(4)} (cos=${s.cos.toFixed(3)}, jac=${s.jac.toFixed(3)}, bm=${s.bm.toFixed(3)}, exact=${s.exact})`);
+        lines.push(`  • ${brain.pairs[s.idx].question} → ${s.score.toFixed(4)} (bm=${s.bm.toFixed(3)}, cov=${s.cov.toFixed(3)}, exact=${s.exact})`);
       }
       return send(chat, lines.join('\n'));
     }
 
     if (t === '/reindex') {
       await ensureLoaded(brain);
-      rebuildEmbeddings(brain);
-      reindexVectors(brain);
+      rebuild(brain);
       await persistLocal(brain);
-      return send(chat, `Пересчитал. Слов: ${brain.vocab.size}, векторов: ${brain.wordVec.size}`);
+      return send(chat, `Пересчитал. Слов: ${brain.df.size}, пар: ${brain.pairs.length}`);
     }
 
     if (t === '/list' || t.startsWith('/list ')) {
@@ -666,8 +543,7 @@ async function handle(chat, text, isGroup, replyTo) {
         }
         for (const a of anchors) brain.anchors.add(lc(a));
         brain.dirty = true;
-        rebuildEmbeddings(brain);
-        reindexVectors(brain);
+        rebuild(brain);
         await persistLocal(brain);
         return send(chat, `Импортировано пар: ${added}, синонимов: ${syn.length}, якорей: ${anchors.length}`);
       } catch (e) {
@@ -691,10 +567,9 @@ async function handle(chat, text, isGroup, replyTo) {
         if (idx >= 0) brain.pairs[idx] = newPair;
         else brain.pairs.push(newPair);
         brain.dirty = true;
-        rebuildEmbeddings(brain);
-        reindexVectors(brain);
+        rebuild(brain);
         await persistLocal(brain);
-        return send(chat, `Запомнил: ${q} = ${a}\nПар: ${brain.pairs.length}, слов: ${brain.vocab.size}`);
+        return send(chat, `Запомнил: ${q} = ${a}\nПар: ${brain.pairs.length}, слов: ${brain.df.size}`);
       } catch (e) {
         console.error('teach', e.message);
         return send(chat, 'Ошибка сохранения: ' + e.message);
@@ -737,8 +612,7 @@ async function handle(chat, text, isGroup, replyTo) {
         }
 
         brain.dirty = true;
-        rebuildEmbeddings(brain);
-        reindexVectors(brain);
+        rebuild(brain);
         await persistLocal(brain);
         const mains = toDelete.map(g => g.main).join(', ');
         return send(chat, `Удалил групп: ${toDelete.length} (${mains}). Слов убрано: ${removedWords}`);
@@ -751,8 +625,7 @@ async function handle(chat, text, isGroup, replyTo) {
         try {
           brain.pairs.splice(idx, 1);
           brain.dirty = true;
-          rebuildEmbeddings(brain);
-          reindexVectors(brain);
+          rebuild(brain);
           await persistLocal(brain);
           return send(chat, `Удалил пару: ${rest}`);
         } catch (e) {
@@ -772,8 +645,7 @@ async function handle(chat, text, isGroup, replyTo) {
           for (const m of group.members) set.delete(m);
         }
         brain.dirty = true;
-        rebuildEmbeddings(brain);
-        reindexVectors(brain);
+        rebuild(brain);
         await persistLocal(brain);
         return send(chat, `Удалил группу синонимов: ${group.main} (${group.members.length} слов)`);
       }
@@ -813,8 +685,7 @@ async function handle(chat, text, isGroup, replyTo) {
 
       try {
         brain.dirty = true;
-        rebuildEmbeddings(brain);
-        reindexVectors(brain);
+        rebuild(brain);
         await persistLocal(brain);
         return send(chat, `Связал: ${main} ↔ ${others.join(', ')}`);
       } catch (e) {
