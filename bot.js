@@ -4,8 +4,17 @@ const fs = require('fs');
 const path = require('path');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) {
+  console.error('[КРИТИЧЕСКАЯ ОШИБКА] Переменная BOT_TOKEN не задана!');
+  process.exit(1);
+}
+
 const DATA_DIR = process.env.DATA_DIR || './data';
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+try {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch (e) {
+  console.error('[ОШИБКА] Не удалось создать папку данных:', e.message);
+}
 
 http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(3000);
 
@@ -29,7 +38,11 @@ function loadUserMemory(userId) {
 
 function saveUserMemory(userId, memory) {
   userMemories.set(userId, memory);
-  fs.writeFileSync(getUserMemoryFile(userId), JSON.stringify(memory, null, 2), 'utf8');
+  try {
+    fs.writeFileSync(getUserMemoryFile(userId), JSON.stringify(memory, null, 2), 'utf8');
+  } catch (e) {
+    console.error('[ОШИБКА ЗАПИСИ ФАЙЛА]', e.message);
+  }
 }
 
 function cleanText(str) {
@@ -57,35 +70,40 @@ function sendMessage(chatId, text) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Content-Length': data.length }
   });
+  req.on('error', (e) => console.error('[ОШИБКА ОТПРАВКИ СООБЩЕНИЯ]', e.message));
   req.write(data);
   req.end();
 }
 
-// Изменено: теперь принимает filePath для отправки конкретного пользовательского файла
 function sendDocument(chatId, filePath, caption) {
-  const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
-  const filename = path.basename(filePath);
-  const fileData = fs.readFileSync(filePath);
+  try {
+    const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
+    const filename = path.basename(filePath);
+    const fileData = fs.readFileSync(filePath);
 
-  let header = `--${boundary}\r\n`;
-  header += `Content-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`;
-  header += `--${boundary}\r\n`;
-  header += `Content-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`;
-  header += `--${boundary}\r\n`;
-  header += `Content-Disposition: form-data; name="document"; filename="${filename}"\r\n`;
-  header += `Content-Type: application/json\r\n\r\n`;
+    let header = `--${boundary}\r\n`;
+    header += `Content-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`;
+    header += `--${boundary}\r\n`;
+    header += `Content-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`;
+    header += `--${boundary}\r\n`;
+    header += `Content-Disposition: form-data; name="document"; filename="${filename}"\r\n`;
+    header += `Content-Type: application/json\r\n\r\n`;
 
-  const footer = `\r\n--${boundary}--\r\n`;
+    const footer = `\r\n--${boundary}--\r\n`;
 
-  const req = https.request(`https://telegram.org{BOT_TOKEN}/sendDocument`, {
-    method: 'POST',
-    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }
-  });
+    const req = https.request(`https://telegram.org{BOT_TOKEN}/sendDocument`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }
+    });
 
-  req.write(header);
-  req.write(fileData);
-  req.write(footer);
-  req.end();
+    req.on('error', (e) => console.error('[ОШИБКА ОТПРАВКИ ДОКУМЕНТА]', e.message));
+    req.write(header);
+    req.write(fileData);
+    req.write(footer);
+    req.end();
+  } catch (e) {
+    console.error('[ОШИБКА ФАЙЛА ПРИ ЭКСПОРТЕ]', e.message);
+  }
 }
 
 function downloadFile(fileId, callback) {
@@ -101,10 +119,14 @@ function downloadFile(fileId, callback) {
             fileRes.on('data', chunk => fileContent += chunk);
             fileRes.on('end', () => callback(fileContent));
           });
+        } else {
+          console.error('[ОШИБКА ТГ] Не удалось получить путь к файлу:', json.description);
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error('[ОШИБКА СКАЧИВАНИЯ]', e.message);
+      }
     });
-  });
+  }).on('error', (e) => console.error('[ОШИБКА ЗАПРОСА СКАЧИВАНИЯ]', e.message));
 }
 
 function findBestAnswer(userTokens, memory) {
@@ -181,6 +203,10 @@ function handleMessage(chatId, userId, text, document) {
   }
 
   if (text && text.startsWith('/')) {
+    if (text === '/start' || text === '/help') {
+      sendMessage(chatId, 'Привет! Я твой персональный текстовый ИИ. Я учусь прямо в процессе нашего общения.\n\nКоманды:\n/start или /help - Вывод этой справки\n/reset - Полностью стереть свою память\n/export - Скачать свою базу знаний\n/forget [фраза] - Забыть конкретную фразу\n/stats - Посмотреть объем памяти');
+      return;
+    }
     if (text === '/reset') {
       const file = getUserMemoryFile(userId);
       if (fs.existsSync(file)) fs.unlinkSync(file);
@@ -216,10 +242,7 @@ function handleMessage(chatId, userId, text, document) {
       sendMessage(chatId, `Личная статистика ИИ:\nУникальных фраз: ${memory.length}\nВсего вариантов ответов: ${answersCount}`);
       return;
     }
-    if (text === '/help') {
-      sendMessage(chatId, 'Команды:\n/reset - Стереть свою память\n/export - Скачать свою базу знаний\n/forget [фраза] - Забыть фразу\n/stats - Посмотреть объем своей памяти');
-      return;
-    }
+    return;
   }
 
   if (!text) return;
@@ -251,19 +274,28 @@ function getUpdates() {
     res.on('end', () => {
       try {
         const json = JSON.parse(data);
-        if (json.ok && json.result.length > 0) {
-          for (const update of json.result) {
-            offset = update.update_id + 1;
-            if (update.message) {
-              // Изменено: теперь в handleMessage передается и chatId (куда писать) и userId (чья память)
-              handleMessage(update.message.chat.id, update.message.from.id, update.message.text, update.message.document);
+        if (json.ok) {
+          if (json.result.length > 0) {
+            for (const update of json.result) {
+              offset = update.update_id + 1;
+              if (update.message) {
+                handleMessage(update.message.chat.id, update.message.from.id, update.message.text, update.message.document);
+              }
             }
           }
+        } else {
+          console.error('[ОШИБКА TELEGRAM API]', json.description);
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error('[ОШИБКА ОБРАБОТКИ ПАКЕТА]', e.message);
+      }
       getUpdates();
     });
-  }).on('error', () => setTimeout(getUpdates, 1000));
+  }).on('error', (e) => {
+    console.error('[ОШИБКА СЕТИ getUpdates]', e.message);
+    setTimeout(getUpdates, 2000);
+  });
 }
 
+console.log('[РОБОТ] Запущен. Ожидание сообщений...');
 getUpdates();
