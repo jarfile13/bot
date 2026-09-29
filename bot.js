@@ -118,20 +118,6 @@ function stem(word) {
     return w;
 }
 
-function canonicalPhrase(phrase) {
-    const words = cleanText(phrase).split(' ').filter(Boolean);
-    const out = [];
-    for (const w of words) {
-        const syn = aiBrain.synonyms[w];
-        if (syn && syn.length) {
-            out.push(syn[0]);
-        } else {
-            out.push(w);
-        }
-    }
-    return out;
-}
-
 function tokenize(text) {
     const clean = cleanText(text);
     if (!clean) return [];
@@ -337,6 +323,39 @@ function buildListPage(page) {
     return out;
 }
 
+function buildSynListPage(page) {
+    const seen = new Set();
+    const groups = [];
+    for (const word in aiBrain.synonyms) {
+        if (seen.has(word)) continue;
+        const list = aiBrain.synonyms[word];
+        if (!list || !list.length) continue;
+        const group = [word, ...list];
+        for (const g of group) seen.add(g);
+        groups.push(group);
+    }
+    groups.sort((a, b) => a[0].localeCompare(b[0]));
+
+    const totalPages = Math.max(1, Math.ceil(groups.length / PAGE_SIZE));
+    if (page < 0) page = 0;
+    if (page >= totalPages) page = totalPages - 1;
+
+    const slice = groups.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+
+    let out = 'Синонимы | стр. ' + (page + 1) + '/' + totalPages + ' | всего групп: ' + groups.length + '\n\n';
+
+    slice.forEach((group, i) => {
+        const num = page * PAGE_SIZE + i + 1;
+        out += num + '. ' + group[0] + '\n';
+        if (group.length > 1) {
+            out += '   ~ ' + group.slice(1).join(', ') + '\n';
+        }
+        out += '\n';
+    });
+
+    return out;
+}
+
 function getStats() {
     const pairs = Object.keys(aiBrain.relations).length;
     let answers = 0;
@@ -359,6 +378,21 @@ function deletePair(question) {
     if (!aiBrain.relations[key]) return false;
     delete aiBrain.relations[key];
     delete aiBrain.originals[key];
+    saveBrainNow();
+    return true;
+}
+
+function deleteAnswer(question, answer) {
+    const tokens = tokenize(question);
+    const key = tokens.join(' ');
+    if (!key || !aiBrain.relations[key]) return false;
+    const outClean = String(answer).trim();
+    if (!aiBrain.relations[key][outClean]) return false;
+    delete aiBrain.relations[key][outClean];
+    if (!Object.keys(aiBrain.relations[key]).length) {
+        delete aiBrain.relations[key];
+        delete aiBrain.originals[key];
+    }
     saveBrainNow();
     return true;
 }
@@ -443,13 +477,15 @@ async function handleMessage(msg) {
             '/train вопрос = ответ\n' +
             '/train привет = Привет!\n\n' +
             'Синонимы:\n' +
-            '/syn слово = синоним1, синоним2\n\n' +
+            '/syn слово = синоним1, синоним2\n' +
+            '/syn del слово\n' +
+            '/synlist - список синонимов\n\n' +
             'Смотреть:\n' +
             '/list - стр. 1\n' +
             '/list 2 - стр. 2\n\n' +
             'Удалять:\n' +
-            '/del вопрос\n' +
-            '/syn del слово\n\n' +
+            '/del вопрос - всю пару\n' +
+            '/del вопрос = ответ - один ответ\n\n' +
             'Ещё:\n' +
             '/stats - статистика\n' +
             '/reset - стереть всё\n' +
@@ -506,13 +542,45 @@ async function handleMessage(msg) {
         return;
     }
 
-    if (text.startsWith('/del ')) {
-        const q = text.slice(5).trim();
-        if (!q) {
-            await sendMessage(chatId, 'Использование: /del вопрос');
+    if (text === '/synlist' || text.startsWith('/synlist ')) {
+        const hasSyns = Object.keys(aiBrain.synonyms).length > 0;
+        if (!hasSyns) {
+            await sendMessage(chatId, 'Синонимов нет.');
             return;
         }
-        const ok = deletePair(q);
+        const arg = text.slice(8).trim();
+        let page = 0;
+        if (arg) {
+            const n = parseInt(arg, 10);
+            if (isNaN(n) || n < 1) {
+                await sendMessage(chatId, 'Использование: /synlist или /synlist n');
+                return;
+            }
+            page = n - 1;
+        }
+        const out = buildSynListPage(page);
+        const parts = chunkMessage(out, MAX_LEN);
+        for (const part of parts) {
+            await sendMessage(chatId, part);
+        }
+        return;
+    }
+
+    if (text.startsWith('/del ')) {
+        const arg = text.slice(5).trim();
+        if (!arg) {
+            await sendMessage(chatId, 'Использование:\n/del вопрос\n/del вопрос = ответ');
+            return;
+        }
+        if (arg.includes('=')) {
+            const idx = arg.indexOf('=');
+            const q = arg.slice(0, idx).trim();
+            const a = arg.slice(idx + 1).trim();
+            const ok = deleteAnswer(q, a);
+            await sendMessage(chatId, ok ? 'Ответ удалён.' : 'Не найдено.');
+            return;
+        }
+        const ok = deletePair(arg);
         await sendMessage(chatId, ok ? 'Пара удалена.' : 'Не найдено.');
         return;
     }
