@@ -1,524 +1,338 @@
-const https = require('https');
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const { Bot, InlineKeyboard } = require("grammy");
+const { Connection, Keypair, VersionedTransaction, PublicKey } = require("@solana/web3.js");
+const https = require("https");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-if (!BOT_TOKEN) { console.error('BOT_TOKEN is not set'); process.exit(1); }
+const WALLET_PRIVATE_KEY = JSON.parse(process.env.WALLET_PRIVATE_KEY);
+const RPC_ENDPOINT = process.env.RPC_ENDPOINT;
+const ALLOWED_CHAT_ID = Number(process.env.ALLOWED_CHAT_ID);
+const APIFY_TOKEN = process.env.APIFY_TOKEN;
 
-const PORT = process.env.PORT || 3000;
-const DATA_DIR = process.env.DATA_DIR || './data';
-const VEC_FILE = path.join(DATA_DIR, 'vectors.bin');
-const VEC_META = path.join(DATA_DIR, 'vectors.json');
-const SENTS_FILE = path.join(DATA_DIR, 'sentences.json');
-const OFFSET_FILE = path.join(DATA_DIR, 'offset.json');
-const CORPUS_FILE = path.join(DATA_DIR, 'corpus.txt');
+const bot = new Bot(BOT_TOKEN);
+const connection = new Connection(RPC_ENDPOINT, "confirmed");
+const wallet = Keypair.fromSecretKey(Uint8Array.from(WALLET_PRIVATE_KEY));
 
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+let isRunning = false;
+let currentStep = null;
+let activePosition = null;
+let isPaused = false; 
 
-http.createServer((req, res) => { res.writeHead(200); res.end('OK'); }).listen(PORT);
+let config = {
+    amountSol: 0.005,
+    takeProfitPercent: 10,   
+    stopLossPercent: 20,     
+    maxSlippage: 10,
+    testBuyAmountSol: 0.0005 
+};
 
-let vectors = { dim: 50, words: {}, trained: false, tokens: 0 };
-let sentences = [];
-let sentVecs = [];
-
-if (fs.existsSync(VEC_META) && fs.existsSync(VEC_FILE)) {
-    try {
-        const meta = JSON.parse(fs.readFileSync(VEC_META, 'utf8'));
-        vectors.dim = meta.dim;
-        vectors.trained = meta.trained;
-        vectors.tokens = meta.tokens;
-        const buf = fs.readFileSync(VEC_FILE);
-        const dim = meta.dim;
-        const words = meta.words;
-        const arr = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
-        let off = 0;
-        for (const w of words) {
-            vectors.words[w] = arr.subarray(off, off + dim);
-            off += dim;
-        }
-    } catch (e) { console.error('vec read error:', e.message); }
-}
-
-if (fs.existsSync(SENTS_FILE)) {
-    try {
-        const data = JSON.parse(fs.readFileSync(SENTS_FILE, 'utf8'));
-        sentences = data.sentences || [];
-        sentVecs = (data.sentVecs || []).map(a => Float32Array.from(a));
-    } catch (e) { console.error('sent read error:', e.message); }
-}
-
-function saveVectorsNow() {
-    try {
-        const words = Object.keys(vectors.words);
-        const dim = vectors.dim;
-        const arr = new Float32Array(words.length * dim);
-        let off = 0;
-        for (const w of words) {
-            const v = vectors.words[w];
-            for (let i = 0; i < dim; i++) arr[off + i] = v[i];
-            off += dim;
-        }
-        fs.writeFileSync(VEC_FILE, Buffer.from(arr.buffer));
-        fs.writeFileSync(VEC_META, JSON.stringify({ dim, words, trained: vectors.trained, tokens: vectors.tokens }), 'utf8');
-    } catch (e) { console.error('saveVectors error:', e.message); }
-}
-
-function saveSentencesNow() {
-    try {
-        const data = { sentences, sentVecs: sentVecs.map(v => Array.from(v)) };
-        fs.writeFileSync(SENTS_FILE, JSON.stringify(data), 'utf8');
-    } catch (e) { console.error('saveSentences error:', e.message); }
-}
-
-process.on('SIGINT', () => { saveVectorsNow(); saveSentencesNow(); process.exit(0); });
-process.on('SIGTERM', () => { saveVectorsNow(); saveSentencesNow(); process.exit(0); });
-
-function loadOffset() {
-    try {
-        if (fs.existsSync(OFFSET_FILE)) return Number(JSON.parse(fs.readFileSync(OFFSET_FILE, 'utf8')).offset) || 0;
-    } catch {}
-    return 0;
-}
-
-function saveOffset(o) {
-    try { fs.writeFileSync(OFFSET_FILE, JSON.stringify({ offset: o }), 'utf8'); } catch {}
-}
-
-function clean(text) {
-    return String(text).toLowerCase().replace(/ё/g, 'е').replace(/[^а-яa-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-function rawTokens(text) {
-    const c = clean(text);
-    if (!c) return [];
-    return c.split(' ').filter(Boolean);
-}
-
-function randVec(dim) {
-    const v = new Float32Array(dim);
-    for (let i = 0; i < dim; i++) v[i] = (Math.random() - 0.5) / dim;
-    return v;
-}
-
-function dot(a, b) {
-    let s = 0;
-    for (let i = 0; i < a.length; i++) s += a[i] * b[i];
-    return s;
-}
-
-function norm(a) {
-    let s = 0;
-    for (let i = 0; i < a.length; i++) s += a[i] * a[i];
-    return Math.sqrt(s) || 1;
-}
-
-function cosine(a, b) {
-    return dot(a, b) / (norm(a) * norm(b));
-}
-
-function sigmoid(x) {
-    if (x > 6) return 1;
-    if (x < -6) return 0;
-    return 1 / (1 + Math.exp(-x));
-}
-
-function buildCorpus() {
-    return fs.existsSync(CORPUS_FILE) ? fs.readFileSync(CORPUS_FILE, 'utf8') : '';
-}
-
-function appendCorpus(t) {
-    fs.appendFileSync(CORPUS_FILE, '\n' + t, 'utf8');
-}
-
-function trainWord2Vec(opts) {
-    const dim = opts.dim || 50;
-    const win = opts.window || 3;
-    const neg = opts.negative || 3;
-    const lr0 = opts.lr || 0.025;
-    const epochs = opts.epochs || 3;
-    const minCount = opts.minCount || 2;
-
-    const raw = buildCorpus();
-    if (!raw) return { ok: false, error: 'корпус пуст' };
-
-    const rawSents = raw.split(/[\n.!?]+/).map(s => rawTokens(s)).filter(s => s.length > 1);
-    const freq = {};
-    for (const s of rawSents) for (const w of s) freq[w] = (freq[w] || 0) + 1;
-
-    const vocab = Object.keys(freq).filter(w => freq[w] >= minCount);
-    const vocabSet = new Set(vocab);
-    const total = vocab.reduce((a, w) => a + freq[w], 0);
-
-    const keepProb = {};
-    for (const w of vocab) {
-        const f = freq[w] / total;
-        keepProb[w] = Math.min(1, (Math.sqrt(f / 0.001) + 1) * 0.001 / f);
-    }
-
-    const negTable = [];
-    for (const w of vocab) {
-        const p = Math.pow(freq[w] / total, 0.75);
-        const count = Math.max(1, Math.round(p * 50000));
-        for (let i = 0; i < count; i++) negTable.push(w);
-    }
-
-    vectors.dim = dim;
-    vectors.words = {};
-    for (const w of vocab) vectors.words[w] = randVec(dim);
-
-    let tokensCount = 0;
-    for (const s of rawSents) for (const w of s) if (vocabSet.has(w)) tokensCount++;
-
-    for (let epoch = 0; epoch < epochs; epoch++) {
-        const lr = lr0 * (1 - epoch / epochs);
-        for (const s of rawSents) {
-            const filtered = [];
-            for (const w of s) {
-                if (vocabSet.has(w) && Math.random() < keepProb[w]) filtered.push(w);
-            }
-            for (let i = 0; i < filtered.length; i++) {
-                const c = filtered[i];
-                const cv = vectors.words[c];
-                const ws = Math.max(0, i - win);
-                const we = Math.min(filtered.length - 1, i + win);
-                for (let j = ws; j <= we; j++) {
-                    if (j === i) continue;
-                    const u = filtered[j];
-                    const uv = vectors.words[u];
-                    let sc = 0;
-                    for (let d = 0; d < dim; d++) sc += cv[d] * uv[d];
-                    const g = (1 - sigmoid(sc)) * lr;
-                    for (let d = 0; d < dim; d++) {
-                        const grad = g * uv[d];
-                        uv[d] += g * cv[d];
-                        cv[d] += grad;
-                    }
-                    for (let k = 0; k < neg; k++) {
-                        const nw = negTable[(Math.random() * negTable.length) | 0];
-                        if (nw === u) continue;
-                        const nv = vectors.words[nw];
-                        let ns = 0;
-                        for (let d = 0; d < dim; d++) ns += cv[d] * nv[d];
-                        const ng = (0 - sigmoid(ns)) * lr;
-                        for (let d = 0; d < dim; d++) {
-                            const grad = ng * nv[d];
-                            nv[d] += ng * cv[d];
-                            cv[d] += grad;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    vectors.trained = true;
-    vectors.tokens = tokensCount;
-    saveVectorsNow();
-
-    sentences = rawSents.map(s => s.join(' '));
-    sentVecs = [];
-    for (const s of rawSents) sentVecs.push(sentVecFromTokens(s));
-    saveSentencesNow();
-
-    return { ok: true, vocab: vocab.length, tokens: tokensCount, sentences: sentences.length };
-}
-
-function sentVecFromTokens(tokenList) {
-    const dim = vectors.dim;
-    const v = new Float32Array(dim);
-    let count = 0;
-    for (const w of tokenList) {
-        const wv = vectors.words[w];
-        if (!wv) continue;
-        for (let i = 0; i < dim; i++) v[i] += wv[i];
-        count++;
-    }
-    if (!count) return null;
-    for (let i = 0; i < dim; i++) v[i] /= count;
-    return v;
-}
-
-function sentVec(text) {
-    return sentVecFromTokens(rawTokens(text));
-}
-
-function search(query, top) {
-    const qv = sentVec(query);
-    if (!qv) return [];
-    const out = [];
-    for (let i = 0; i < sentences.length; i++) {
-        const sv = sentVecs[i];
-        if (!sv) continue;
-        out.push({ i, text: sentences[i], score: cosine(qv, sv) });
-    }
-    out.sort((a, b) => b.score - a.score);
-    return out.slice(0, top || 5);
-}
-
-function nearest(word, top) {
-    const w = clean(word);
-    if (!vectors.words[w]) return [];
-    const base = vectors.words[w];
-    const out = [];
-    for (const k in vectors.words) {
-        if (k === w) continue;
-        out.push({ word: k, score: cosine(base, vectors.words[k]) });
-    }
-    out.sort((a, b) => b.score - a.score);
-    return out.slice(0, top || 10);
-}
-
-function apiRequest(method, data) {
-    return new Promise((resolve) => {
-        const ds = JSON.stringify(data);
-        const opts = {
-            hostname: 'api.telegram.org',
-            path: `/bot${BOT_TOKEN}/${method}`,
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(ds) },
-            timeout: 40000
-        };
-        const req = https.request(opts, (res) => {
-            let body = '';
-            res.on('data', c => body += c);
-            res.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve({ ok: false }); } });
+function request(url, options = {}) {
+    return new Promise((resolve, reject) => {
+        const req = https.request(url, options, (res) => {
+            let data = "";
+            res.on("data", (chunk) => data += chunk);
+            res.on("end", () => {
+                try { resolve(JSON.parse(data)); }
+                catch (e) { reject(e); }
+            });
         });
-        req.on('error', () => resolve({ ok: false }));
-        req.on('timeout', () => { req.destroy(); resolve({ ok: false }); });
-        req.write(ds);
+        req.on("error", reject);
+        if (options.body) req.write(JSON.stringify(options.body));
         req.end();
     });
 }
 
-function send(chatId, text) {
-    return apiRequest('sendMessage', { chat_id: chatId, text: String(text).slice(0, 4000) });
+function checkAccess(ctx) {
+    return ctx.chat.id === ALLOWED_CHAT_ID;
 }
 
-let pendingReset = false;
-let polling = false;
-let training = false;
-let writing = {};   // userId -> true, если идёт запись в корпус
+async function isTokenSafe(tokenMint) {
+    try {
+        const apifyUrl = `https://api.apify.com/v2/acts/ninhothedev~rugcheck-solana-scraper/run-sync-get-dataset-items?token=${APIFY_TOKEN}`;
+        const rugRes = await request(apifyUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: { mints: [tokenMint] }
+        });
 
-async function getUpdates(offset) {
-    if (polling) return;
-    polling = true;
-    const res = await apiRequest('getUpdates', { offset, timeout: 30, allowed_updates: ['message'] });
-    polling = false;
-    if (res && res.ok && res.result && res.result.length) {
-        for (const u of res.result) {
-            offset = u.update_id + 1;
-            saveOffset(offset);
-            if (u.message && (typeof u.message.text === 'string' || u.message.document)) {
-                try { await handle(u.message); } catch (e) { console.error('handle:', e.message); }
-            }
+        if (!rugRes || !rugRes.length || !rugRes[0]) {
+            await bot.api.sendMessage(ALLOWED_CHAT_ID, "RugCheck didn't respond. Skipping.");
+            return false;
         }
-        setTimeout(() => getUpdates(offset), 50);
-    } else {
-        setTimeout(() => getUpdates(offset), (res && res.ok) ? 50 : 3000);
+
+        const report = rugRes[0];
+        
+        if (report.mintAuthority !== null && report.mintAuthority !== "null") {
+            await bot.api.sendMessage(ALLOWED_CHAT_ID, `Mint Authority not revoked. Skipping.`);
+            return false;
+        }
+        if (report.freezeAuthority !== null && report.freezeAuthority !== "null") {
+            await bot.api.sendMessage(ALLOWED_CHAT_ID, `Freeze Authority not revoked. Skipping.`);
+            return false;
+        }
+
+        if (report.topHoldersPercent > 30) {
+            await bot.api.sendMessage(ALLOWED_CHAT_ID, `Top-10 hold ${report.topHoldersPercent}%. Skipping.`);
+            return false;
+        }
+
+        if (report.lpLockedPercent < 80 && report.lpBurnedPercent < 80) {
+            await bot.api.sendMessage(ALLOWED_CHAT_ID, `Liquidity not locked. Skipping.`);
+            return false;
+        }
+
+        await bot.api.sendMessage(ALLOWED_CHAT_ID, `RugCheck passed. Testing honeypot...`);
+        return true;
+
+    } catch (e) {
+        await bot.api.sendMessage(ALLOWED_CHAT_ID, `Check error: ${e.message}. Skipping.`);
+        return false;
     }
 }
 
-async function handle(msg) {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const text = (msg.text || '').trim();
-
-    if (text === '/start') {
-        await send(chatId,
-            'Бот на семантической модели.\n\n' +
-            'Как учить:\n' +
-            '/add — начать писать текст в корпус. Пиши сообщения подряд, они добавятся.\n' +
-            '/stop — закончить запись.\n' +
-            '/retrain — обучить модель на том, что записал.\n\n' +
-            'Или можно просто кинуть .txt файл в чат — он тоже пойдёт в корпус.\n\n' +
-            'Как спрашивать:\n' +
-            'Просто пиши боту вопрос или фразу — он найдёт самое близкое по смыслу в корпусе.\n' +
-            '/ask вопрос — показать топ-3 близких предложения.\n' +
-            '/similar слово — похожие по смыслу слова.\n\n' +
-            'Другое:\n' +
-            '/stats — что в модели.\n' +
-            '/reset — стереть всё (с подтверждением "да").\n' +
-            '/export — скачать корпус.\n' +
-            '/import — загрузить корпус из файла.'
+async function testSellability(tokenMint, chatId) {
+    try {
+        const testLamports = Math.floor(config.testBuyAmountSol * 1000000000);
+        
+        const buyQuote = await getQuote(
+            "So11111111111111111111111111111111111111112",
+            tokenMint,
+            testLamports
         );
-        return;
-    }
-
-    if (pendingReset) {
-        if (text.toLowerCase() === 'да') {
-            vectors = { dim: 50, words: {}, trained: false, tokens: 0 };
-            sentences = [];
-            sentVecs = [];
-            writing = {};
-            pendingReset = false;
-            try { fs.unlinkSync(CORPUS_FILE); } catch {}
-            try { fs.unlinkSync(VEC_FILE); } catch {}
-            try { fs.unlinkSync(VEC_META); } catch {}
-            try { fs.unlinkSync(SENTS_FILE); } catch {}
-            await send(chatId, 'Стёрто.');
-        } else {
-            pendingReset = false;
-            await send(chatId, 'Отменено.');
+        if (!buyQuote) {
+            await bot.api.sendMessage(chatId, "No buy quote. Skipping.");
+            return false;
         }
-        return;
-    }
 
-    if (text === '/reset') {
-        pendingReset = true;
-        await send(chatId, 'Точно стереть всё? Напиши "да".');
-        return;
-    }
-
-    if (writing[userId]) {
-        if (text === '/stop') {
-            writing[userId] = false;
-            await send(chatId, 'Запись закончена. Теперь /retrain.');
-            return;
+        const buySuccess = await executeSwap(buyQuote, chatId);
+        if (!buySuccess) {
+            await bot.api.sendMessage(chatId, "Test buy failed.");
+            return false;
         }
-        if (text) {
-            appendCorpus(text);
-            await send(chatId, 'Добавлено.');
-            return;
+
+        const tokenBalance = await getTokenBalance(tokenMint);
+        if (!tokenBalance || tokenBalance === "0") {
+            await bot.api.sendMessage(chatId, "Failed to get token balance.");
+            return false;
         }
-    }
 
-    if (text === '/add') {
-        writing[userId] = true;
-        await send(chatId, 'Пиши текст. Каждое сообщение пойдёт в корпус. Когда закончишь — /stop.');
-        return;
-    }
-
-    if (text === '/stop') {
-        await send(chatId, 'Ты не в режиме записи. Начни с /add.');
-        return;
-    }
-
-    if (text === '/stats') {
-        await send(chatId,
-            'Слов в модели: ' + Object.keys(vectors.words).length + '\n' +
-            'Размер вектора: ' + vectors.dim + '\n' +
-            'Токенов обучено: ' + (vectors.tokens || 0) + '\n' +
-            'Предложений: ' + sentences.length + '\n' +
-            'Обучена: ' + (vectors.trained ? 'да' : 'нет') + '\n' +
-            'Корпус: ' + (fs.existsSync(CORPUS_FILE) ? (fs.statSync(CORPUS_FILE).size + ' байт') : 'пусто'));
-        return;
-    }
-
-    if (text === '/retrain') {
-        if (training) { await send(chatId, 'Уже обучается.'); return; }
-        training = true;
-        await send(chatId, 'Обучаю...');
-        try {
-            const r = trainWord2Vec({});
-            await send(chatId, r.ok ? ('Готово. Слов: ' + r.vocab + ', токенов: ' + r.tokens + ', предложений: ' + r.sentences) : ('Ошибка: ' + r.error));
-        } catch (e) {
-            await send(chatId, 'Ошибка: ' + e.message);
+        const sellQuote = await getQuote(
+            tokenMint,
+            "So11111111111111111111111111111111111111112",
+            tokenBalance
+        );
+        if (!sellQuote) {
+            await bot.api.sendMessage(chatId, "HONEYPOT! No sell quote. Skipping.");
+            return false;
         }
-        training = false;
-        return;
-    }
 
-    if (text.startsWith('/ask ')) {
-        const q = text.slice(5).trim();
-        if (!q) { await send(chatId, '/ask вопрос'); return; }
-        if (!vectors.trained) { await send(chatId, 'Сначала /retrain.'); return; }
-        const res = search(q, 3);
-        if (!res.length) { await send(chatId, 'Ничего не нашёл.'); return; }
-        let out = 'Ближайшее по смыслу:\n\n';
-        for (const r of res) out += '[' + r.score.toFixed(3) + '] ' + r.text + '\n\n';
-        await send(chatId, out);
-        return;
-    }
+        const sellSuccess = await executeSwap(sellQuote, chatId);
+        if (!sellSuccess) {
+            await bot.api.sendMessage(chatId, "HONEYPOT! Sell failed. Skipping.");
+            return false;
+        }
 
-    if (text.startsWith('/similar ')) {
-        const w = text.slice(9).trim();
-        if (!vectors.trained) { await send(chatId, 'Сначала /retrain.'); return; }
-        const list = nearest(w, 15);
-        if (!list.length) { await send(chatId, 'Нет в модели.'); return; }
-        let out = 'Похожие на "' + w + '":\n';
-        for (const it of list) out += it.word + ' (' + it.score.toFixed(3) + ')\n';
-        await send(chatId, out);
-        return;
-    }
+        await bot.api.sendMessage(chatId, `Honeypot test passed. Token can be sold.`);
+        return true;
 
-    if (text === '/export') {
-        try {
-            const corpus = fs.existsSync(CORPUS_FILE) ? fs.readFileSync(CORPUS_FILE, 'utf8') : '';
-            const buf = Buffer.from(JSON.stringify({ corpus }), 'utf8');
-            const b = '----B' + Date.now();
-            const head = '--' + b + '\r\nContent-Disposition: form-data; name="document"; filename="corpus.json"\r\nContent-Type: application/json\r\n\r\n';
-            const tail = '\r\n--' + b + '--\r\n';
-            const body = Buffer.concat([Buffer.from(head, 'utf8'), buf, Buffer.from(tail, 'utf8')]);
-            await new Promise((resolve) => {
-                const opts = {
-                    hostname: 'api.telegram.org',
-                    path: `/bot${BOT_TOKEN}/sendDocument`,
-                    method: 'POST',
-                    headers: { 'Content-Type': 'multipart/form-data; boundary=' + b, 'Content-Length': body.length },
-                    timeout: 40000
-                };
-                const req = https.request(opts, (res) => { res.on('data', () => {}); res.on('end', () => resolve()); });
-                req.on('error', () => resolve());
-                req.on('timeout', () => { req.destroy(); resolve(); });
-                req.write(body);
-                req.end();
-            });
-        } catch {}
-        return;
+    } catch (e) {
+        await bot.api.sendMessage(chatId, `Test error: ${e.message}. Skipping.`);
+        return false;
     }
+}
 
-    if (text === '/import') {
-        await send(chatId, 'Кинь corpus.json.');
-        return;
-    }
+async function getQuote(inputMint, outputMint, amount) {
+    try {
+        const url = `https://api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${Math.floor(config.maxSlippage * 100)}`;
+        const res = await request(url);
+        return res.outAmount ? res : null;
+    } catch { return null; }
+}
 
-    if (msg.document) {
-        try {
-            const fr = await apiRequest('getFile', { file_id: msg.document.file_id });
-            if (!fr.ok) { await send(chatId, 'Ошибка.'); return; }
-            const fd = await new Promise((resolve) => {
-                https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${fr.result.file_path}`, (res) => {
-                    const c = [];
-                    res.on('data', x => c.push(x));
-                    res.on('end', () => resolve(Buffer.concat(c)));
-                }).on('error', () => resolve(null));
-            });
-            if (!fd) { await send(chatId, 'Ошибка.'); return; }
-            const name = (msg.document.file_name || '').toLowerCase();
-            if (name.endsWith('.txt')) {
-                appendCorpus(fd.toString('utf8'));
-                await send(chatId, 'Добавлено. Корпус: ' + fs.statSync(CORPUS_FILE).size + ' байт. Теперь /retrain.');
-                return;
+async function executeSwap(quote, chatId) {
+    try {
+        const swapRes = await request("https://api.jup.ag/swap/v1/swap", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: {
+                quoteResponse: quote,
+                userPublicKey: wallet.publicKey.toString(),
+                wrapAndUnwrapSol: true,
+                prioritizationFeeLamports: 5000000
             }
-            if (name.endsWith('.json')) {
-                const p = JSON.parse(fd.toString('utf8'));
-                if (p.corpus) {
-                    fs.writeFileSync(CORPUS_FILE, p.corpus, 'utf8');
-                    await send(chatId, 'Корпус загружен. Теперь /retrain.');
-                    return;
+        });
+        
+        if (!swapRes.swapTransaction) return false;
+        
+        const txBuffer = Buffer.from(swapRes.swapTransaction, "base64");
+        const transaction = VersionedTransaction.deserialize(txBuffer);
+        transaction.sign([wallet]);
+        
+        const txid = await connection.sendTransaction(transaction, { skipPreflight: true, maxRetries: 3 });
+        const confirmation = await connection.confirmTransaction(txid, "confirmed");
+        
+        if (confirmation.value.err) return false;
+        return true;
+    } catch { return false; }
+}
+
+async function getTokenBalance(tokenMint) {
+    try {
+        const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(tokenMint) });
+        if (accounts.value.length === 0) return "0";
+        return accounts.value[0].account.data.parsed.info.tokenAmount.amount;
+    } catch { return "0"; }
+}
+
+async function scanNewLiquidityPool() {
+    try {
+        const res = await request("https://api.geckoterminal.com/api/v2/networks/solana/new_pools", {
+            headers: { "Accept": "application/json;version=20230302", "User-Agent": "Mozilla/5.0" }
+        });
+        if (!res.data || res.data.length === 0) return null;
+        const latestPool = res.data[0];
+        const reserveInUsd = parseFloat(latestPool.attributes.reserve_in_usd);
+        if (reserveInUsd < 5000 || reserveInUsd > 50000) return null;
+        const baseTokenData = latestPool.relationships?.base_token?.data;
+        if (!baseTokenData || !baseTokenData.id) return null;
+        return baseTokenData.id.split("_")[1];
+    } catch { return null; }
+}
+
+async function fetchCurrentPrice(tokenMint) {
+    try {
+        const url = `https://api.jup.ag/swap/v1/quote?inputMint=${tokenMint}&outputMint=So11111111111111111111111111111111111111112&amount=100000000&slippageBps=50`;
+        const res = await request(url);
+        return res.outAmount ? parseFloat(res.outAmount) / 100000000 : null;
+    } catch { return null; }
+}
+
+async function runSniperLoop(chatId) {
+    while (isRunning && !isPaused) {
+        try {
+            if (activePosition) {
+                await checkPositionStatus(chatId);
+            } else {
+                const targetToken = await scanNewLiquidityPool();
+                if (targetToken) {
+                    await bot.api.sendMessage(chatId, `Token found: ${targetToken}`);
+
+                    const safe = await isTokenSafe(targetToken);
+                    if (!safe) continue;
+
+                    const sellable = await testSellability(targetToken, chatId);
+                    if (!sellable) continue;
+
+                    const lamports = Math.floor(config.amountSol * 1000000000);
+                    const quote = await getQuote("So11111111111111111111111111111111111111112", targetToken, lamports);
+                    if (!quote) continue;
+
+                    const buySuccess = await executeSwap(quote, chatId);
+                    if (buySuccess) {
+                        const price = await fetchCurrentPrice(targetToken);
+                        activePosition = { mint: targetToken, buyPrice: price, amount: config.amountSol };
+                        await bot.api.sendMessage(chatId, `Position opened: ${price}`);
+                    }
                 }
             }
-            await send(chatId, 'Неизвестный файл.');
-        } catch (e) { await send(chatId, 'Ошибка: ' + e.message); }
-        return;
+        } catch (error) {
+            await bot.api.sendMessage(chatId, `Error: ${error.message}`);
+        }
+        await new Promise(res => setTimeout(res, 5000));
     }
-
-    if (!text) return;
-
-    if (!vectors.trained) {
-        await send(chatId, 'Модель не обучена. Напиши /add, накидай текст, потом /retrain.');
-        return;
-    }
-
-    const res = search(text, 1);
-    if (!res.length || res[0].score < 0.3) {
-        await send(chatId, 'Ничего близкого не нашёл.');
-        return;
-    }
-    await send(chatId, res[0].text);
 }
 
-const start = loadOffset();
-console.log('Bot started. Offset:', start);
-getUpdates(start);
+async function checkPositionStatus(chatId) {
+    const currentPrice = await fetchCurrentPrice(activePosition.mint);
+    if (!currentPrice) return;
+    const change = ((currentPrice - activePosition.buyPrice) / activePosition.buyPrice) * 100;
+    
+    if (change >= config.takeProfitPercent) {
+        await bot.api.sendMessage(chatId, `TP +${change.toFixed(2)}%. Selling...`);
+        await sellPosition(activePosition.mint, chatId);
+        activePosition = null;
+        return;
+    }
+    
+    if (change <= -config.stopLossPercent) {
+        await bot.api.sendMessage(chatId, `SL -${change.toFixed(2)}%. Selling...`);
+        await sellPosition(activePosition.mint, chatId);
+        activePosition = null;
+        return;
+    }
+    
+    await bot.api.sendMessage(chatId, `PnL: ${change.toFixed(2)}%`);
+}
+
+async function sellPosition(tokenMint, chatId) {
+    const balance = await getTokenBalance(tokenMint);
+    if (balance === "0") return;
+    const quote = await getQuote(tokenMint, "So11111111111111111111111111111111111111112", balance);
+    if (!quote) {
+        await bot.api.sendMessage(chatId, "No sell quote! Token cannot be sold.");
+        return;
+    }
+    const success = await executeSwap(quote, chatId);
+    await bot.api.sendMessage(chatId, success ? "Sold." : "Sell error.");
+}
+
+function getMainKeyboard() {
+    const statusText = isRunning ? "ACTIVE" : "PAUSED";
+    return new InlineKeyboard()
+        .text(statusText, "noop").row()
+        .text(isRunning ? "STOP BOT" : "START BOT", "toggle_bot").row()
+        .text("SOL Amount", "set_amount")
+        .text("Take Profit %", "set_tp").row()
+        .text("Stop Loss %", "set_sl")
+        .text("Slippage %", "set_slippage").row()
+        .text("Show Config", "view_config");
+}
+
+bot.command("start", async (ctx) => {
+    if (!checkAccess(ctx)) return;
+    await ctx.reply("Solana Sniper (Safe Mode)", { reply_markup: getMainKeyboard() });
+});
+
+bot.callbackQuery("noop", async (ctx) => { await ctx.answerCallbackQuery(); });
+
+bot.callbackQuery("toggle_bot", async (ctx) => {
+    if (!checkAccess(ctx)) return;
+    isRunning = !isRunning;
+    isPaused = !isRunning;
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText("Solana Sniper (Safe Mode)", { reply_markup: getMainKeyboard() });
+    if (isRunning) {
+        await ctx.reply("Scanning... (with checks)");
+        runSniperLoop(ctx.chat.id);
+    } else {
+        await ctx.reply("Stopped. Open position not auto-sold.");
+    }
+});
+
+bot.callbackQuery("view_config", async (ctx) => {
+    if (!checkAccess(ctx)) return;
+    await ctx.answerCallbackQuery();
+    await ctx.reply(`Settings:\nSOL: ${config.amountSol}\nTP: +${config.takeProfitPercent}%\nSL: -${config.stopLossPercent}%\nSlippage: ${config.maxSlippage}%\n\nTest buy honeypot: ${config.testBuyAmountSol} SOL`);
+});
+
+bot.callbackQuery(/set_(amount|tp|sl|slippage)/, async (ctx) => {
+    if (!checkAccess(ctx)) return;
+    currentStep = ctx.match[1];
+    await ctx.answerCallbackQuery();
+    await ctx.reply(`Enter value for ${currentStep}:`);
+});
+
+bot.on("message:text", async (ctx) => {
+    if (!checkAccess(ctx) || !currentStep) return;
+    const val = parseFloat(ctx.text);
+    if (isNaN(val) || val <= 0) { await ctx.reply("Need a number > 0."); return; }
+    if (currentStep === "amount") config.amountSol = val;
+    if (currentStep === "tp") config.takeProfitPercent = val;
+    if (currentStep === "sl") config.stopLossPercent = val;
+    if (currentStep === "slippage") config.maxSlippage = val;
+    currentStep = null;
+    await ctx.reply("Saved.", { reply_markup: getMainKeyboard() });
+});
+
+bot.catch((err) => console.error("Bot error:", err));
+bot.start();
+console.log("Bot started.");
