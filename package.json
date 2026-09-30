@@ -1,8 +1,12 @@
 {
-  "name": "tg-ai-bot",
+  "name": "tg-bot",
   "version": "1.0.0",
   "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
   "dependencies": {
-    "parse": "^5.0.0"
+    "grammy": "^1.30.0",
+    "@solana/web3.js": "^1.95.0"
   }
 }
