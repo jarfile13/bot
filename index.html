@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>XMR Miner</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{--bg:#0d1117;--card:#161b22;--card2:#1c2128;--accent:#f7931a;--green:#3fb950;--red:#f85149;--text:#e6edf3;--muted:#8b949e;--border:#30363d}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:12px;padding-bottom:24px;min-height:100vh;user-select:none;font-size:14px}
+.header{display:flex;align-items:center;justify-content:space-between;padding:8px 4px;margin-bottom:12px;border-bottom:1px solid var(--border)}
+.header h1{font-size:16px;font-weight:600;letter-spacing:.5px}
+.status{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:0 0 6px currentColor}
+.dot.on{background:var(--green);animation:pulse 1.6s infinite}
+@keyframes pulse{50%{opacity:.4}}
+.card{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:12px;margin-bottom:10px}
+.card-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:10px}
+.hashrate{text-align:center;padding:16px 0 10px}
+.hashrate .value{font-size:40px;font-weight:700;color:var(--accent);line-height:1;font-variant-numeric:tabular-nums}
+.hashrate .unit{font-size:13px;color:var(--muted);margin-left:6px}
+.hashrate .label{font-size:11px;color:var(--muted);margin-top:8px;text-transform:uppercase;letter-spacing:.8px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.stat{background:var(--card2);border-radius:3px;padding:8px 10px}
+.stat .k{font-size:10px;color:var(--muted);margin-bottom:3px;text-transform:uppercase;letter-spacing:.6px}
+.stat .v{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums}
+.field{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+.field:last-child{border-bottom:none}
+.field .k{color:var(--muted);font-size:12px}
+.field .v{font-weight:600;color:var(--accent);font-variant-numeric:tabular-nums}
+input[type=text]{width:100%;background:var(--card2);border:1px solid var(--border);color:var(--text);padding:9px 10px;border-radius:3px;font-size:12px;font-family:ui-monospace,Menlo,monospace;outline:none;margin-top:6px}
+input[type=text]:focus{border-color:var(--accent)}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:3px;background:var(--border);border-radius:0;outline:none;margin-top:8px}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;background:var(--accent);border-radius:50%;cursor:pointer;box-shadow:0 0 0 3px rgba(247,147,26,.15)}
+input[type=range]::-moz-range-thumb{width:16px;height:16px;background:var(--accent);border-radius:50%;cursor:pointer;border:none}
+.btn{width:100%;padding:13px;border-radius:3px;border:none;font-size:14px;font-weight:600;cursor:pointer;transition:transform .1s,opacity .2s;margin-top:8px;text-transform:uppercase;letter-spacing:1px}
+.btn:active{transform:scale(.99)}
+.btn-start{background:var(--green);color:#002b16}
+.btn-stop{background:var(--red);color:#fff}
+.hidden{display:none}
+.log{background:#0a0d12;border-radius:3px;padding:10px;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#8ba1b8;height:120px;overflow-y:auto;line-height:1.5}
+.log .ok{color:var(--green)}
+.log .warn{color:var(--accent)}
+.log .err{color:var(--red)}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>XMR MINER</h1>
+  <div class="status">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">OFFLINE</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Wallet</div>
+  <input type="text" id="wallet" placeholder="4..." autocomplete="off" spellcheck="false">
+  <div class="card-title" style="margin-top:12px">Worker</div>
+  <input type="text" id="worker" value="tg-worker" autocomplete="off">
+</div>
+
+<div class="card hashrate">
+  <div><span class="value" id="hashrate">0</span><span class="unit">H/s</span></div>
+  <div class="label">Hashrate</div>
+</div>
+
+<div class="card">
+  <div class="card-title">Stats</div>
+  <div class="grid">
+    <div class="stat"><div class="k">Accepted</div><div class="v" style="color:var(--green)" id="accepted">0</div></div>
+    <div class="stat"><div class="k">Rejected</div><div class="v" style="color:var(--red)" id="rejected">0</div></div>
+    <div class="stat"><div class="k">Hashes</div><div class="v" id="totalHashes">0</div></div>
+    <div class="stat"><div class="k">Uptime</div><div class="v" id="uptime">00:00:00</div></div>
+    <div class="stat"><div class="k">Jobs</div><div class="v" id="jobs">0</div></div>
+    <div class="stat"><div class="k">Threads</div><div class="v" id="threads">0</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Performance</div>
+  <div class="field">
+    <span class="k">Weight</span>
+    <span class="v" id="weightVal">50%</span>
+  </div>
+  <input type="range" id="weightRange" min="10" max="100" value="50" step="5">
+  <div class="field" style="margin-top:8px">
+    <span class="k">Weight load</span>
+    <span class="v" id="weightStat">50%</span>
+  </div>
+</div>
+
+<button class="btn btn-start" id="startBtn">Start</button>
+<button class="btn btn-stop hidden" id="stopBtn">Stop</button>
+
+<div class="card" style="margin-top:10px">
+  <div class="card-title">Log</div>
+  <div class="log" id="log"></div>
+</div>
+
+<script src="script.js"></script>
+<script>
+var tg=window.Telegram&&window.Telegram.WebApp?window.Telegram.WebApp:null;
+if(tg){tg.ready();tg.expand()}
+var $=function(id){return document.getElementById(id)};
+var miningActive=false,startTime=0,lastTotalHashes=0,lastHashTime=0,currentHashrate=0;
+var POOL="moneroocean.stream",PROXY_SERVER="wss://ny1.xmrminingproxy.com";
+var currentWeight=50;
+
+function log(msg,type){
+  type=type||"";
+  var el=$("log");
+  var t=new Date().toLocaleTimeString("en-GB");
+  var line=document.createElement("div");
+  line.className=type;
+  line.textContent="["+t+"] "+msg;
+  el.appendChild(line);
+  el.scrollTop=el.scrollHeight;
+  while(el.children.length>100)el.removeChild(el.firstChild)
+}
+
+function fmtUptime(ms){
+  var s=Math.floor(ms/1000);
+  var h=String(Math.floor(s/3600)).padStart(2,"0");
+  var m=String(Math.floor((s%3600)/60)).padStart(2,"0");
+  var ss=String(s%60).padStart(2,"0");
+  return h+":"+m+":"+ss
+}
+
+function fmtNum(n){
+  if(n>=1e6)return(n/1e6).toFixed(2)+"M";
+  if(n>=1e3)return(n/1e3).toFixed(2)+"K";
+  return Math.round(n).toString()
+}
+
+function isValidWallet(addr){
+  return /^[48][0-9A-Za-z]{94}$/.test(addr.trim())
+}
+
+function startMining(){
+  var wallet=$("wallet").value.trim();
+  var worker=$("worker").value.trim()||"tg-worker";
+  if(!isValidWallet(wallet)){
+    log("Invalid wallet address","err");
+    if(tg&&tg.showAlert)tg.showAlert("Wallet must start with 4 or 8 and be 95 chars long");
+    return
+  }
+  localStorage.setItem("xmr_wallet",wallet);
+  localStorage.setItem("xmr_worker",worker);
+  log("Starting miner...","warn");
+  log("Pool: "+POOL);
+  log("Weight: "+currentWeight+"%");
+  miningActive=true;
+  startTime=Date.now();
+  lastTotalHashes=0;
+  lastHashTime=Date.now();
+  currentHashrate=0;
+  $("statusDot").classList.add("on");
+  $("statusText").textContent="MINING";
+  $("startBtn").classList.add("hidden");
+  $("stopBtn").classList.remove("hidden");
+  try{
+    window.server=PROXY_SERVER;
+    window.startMining(POOL,wallet,worker,-1,"");
+    window.throttleMiner=currentWeight;
+    log("Connecting to proxy...","warn")
+  }catch(e){
+    log("Error: "+e.message,"err");
+    stopMining()
+  }
+}
+
+function stopMining(){
+  if(!miningActive)return;
+  miningActive=false;
+  try{window.stopMining()}catch(e){}
+  $("statusDot").classList.remove("on");
+  $("statusText").textContent="OFFLINE";
+  $("startBtn").classList.remove("hidden");
+  $("stopBtn").classList.add("hidden");
+  $("hashrate").textContent="0";
+  log("Mining stopped","warn")
+}
+
+function updateStats(){
+  if(!miningActive)return;
+  $("uptime").textContent=fmtUptime(Date.now()-startTime);
+  var total=window.totalhashes||0;
+  var now=Date.now();
+  var dt=(now-lastHashTime)/1000;
+  if(dt>=1){
+    var dh=total-lastTotalHashes;
+    var instantRate=dh/dt;
+    currentHashrate=currentHashrate*0.7+instantRate*0.3;
+    lastTotalHashes=total;
+    lastHashTime=now;
+    $("hashrate").textContent=fmtNum(currentHashrate);
+    $("totalHashes").textContent=fmtNum(total)
+  }
+  $("threads").textContent=(window.workers||[]).length;
+  var jobs=(window.receiveStack||[]).filter(function(m){return m.identifier==="job"}).length;
+  $("jobs").textContent=jobs;
+  var sends=window.sendStack||[];
+  var acc=0,rej=0;
+  for(var i=0;i<sends.length;i++){
+    var s=sends[i];
+    if(s.identifier==="solved"||s.identifier==="submit"){if(s.result||s.accepted)acc++}
+    if(s.error||s.identifier==="rejected")rej++
+  }
+  $("accepted").textContent=acc;
+  $("rejected").textContent=rej
+}
+
+$("startBtn").addEventListener("click",startMining);
+$("stopBtn").addEventListener("click",stopMining);
+
+$("weightRange").addEventListener("input",function(){
+  currentWeight=parseInt(this.value,10);
+  $("weightVal").textContent=currentWeight+"%";
+  $("weightStat").textContent=currentWeight+"%";
+  if(miningActive){
+    window.throttleMiner=currentWeight;
+    log("Weight set to "+currentWeight+"%")
+  }
+});
+
+window.addEventListener("load",function(){
+  var w=localStorage.getItem("xmr_wallet");
+  var wk=localStorage.getItem("xmr_worker");
+  if(w)$("wallet").value=w;
+  if(wk)$("worker").value=wk;
+  log("Panel ready","ok");
+  log("Enter wallet and press Start")
+});
+
+setInterval(updateStats,500);
+
+window.addEventListener("beforeunload",function(){
+  if(miningActive){try{window.stopMining()}catch(e){}}
+});
+</script>
+</body>
+</html>
