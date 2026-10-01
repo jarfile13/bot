@@ -38,11 +38,13 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;background:var(--acce
 .btn:active{transform:scale(.99)}
 .btn-start{background:var(--green);color:#002b16}
 .btn-stop{background:var(--red);color:#fff}
+.btn:disabled{opacity:.4;cursor:not-allowed}
 .hidden{display:none}
 .log{background:#0a0d12;border-radius:3px;padding:10px;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#8ba1b8;height:120px;overflow-y:auto;line-height:1.5}
 .log .ok{color:var(--green)}
 .log .warn{color:var(--accent)}
 .log .err{color:var(--red)}
+.warn-box{background:#3a2a10;border:1px solid #5c4218;color:#f7931a;font-size:11px;padding:8px 10px;border-radius:3px;margin-bottom:10px;line-height:1.4}
 </style>
 </head>
 <body>
@@ -53,6 +55,10 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;background:var(--acce
     <span class="dot" id="statusDot"></span>
     <span id="statusText">OFFLINE</span>
   </div>
+</div>
+
+<div class="warn-box" id="warnBox">
+  If your phone lags, reduce Threads and lower Weight. Start with 1 thread and 30%.
 </div>
 
 <div class="card">
@@ -82,13 +88,18 @@ input[type=range]::-moz-range-thumb{width:16px;height:16px;background:var(--acce
 <div class="card">
   <div class="card-title">Performance</div>
   <div class="field">
-    <span class="k">Weight</span>
-    <span class="v" id="weightVal">50%</span>
+    <span class="k">Threads</span>
+    <span class="v" id="threadsVal">1</span>
   </div>
-  <input type="range" id="weightRange" min="10" max="100" value="50" step="5">
+  <input type="range" id="threadsRange" min="1" max="4" value="1" step="1">
   <div class="field" style="margin-top:8px">
-    <span class="k">Weight load</span>
-    <span class="v" id="weightStat">50%</span>
+    <span class="k">Weight</span>
+    <span class="v" id="weightVal">30%</span>
+  </div>
+  <input type="range" id="weightRange" min="10" max="80" value="30" step="5">
+  <div class="field" style="margin-top:8px">
+    <span class="k">CPU limit</span>
+    <span class="v" id="cpuStat">30%</span>
   </div>
 </div>
 
@@ -107,7 +118,7 @@ if(tg){tg.ready();tg.expand()}
 var $=function(id){return document.getElementById(id)};
 var miningActive=false,startTime=0,lastTotalHashes=0,lastHashTime=0,currentHashrate=0;
 var POOL="moneroocean.stream",PROXY_SERVER="wss://ny1.xmrminingproxy.com";
-var currentWeight=50;
+var currentThreads=1,currentWeight=30;
 
 function log(msg,type){
   type=type||"";
@@ -151,6 +162,7 @@ function startMining(){
   localStorage.setItem("xmr_worker",worker);
   log("Starting miner...","warn");
   log("Pool: "+POOL);
+  log("Threads: "+currentThreads);
   log("Weight: "+currentWeight+"%");
   miningActive=true;
   startTime=Date.now();
@@ -163,7 +175,7 @@ function startMining(){
   $("stopBtn").classList.remove("hidden");
   try{
     window.server=PROXY_SERVER;
-    window.startMining(POOL,wallet,worker,-1,"");
+    window.startMining(POOL,wallet,worker,currentThreads,"");
     window.throttleMiner=currentWeight;
     log("Connecting to proxy...","warn")
   }catch(e){
@@ -181,6 +193,7 @@ function stopMining(){
   $("startBtn").classList.remove("hidden");
   $("stopBtn").classList.add("hidden");
   $("hashrate").textContent="0";
+  $("threads").textContent="0";
   log("Mining stopped","warn")
 }
 
@@ -216,10 +229,18 @@ function updateStats(){
 $("startBtn").addEventListener("click",startMining);
 $("stopBtn").addEventListener("click",stopMining);
 
+$("threadsRange").addEventListener("input",function(){
+  currentThreads=parseInt(this.value,10);
+  $("threadsVal").textContent=currentThreads;
+  if(miningActive){
+    log("Threads change requires restart","warn")
+  }
+});
+
 $("weightRange").addEventListener("input",function(){
   currentWeight=parseInt(this.value,10);
   $("weightVal").textContent=currentWeight+"%";
-  $("weightStat").textContent=currentWeight+"%";
+  $("cpuStat").textContent=currentWeight+"%";
   if(miningActive){
     window.throttleMiner=currentWeight;
     log("Weight set to "+currentWeight+"%")
@@ -232,7 +253,7 @@ window.addEventListener("load",function(){
   if(w)$("wallet").value=w;
   if(wk)$("worker").value=wk;
   log("Panel ready","ok");
-  log("Enter wallet and press Start")
+  log("Recommended: 1 thread, 30% weight")
 });
 
 setInterval(updateStats,500);
