@@ -117,7 +117,7 @@ var tg=window.Telegram&&window.Telegram.WebApp?window.Telegram.WebApp:null;
 if(tg){tg.ready();tg.expand()}
 var $=function(id){return document.getElementById(id)};
 var miningActive=false,startTime=0,lastTotalHashes=0,lastHashTime=0,currentHashrate=0;
-var POOL="moneroocean.stream",PROXY_SERVER="wss://ny1.xmrminingproxy.com";
+var POOL="moneroocean.stream",PROXY_SERVER="wss://f.xmrminingproxy.com:8181";
 var currentThreads=1,currentWeight=30;
 
 function log(msg,type){
