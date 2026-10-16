@@ -18,10 +18,8 @@
     .ref-link { display: flex; gap: 8px; }
     .ref-link input { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: #fff; font-size: 12px; }
     .ref-link button { width: auto; padding: 12px 16px; margin: 0; }
-    #ad-container { margin: 16px 0; min-height: 250px; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.2); border-radius: 12px; overflow: hidden; }
-    #ad-container iframe { border: 0; padding: 0; width: 100%; height: auto; overflow: hidden; display: block; margin: auto; }
+    .status { text-align: center; font-size: 14px; opacity: 0.7; margin-top: 8px; min-height: 20px; }
     .hidden { display: none; }
-    .status { text-align: center; font-size: 14px; opacity: 0.7; margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -32,9 +30,8 @@
   </div>
 
   <div class="card">
-    <button class="btn-ad" id="watch-ad">📺 Смотреть рекламу (+0.2 ⭐)</button>
-    <div id="ad-container" class="hidden"></div>
-    <div class="status" id="ad-status"></div>
+    <button class="btn-ad" id="earn-btn">🔗 Заработать (+0.2 ⭐)</button>
+    <div class="status" id="status"></div>
   </div>
 
   <div class="card">
@@ -46,20 +43,19 @@
   </div>
 
   <script>
+    const ADSTERRA_LINK = 'https://www.profitableratecpmnetwork.com/s7p5vvdbuc?key=2d2a73f5fe9b861dee8060f1e93d44ad';
     const AD_REWARD = 0.2;
     const REFERRAL_REWARD = 1;
-    const AADS_BLOCK_ID = '2448856';
 
     const tg = window.Telegram?.WebApp;
     if (tg) { tg.ready(); tg.expand(); }
 
     const userId = tg?.initDataUnsafe?.user?.id || '0';
-    const username = tg?.initDataUnsafe?.user?.username || '';
-    const botUsername = 'Tonnerobot';
+    const botUsername = 'YourBotUsername';
 
     let balance = parseFloat(localStorage.getItem('balance_' + userId) || '0');
-    let adCount = parseInt(localStorage.getItem('adCount_' + userId) || '0');
     let refs = parseInt(localStorage.getItem('refs_' + userId) || '0');
+    let pendingEarn = false;
 
     function updateUI() {
       document.getElementById('balance').textContent = balance.toFixed(2);
@@ -69,33 +65,28 @@
 
     function save() {
       localStorage.setItem('balance_' + userId, balance.toString());
-      localStorage.setItem('adCount_' + userId, adCount.toString());
       localStorage.setItem('refs_' + userId, refs.toString());
     }
 
-    document.getElementById('watch-ad').addEventListener('click', () => {
-      const container = document.getElementById('ad-container');
-      const status = document.getElementById('ad-status');
-      container.innerHTML = '';
-      container.classList.remove('hidden');
-      status.textContent = 'Загрузка рекламы...';
-
-      const iframe = document.createElement('iframe');
-      iframe.src = `//acceptable.a-ads.com/${AADS_BLOCK_ID}/?size=Adaptive`;
-      iframe.setAttribute('data-aa', AADS_BLOCK_ID);
-      iframe.style.cssText = 'border:0; padding:0; width:100%; height:250px; overflow:hidden; display:block; margin:auto;';
-      iframe.onload = () => {
-        status.textContent = 'Реклама показана. Награда начислена!';
+    document.getElementById('earn-btn').addEventListener('click', () => {
+      if (pendingEarn) {
+        document.getElementById('status').textContent = 'Уже засчитано!';
+        return;
+      }
+      document.getElementById('status').textContent = 'Переходим...';
+      
+      window.open(ADSTERRA_LINK, '_blank');
+      
+      pendingEarn = true;
+      
+      setTimeout(() => {
         balance += AD_REWARD;
-        adCount++;
         save();
         updateUI();
-        setTimeout(() => {
-          container.classList.add('hidden');
-          status.textContent = '';
-        }, 3000);
-      };
-      container.appendChild(iframe);
+        document.getElementById('status').textContent = '✅ +0.2 ⭐ начислено!';
+        pendingEarn = false;
+        setTimeout(() => { document.getElementById('status').textContent = ''; }, 3000);
+      }, 5000);
     });
 
     document.getElementById('copy-ref').addEventListener('click', () => {
