@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Star Earn</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="//libtl.com/sdk.js" data-zone="3536294" data-sdk="show_3536294"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
     body { background: var(--tg-theme-bg-color, #0f0f0f); color: var(--tg-theme-text-color, #fff); min-height: 100vh; padding: 20px; }
@@ -15,11 +16,11 @@
     .btn-primary { background: var(--tg-theme-button-color, #007aff); color: #fff; }
     .btn-secondary { background: var(--tg-theme-secondary-bg-color, #2c2c2e); color: var(--tg-theme-text-color, #fff); border: 1px solid rgba(255,255,255,0.1); }
     .btn-ad { background: #34c759; color: #fff; }
+    .btn-ad:disabled { opacity: 0.5; cursor: not-allowed; }
     .ref-link { display: flex; gap: 8px; }
     .ref-link input { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: #fff; font-size: 12px; }
     .ref-link button { width: auto; padding: 12px 16px; margin: 0; }
     .status { text-align: center; font-size: 14px; opacity: 0.7; margin-top: 8px; min-height: 20px; }
-    .hidden { display: none; }
   </style>
 </head>
 <body>
@@ -30,7 +31,7 @@
   </div>
 
   <div class="card">
-    <button class="btn-ad" id="earn-btn">🔗 Заработать (+0.2 ⭐)</button>
+    <button class="btn-ad" id="earn-btn">📺 Смотреть рекламу (+0.2 ⭐)</button>
     <div class="status" id="status"></div>
   </div>
 
@@ -42,8 +43,11 @@
     </div>
   </div>
 
+  <div class="card">
+    <button class="btn-primary" id="withdraw-btn">💸 Вывести звёзды</button>
+  </div>
+
   <script>
-    const ADSTERRA_LINK = 'https://www.profitableratecpmnetwork.com/s7p5vvdbuc?key=2d2a73f5fe9b861dee8060f1e93d44ad';
     const AD_REWARD = 0.2;
     const REFERRAL_REWARD = 1;
 
@@ -51,11 +55,10 @@
     if (tg) { tg.ready(); tg.expand(); }
 
     const userId = tg?.initDataUnsafe?.user?.id || '0';
-    const botUsername = 'YourBotUsername';
+    const botUsername = 'Tonnerobot';
 
     let balance = parseFloat(localStorage.getItem('balance_' + userId) || '0');
     let refs = parseInt(localStorage.getItem('refs_' + userId) || '0');
-    let pendingEarn = false;
 
     function updateUI() {
       document.getElementById('balance').textContent = balance.toFixed(2);
@@ -69,24 +72,31 @@
     }
 
     document.getElementById('earn-btn').addEventListener('click', () => {
-      if (pendingEarn) {
-        document.getElementById('status').textContent = 'Уже засчитано!';
-        return;
-      }
-      document.getElementById('status').textContent = 'Переходим...';
-      
-      window.open(ADSTERRA_LINK, '_blank');
-      
-      pendingEarn = true;
-      
-      setTimeout(() => {
+      const btn = document.getElementById('earn-btn');
+      const status = document.getElementById('status');
+
+      btn.disabled = true;
+      status.textContent = 'Загрузка рекламы...';
+
+      show_3536294().then(() => {
         balance += AD_REWARD;
         save();
         updateUI();
-        document.getElementById('status').textContent = '✅ +0.2 ⭐ начислено!';
-        pendingEarn = false;
-        setTimeout(() => { document.getElementById('status').textContent = ''; }, 3000);
-      }, 5000);
+        status.textContent = '✅ +0.2 ⭐ начислено!';
+        
+        setTimeout(() => {
+          btn.disabled = false;
+          status.textContent = '';
+        }, 3000);
+      }).catch((e) => {
+        console.error('Ad error:', e);
+        status.textContent = '❌ Ошибка загрузки рекламы. Попробуй позже.';
+        btn.disabled = false;
+        
+        setTimeout(() => {
+          status.textContent = '';
+        }, 3000);
+      });
     });
 
     document.getElementById('copy-ref').addEventListener('click', () => {
@@ -95,6 +105,21 @@
       input.setSelectionRange(0, 99999);
       document.execCommand('copy');
       tg?.showAlert?.('Ссылка скопирована!') || alert('Ссылка скопирована!');
+    });
+
+    document.getElementById('withdraw-btn').addEventListener('click', () => {
+      if (balance < 15) {
+        tg?.showAlert?.('Минимум для вывода: 15 ⭐') || alert('Минимум для вывода: 15 ⭐');
+        return;
+      }
+      
+      const amount = Math.floor(balance);
+      balance -= amount;
+      save();
+      updateUI();
+      
+      const url = `https://t.me/${botUsername}?start=withdraw_${amount}`;
+      tg.openTelegramLink(url);
     });
 
     updateUI();
