@@ -20,7 +20,7 @@
     .ref-link { display: flex; gap: 8px; }
     .ref-link input { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: #fff; font-size: 12px; }
     .ref-link button { width: auto; padding: 12px 16px; margin: 0; }
-    .status { text-align: center; font-size: 14px; opacity: 0.7; margin-top: 8px; min-height: 20px; }
+    .status { text-align: center; font-size: 14px; opacity: 0.7; margin-top: 8px; min-height: 20px; color: #ff453a; }
   </style>
 </head>
 <body>
@@ -78,24 +78,37 @@
       btn.disabled = true;
       status.textContent = 'Загрузка рекламы...';
 
+      if (typeof show_3536294 !== 'function') {
+        status.textContent = 'Ошибка: SDK Monetag не загрузился (блокировщик рекламы?).';
+        tg?.showAlert?.('SDK Monetag не загрузился. Отключите AdBlock.') || alert('SDK не загрузился.');
+        btn.disabled = false;
+        return;
+      }
+
       show_3536294().then(() => {
         balance += AD_REWARD;
         save();
         updateUI();
-        status.textContent = '✅ +0.2 ⭐ начислено!';
+        status.textContent = '';
+        tg?.showAlert?.('✅ +0.2 ⭐ начислено!') || alert('+0.2 ⭐ начислено!');
         
         setTimeout(() => {
           btn.disabled = false;
-          status.textContent = '';
-        }, 3000);
+        }, 2000);
       }).catch((e) => {
         console.error('Ad error:', e);
-        status.textContent = '❌ Ошибка загрузки рекламы. Попробуй позже.';
-        btn.disabled = false;
         
-        setTimeout(() => {
-          status.textContent = '';
-        }, 3000);
+        let errMsg = 'Неизвестная ошибка';
+        if (typeof e === 'string') errMsg = e;
+        else if (e && e.message) errMsg = e.message;
+        else if (e && e.code) errMsg = e.code;
+        else errMsg = JSON.stringify(e);
+
+        status.textContent = '❌ Ошибка: ' + errMsg;
+        
+        tg?.showAlert?.('Ошибка Monetag:\n' + errMsg) || alert('Ошибка Monetag:\n' + errMsg);
+        
+        btn.disabled = false;
       });
     });
 
