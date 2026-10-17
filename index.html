@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Star Earn</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="//libtl.com/sdk.js" data-zone="3536294" data-sdk="show_3536294"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
     body { background: var(--tg-theme-bg-color, #0f0f0f); color: var(--tg-theme-text-color, #fff); min-height: 100vh; padding: 20px; }
@@ -16,11 +15,12 @@
     .btn-primary { background: var(--tg-theme-button-color, #007aff); color: #fff; }
     .btn-secondary { background: var(--tg-theme-secondary-bg-color, #2c2c2e); color: var(--tg-theme-text-color, #fff); border: 1px solid rgba(255,255,255,0.1); }
     .btn-ad { background: #34c759; color: #fff; }
-    .btn-ad:disabled { opacity: 0.5; cursor: not-allowed; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
     .ref-link { display: flex; gap: 8px; }
     .ref-link input { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: #fff; font-size: 12px; }
     .ref-link button { width: auto; padding: 12px 16px; margin: 0; }
-    .status { text-align: center; font-size: 14px; opacity: 0.7; margin-top: 8px; min-height: 20px; color: #ff453a; }
+    .status { text-align: center; font-size: 14px; opacity: 0.7; margin-top: 8px; min-height: 20px; }
+    .ad-buttons { display: flex; flex-direction: column; gap: 8px; }
   </style>
 </head>
 <body>
@@ -31,7 +31,12 @@
   </div>
 
   <div class="card">
-    <button class="btn-ad" id="earn-btn">📺 Смотреть рекламу (+0.2 ⭐)</button>
+    <div class="label" style="text-align:left; margin-bottom:12px;">📺 Заработать (+0.2 ⭐ за ссылку)</div>
+    <div class="ad-buttons">
+      <button class="btn-ad ad-btn" data-id="0">🔗 Открыть ссылку 1</button>
+      <button class="btn-ad ad-btn" data-id="1">🔗 Открыть ссылку 2</button>
+      <button class="btn-ad ad-btn" data-id="2">🔗 Открыть ссылку 3</button>
+    </div>
     <div class="status" id="status"></div>
   </div>
 
@@ -50,6 +55,14 @@
   <script>
     const AD_REWARD = 0.2;
     const REFERRAL_REWARD = 1;
+    const COOLDOWN_MS = 5 * 60 * 1000;
+    const WAIT_MS = 3000;
+
+    const AD_LINKS = [
+      'https://example.com/ad1',
+      'https://example.com/ad2',
+      'https://example.com/ad3'
+    ];
 
     const tg = window.Telegram?.WebApp;
     if (tg) { tg.ready(); tg.expand(); }
@@ -59,56 +72,76 @@
 
     let balance = parseFloat(localStorage.getItem('balance_' + userId) || '0');
     let refs = parseInt(localStorage.getItem('refs_' + userId) || '0');
+    let lastRewardTime = parseInt(localStorage.getItem('lastReward_' + userId) || '0');
+    let activeTimers = {};
 
     function updateUI() {
       document.getElementById('balance').textContent = balance.toFixed(2);
       const refLink = `https://t.me/${botUsername}?start=ref_${userId}`;
       document.getElementById('ref-link').value = refLink;
+
+      const now = Date.now();
+      const timePassed = now - lastRewardTime;
+      
+      document.querySelectorAll('.ad-btn').forEach(btn => {
+        if (timePassed < COOLDOWN_MS) {
+          const left = Math.ceil((COOLDOWN_MS - timePassed) / 1000);
+          btn.textContent = `⏳ Ждать ${Math.floor(left / 60)}:${(left % 60).toString().padStart(2, '0')}`;
+          btn.disabled = true;
+        } else {
+          const id = parseInt(btn.getAttribute('data-id'), 10);
+          if (!activeTimers[id]) {
+            btn.textContent = `🔗 Открыть ссылку ${id + 1}`;
+            btn.disabled = false;
+          }
+        }
+      });
     }
 
     function save() {
       localStorage.setItem('balance_' + userId, balance.toString());
       localStorage.setItem('refs_' + userId, refs.toString());
+      localStorage.setItem('lastReward_' + userId, lastRewardTime.toString());
     }
 
-    document.getElementById('earn-btn').addEventListener('click', () => {
-      const btn = document.getElementById('earn-btn');
-      const status = document.getElementById('status');
+    document.querySelectorAll('.ad-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const id = parseInt(e.target.getAttribute('data-id'), 10);
+        const status = document.getElementById('status');
+        const link = AD_LINKS[id];
 
-      btn.disabled = true;
-      status.textContent = 'Загрузка рекламы...';
+        if (activeTimers[id]) return;
 
-      if (typeof show_3536294 !== 'function') {
-        status.textContent = 'Ошибка: SDK Monetag не загрузился (блокировщик рекламы?).';
-        tg?.showAlert?.('SDK Monetag не загрузился. Отключите AdBlock.') || alert('SDK не загрузился.');
-        btn.disabled = false;
-        return;
-      }
+        window.open(link, '_blank');
+        e.target.disabled = true;
+        e.target.textContent = '⏳ Ждите 3 сек...';
+        status.textContent = 'Ссылка открыта. Вернитесь через 3 секунды.';
 
-      show_3536294().then(() => {
-        balance += AD_REWARD;
-        save();
-        updateUI();
-        status.textContent = '';
-        tg?.showAlert?.('✅ +0.2 ⭐ начислено!') || alert('+0.2 ⭐ начислено!');
-        
-        setTimeout(() => {
-          btn.disabled = false;
-        }, 2000);
-      }).catch((e) => {
-        console.error('Ad error:', e);
-        
-        let errMsg = 'Неизвестная ошибка';
-        if (typeof e === 'string') errMsg = e;
-        else if (e && e.message) errMsg = e.message;
-        else if (e && e.code) errMsg = e.code;
-        else errMsg = JSON.stringify(e);
-
-        status.textContent = '❌ Ошибка: ' + errMsg;
-        
-        tg?.showAlert?.('Ошибка Monetag:\n' + errMsg) || alert('Ошибка Monetag:\n' + errMsg);
-        
-        btn.disabled = false;
+        activeTimers[id] = setTimeout(() => {
+          delete activeTimers[id];
+          e.target.textContent = '✅ Забрать +0.2 ⭐';
+          e.target.disabled = false;
+          
+          e.target.onclick = (ev) => {
+            ev.preventDefault();
+            const now = Date.now();
+            if (now - lastRewardTime < COOLDOWN_MS) {
+              tg?.showAlert?.('Подождите, кулдаун еще не прошел!') || alert('Подождите!');
+              return;
+            }
+            
+            balance += AD_REWARD;
+            lastRewardTime = now;
+            save();
+            status.textContent = '✅ Награда начислена!';
+            
+            e.target.onclick = null;
+            setTimeout(() => {
+              status.textContent = '';
+              updateUI();
+            }, 1500);
+          };
+        }, WAIT_MS);
       });
     });
 
@@ -135,6 +168,7 @@
       tg.openTelegramLink(url);
     });
 
+    setInterval(updateUI, 1000);
     updateUI();
   </script>
 </body>
