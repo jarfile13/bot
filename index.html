@@ -72,7 +72,8 @@
 
     let balance = parseFloat(localStorage.getItem('balance_' + userId) || '0');
     let refs = parseInt(localStorage.getItem('refs_' + userId) || '0');
-    let lastRewardTime = parseInt(localStorage.getItem('lastReward_' + userId) || '0');
+    
+    let lastRewards = JSON.parse(localStorage.getItem('lastRewards_' + userId) || '{"0":0,"1":0,"2":0}');
     let activeTimers = {};
 
     function updateUI() {
@@ -81,17 +82,18 @@
       document.getElementById('ref-link').value = refLink;
 
       const now = Date.now();
-      const timePassed = now - lastRewardTime;
       
       document.querySelectorAll('.ad-btn').forEach(btn => {
+        const id = btn.getAttribute('data-id');
+        const timePassed = now - (lastRewards[id] || 0);
+        
         if (timePassed < COOLDOWN_MS) {
           const left = Math.ceil((COOLDOWN_MS - timePassed) / 1000);
           btn.textContent = `⏳ Ждать ${Math.floor(left / 60)}:${(left % 60).toString().padStart(2, '0')}`;
           btn.disabled = true;
         } else {
-          const id = parseInt(btn.getAttribute('data-id'), 10);
           if (!activeTimers[id]) {
-            btn.textContent = `🔗 Открыть ссылку ${id + 1}`;
+            btn.textContent = `🔗 Открыть ссылку ${parseInt(id) + 1}`;
             btn.disabled = false;
           }
         }
@@ -101,14 +103,14 @@
     function save() {
       localStorage.setItem('balance_' + userId, balance.toString());
       localStorage.setItem('refs_' + userId, refs.toString());
-      localStorage.setItem('lastReward_' + userId, lastRewardTime.toString());
+      localStorage.setItem('lastRewards_' + userId, JSON.stringify(lastRewards));
     }
 
     document.querySelectorAll('.ad-btn').forEach(btn => {
       btn.addEventListener('click', (e) => {
-        const id = parseInt(e.target.getAttribute('data-id'), 10);
+        const id = e.target.getAttribute('data-id');
         const status = document.getElementById('status');
-        const link = AD_LINKS[id];
+        const link = AD_LINKS[parseInt(id)];
 
         if (activeTimers[id]) return;
 
@@ -125,13 +127,13 @@
           e.target.onclick = (ev) => {
             ev.preventDefault();
             const now = Date.now();
-            if (now - lastRewardTime < COOLDOWN_MS) {
+            if (now - (lastRewards[id] || 0) < COOLDOWN_MS) {
               tg?.showAlert?.('Подождите, кулдаун еще не прошел!') || alert('Подождите!');
               return;
             }
             
             balance += AD_REWARD;
-            lastRewardTime = now;
+            lastRewards[id] = now;
             save();
             status.textContent = '✅ Награда начислена!';
             
