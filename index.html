@@ -6,11 +6,9 @@
 <body>
     <h2>Verification successful! Redirecting back to Telegram...</h2>
     <script>
-        // Считываем токен, который бот передал через AdFly
         const urlParams = new URLSearchParams(window.location.search);
-        const token = urlParams.get('param') || urlParams.get('click') || urlParams.get('id');
+        const token = urlParams.get('token');
         
-        // Моментально возвращаем пользователя в бота с его кодом
         if (token) {
             window.location.href = `https://t.me{token}`;
         } else {
