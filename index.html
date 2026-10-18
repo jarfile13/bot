@@ -1,177 +1,161 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Star Earn</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-    body { background: var(--tg-theme-bg-color, #0f0f0f); color: var(--tg-theme-text-color, #fff); min-height: 100vh; padding: 20px; }
-    .card { background: var(--tg-theme-secondary-bg-color, #1c1c1e); border-radius: 16px; padding: 24px; margin-bottom: 16px; }
-    .balance { font-size: 48px; font-weight: bold; text-align: center; margin: 16px 0; }
-    .label { font-size: 14px; opacity: 0.6; text-align: center; }
-    button { width: 100%; padding: 16px; border: none; border-radius: 12px; font-size: 16px; font-weight: 600; cursor: pointer; margin-bottom: 12px; }
-    .btn-primary { background: var(--tg-theme-button-color, #007aff); color: #fff; }
-    .btn-secondary { background: var(--tg-theme-secondary-bg-color, #2c2c2e); color: var(--tg-theme-text-color, #fff); border: 1px solid rgba(255,255,255,0.1); }
-    .btn-ad { background: #34c759; color: #fff; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .ref-link { display: flex; gap: 8px; }
-    .ref-link input { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: #fff; font-size: 12px; }
-    .ref-link button { width: auto; padding: 12px 16px; margin: 0; }
-    .status { text-align: center; font-size: 14px; opacity: 0.7; margin-top: 8px; min-height: 20px; }
-    .ad-buttons { display: flex; flex-direction: column; gap: 8px; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TON Reward Mini App</title>
+    <script src="https://telegram.org"></script>
+    <script src="https://adsgram.ai"></script>
+    <style>
+        body { font-family: sans-serif; background: #17212b; color: #fff; text-align: center; padding: 20px; margin: 0; }
+        .container { max-width: 400px; margin: 0 auto; background: #24303f; padding: 20px; border-radius: 12px; }
+        button { background: #2481cc; color: #fff; border: none; padding: 12px 20px; font-size: 16px; border-radius: 8px; cursor: pointer; width: 100%; margin: 10px 0; font-weight: bold; }
+        button:disabled { background: #40566b; cursor: not-allowed; }
+        input { width: 100%; padding: 10px; margin: 10px 0; border-radius: 6px; border: 1px solid #313e4f; background: #17212b; color: #fff; box-sizing: border-box; }
+        .balance { font-size: 24px; font-weight: bold; color: #64b5f6; margin: 15px 0; }
+        .timer { color: #e57373; font-size: 14px; }
+        .percent-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 10px 0; }
+        .percent-btn { background: #313e4f; font-size: 14px; padding: 8px; margin: 0; }
+        .percent-btn.active { background: #2481cc; }
+    </style>
 </head>
 <body>
-  <div class="card">
-    <div class="label">⭐ Твой баланс</div>
-    <div class="balance" id="balance">0.00</div>
-    <div class="label">Звёзд</div>
-  </div>
-
-  <div class="card">
-    <div class="label" style="text-align:left; margin-bottom:12px;">📺 Заработать (+0.2 ⭐ за ссылку)</div>
-    <div class="ad-buttons">
-      <button class="btn-ad ad-btn" data-id="0">🔗 Открыть ссылку 1</button>
-      <button class="btn-ad ad-btn" data-id="1">🔗 Открыть ссылку 2</button>
-      <button class="btn-ad ad-btn" data-id="2">🔗 Открыть ссылку 3</button>
-    </div>
-    <div class="status" id="status"></div>
-  </div>
-
-  <div class="card">
-    <div class="label" style="text-align:left; margin-bottom:8px;">👥 Пригласи друга (+1 ⭐)</div>
-    <div class="ref-link">
-      <input type="text" id="ref-link" readonly>
-      <button class="btn-secondary" id="copy-ref">📋</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <button class="btn-primary" id="withdraw-btn">💸 Вывести звёзды</button>
-  </div>
-
-  <script>
-    const AD_REWARD = 0.2;
-    const REFERRAL_REWARD = 1;
-    const COOLDOWN_MS = 5 * 60 * 1000;
-    const WAIT_MS = 3000;
-
-    const AD_LINKS = [
-      'https://www.profitableratecpmnetwork.com/zvuppgu1?key=ff96d8b197f15a423003f11af7978655',
-      'https://www.profitableratecpmnetwork.com/a3mg4rh3x4?key=2be145c8fc7d9d8c29b6a705806b0598',
-      'https://www.profitableratecpmnetwork.com/s7p5vvdbuc?key=2d2a73f5fe9b861dee8060f1e93d44ad'
-    ];
-
-    const tg = window.Telegram?.WebApp;
-    if (tg) { tg.ready(); tg.expand(); }
-
-    const userId = tg?.initDataUnsafe?.user?.id || '0';
-    const botUsername = 'Tonnerobot';
-
-    let balance = parseFloat(localStorage.getItem('balance_' + userId) || '0');
-    let refs = parseInt(localStorage.getItem('refs_' + userId) || '0');
-    
-    let lastRewards = JSON.parse(localStorage.getItem('lastRewards_' + userId) || '{"0":0,"1":0,"2":0}');
-    let activeTimers = {};
-
-    function updateUI() {
-      document.getElementById('balance').textContent = balance.toFixed(2);
-      const refLink = `https://t.me/${botUsername}?start=ref_${userId}`;
-      document.getElementById('ref-link').value = refLink;
-
-      const now = Date.now();
-      
-      document.querySelectorAll('.ad-btn').forEach(btn => {
-        const id = btn.getAttribute('data-id');
-        const timePassed = now - (lastRewards[id] || 0);
+    <div class="container">
+        <h2>TON Rewards</h2>
+        <div class="balance"><span id="balance">0.0000</span> TON</div>
+        <div id="timer" class="timer"></div>
+        <button id="adBtn" onclick="watchAd()">Watch Ad & Earn</button>
+        <hr style="border:1px solid #313e4f; margin: 20px 0;">
+        <input type="text" id="walletInput" placeholder="Enter TON Wallet Address">
+        <button id="saveWalletBtn" onclick="saveWallet()">Save Wallet</button>
         
-        if (timePassed < COOLDOWN_MS) {
-          const left = Math.ceil((COOLDOWN_MS - timePassed) / 1000);
-          btn.textContent = `⏳ Ждать ${Math.floor(left / 60)}:${(left % 60).toString().padStart(2, '0')}`;
-          btn.disabled = true;
-        } else {
-          if (!activeTimers[id]) {
-            btn.textContent = `🔗 Открыть ссылку ${parseInt(id) + 1}`;
-            btn.disabled = false;
-          }
+        <div class="percent-grid">
+            <button class="percent-btn" onclick="selectPercent(25, this)">25%</button>
+            <button class="percent-btn" onclick="selectPercent(50, this)">50%</button>
+            <button class="percent-btn" onclick="selectPercent(75, this)">75%</button>
+            <button class="percent-btn" onclick="selectPercent(100, this)">MAX</button>
+        </div>
+        <button id="withdrawBtn" onclick="withdraw()" disabled>Withdraw Selected Amount</button>
+    </div>
+
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand();
+
+        const BACKEND_URL = "https://199.47.240.228:10154";
+        const ADSGRAM_BLOCK_ID = "YOUR_ADSGRAM_BLOCK_ID"; 
+        
+        let initData = tg.initData;
+        let adController = null;
+        let cooldownTimer = null;
+        let selectedPercent = 100;
+
+        if (window.Adsgram) {
+            adController = window.Adsgram.init({ blockId: ADSGRAM_BLOCK_ID });
         }
-      });
-    }
 
-    function save() {
-      localStorage.setItem('balance_' + userId, balance.toString());
-      localStorage.setItem('refs_' + userId, refs.toString());
-      localStorage.setItem('lastRewards_' + userId, JSON.stringify(lastRewards));
-    }
-
-    document.querySelectorAll('.ad-btn').forEach(btn => {
-      btn.addEventListener('click', (e) => {
-        const id = e.target.getAttribute('data-id');
-        const status = document.getElementById('status');
-        const link = AD_LINKS[parseInt(id)];
-
-        if (activeTimers[id]) return;
-
-        window.open(link, '_blank');
-        e.target.disabled = true;
-        e.target.textContent = '⏳ Ждите 3 сек...';
-        status.textContent = 'Ссылка открыта. Вернитесь через 3 секунды.';
-
-        activeTimers[id] = setTimeout(() => {
-          delete activeTimers[id];
-          e.target.textContent = '✅ Забрать +0.2 ⭐';
-          e.target.disabled = false;
-          
-          e.target.onclick = (ev) => {
-            ev.preventDefault();
-            const now = Date.now();
-            if (now - (lastRewards[id] || 0) < COOLDOWN_MS) {
-              tg?.showAlert?.('Подождите, кулдаун еще не прошел!') || alert('Подождите!');
-              return;
+        async function makeRequest(endpoint, data = {}) {
+            try {
+                const response = await fetch(`${BACKEND_URL}${endpoint}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ initData, ...data })
+                });
+                return await response.json();
+            } catch (error) {
+                console.error(error);
+                alert("Server connection error");
             }
+        }
+
+        function selectPercent(val, element) {
+            selectedPercent = val;
+            const buttons = document.querySelectorAll('.percent-btn');
+            buttons.forEach(b => b.classList.remove('active'));
+            element.classList.add('active');
+        }
+
+        function updateUI(data) {
+            if (data.error) {
+                alert(data.error);
+                return;
+            }
+            document.getElementById('balance').innerText = data.balance.toFixed(4);
+            if (data.wallet) {
+                document.getElementById('walletInput').value = data.wallet;
+            }
+            document.getElementById('withdrawBtn').disabled = data.balance < 0.01;
             
-            balance += AD_REWARD;
-            lastRewards[id] = now;
-            save();
-            status.textContent = '✅ Награда начислена!';
-            
-            e.target.onclick = null;
-            setTimeout(() => {
-              status.textContent = '';
-              updateUI();
-            }, 1500);
-          };
-        }, WAIT_MS);
-      });
-    });
+            if (data.lastAdWatch) {
+                const passed = Date.now() - data.lastAdWatch;
+                const remaining = Math.ceil((10 * 60 * 1000 - passed) / 1000);
+                if (remaining > 0) {
+                    startTimer(remaining);
+                } else {
+                    resetTimerUI();
+                }
+            }
+        }
 
-    document.getElementById('copy-ref').addEventListener('click', () => {
-      const input = document.getElementById('ref-link');
-      input.select();
-      input.setSelectionRange(0, 99999);
-      document.execCommand('copy');
-      tg?.showAlert?.('Ссылка скопирована!') || alert('Ссылка скопирована!');
-    });
+        function startTimer(seconds) {
+            clearInterval(cooldownTimer);
+            const btn = document.getElementById('adBtn');
+            const timerDiv = document.getElementById('timer');
+            btn.disabled = true;
 
-    document.getElementById('withdraw-btn').addEventListener('click', () => {
-      if (balance < 15) {
-        tg?.showAlert?.('Минимум для вывода: 15 ⭐') || alert('Минимум для вывода: 15 ⭐');
-        return;
-      }
-      
-      const amount = Math.floor(balance);
-      balance -= amount;
-      save();
-      updateUI();
-      
-      const url = `https://t.me/${botUsername}?start=withdraw_${amount}`;
-      tg.openTelegramLink(url);
-    });
+            cooldownTimer = setInterval(() => {
+                seconds--;
+                const mins = Math.floor(seconds / 60);
+                const secs = seconds % 60;
+                timerDiv.innerText = `Next ad available in ${mins}:${secs < 10 ? '0' : ''}${secs}`;
+                if (seconds <= 0) {
+                    clearInterval(cooldownTimer);
+                    resetTimerUI();
+                }
+            }, 1000);
+        }
 
-    setInterval(updateUI, 1000);
-    updateUI();
-  </script>
+        function resetTimerUI() {
+            document.getElementById('adBtn').disabled = false;
+            document.getElementById('timer').innerText = "";
+        }
+
+        async function loadUserData() {
+            const data = await makeRequest('/api/user-data');
+            if (data) updateUI(data);
+        }
+
+        function watchAd() {
+            if (!adController) {
+                alert("AdsGram not loaded");
+                return;
+            }
+            adController.show().then(async (result) => {
+                const data = await makeRequest('/api/claim-reward');
+                if (data) updateUI(data);
+            }).catch((err) => {
+                alert("Ad skipped or failed to load");
+            });
+        }
+
+        async function saveWallet() {
+            const wallet = document.getElementById('walletInput').value;
+            const data = await makeRequest('/api/save-wallet', { wallet });
+            if (data && !data.error) alert("Wallet saved");
+        }
+
+        async function withdraw() {
+            const data = await makeRequest('/api/withdraw', { percent: selectedPercent });
+            if (data && data.success) {
+                alert("Withdrawal successful! Tokens sent.");
+                loadUserData();
+            } else if (data && data.error) {
+                alert(data.error);
+            }
+        }
+
+        loadUserData();
+    </script>
 </body>
 </html>
