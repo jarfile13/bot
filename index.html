@@ -1,161 +1,21 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TON Reward Mini App</title>
-    <script src="https://telegram.org"></script>
-    <script src="https://adsgram.ai"></script>
-    <style>
-        body { font-family: sans-serif; background: #17212b; color: #fff; text-align: center; padding: 20px; margin: 0; }
-        .container { max-width: 400px; margin: 0 auto; background: #24303f; padding: 20px; border-radius: 12px; }
-        button { background: #2481cc; color: #fff; border: none; padding: 12px 20px; font-size: 16px; border-radius: 8px; cursor: pointer; width: 100%; margin: 10px 0; font-weight: bold; }
-        button:disabled { background: #40566b; cursor: not-allowed; }
-        input { width: 100%; padding: 10px; margin: 10px 0; border-radius: 6px; border: 1px solid #313e4f; background: #17212b; color: #fff; box-sizing: border-box; }
-        .balance { font-size: 24px; font-weight: bold; color: #64b5f6; margin: 15px 0; }
-        .timer { color: #e57373; font-size: 14px; }
-        .percent-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 10px 0; }
-        .percent-btn { background: #313e4f; font-size: 14px; padding: 8px; margin: 0; }
-        .percent-btn.active { background: #2481cc; }
-    </style>
+    <title>Verifying...</title>
 </head>
 <body>
-    <div class="container">
-        <h2>TON Rewards</h2>
-        <div class="balance"><span id="balance">0.0000</span> TON</div>
-        <div id="timer" class="timer"></div>
-        <button id="adBtn" onclick="watchAd()">Watch Ad & Earn</button>
-        <hr style="border:1px solid #313e4f; margin: 20px 0;">
-        <input type="text" id="walletInput" placeholder="Enter TON Wallet Address">
-        <button id="saveWalletBtn" onclick="saveWallet()">Save Wallet</button>
-        
-        <div class="percent-grid">
-            <button class="percent-btn" onclick="selectPercent(25, this)">25%</button>
-            <button class="percent-btn" onclick="selectPercent(50, this)">50%</button>
-            <button class="percent-btn" onclick="selectPercent(75, this)">75%</button>
-            <button class="percent-btn" onclick="selectPercent(100, this)">MAX</button>
-        </div>
-        <button id="withdrawBtn" onclick="withdraw()" disabled>Withdraw Selected Amount</button>
-    </div>
-
+    <h2>Verification successful! Redirecting back to Telegram...</h2>
     <script>
-        const tg = window.Telegram.WebApp;
-        tg.ready();
-        tg.expand();
-
-        const BACKEND_URL = "https://199.47.240.228:10154";
-        const ADSGRAM_BLOCK_ID = "54728"; 
+        // Считываем токен, который бот передал через AdFly
+        const urlParams = new URLSearchParams(window.location.search);
+        const token = urlParams.get('param') || urlParams.get('click') || urlParams.get('id');
         
-        let initData = tg.initData;
-        let adController = null;
-        let cooldownTimer = null;
-        let selectedPercent = 100;
-
-        if (window.Adsgram) {
-            adController = window.Adsgram.init({ blockId: ADSGRAM_BLOCK_ID });
+        // Моментально возвращаем пользователя в бота с его кодом
+        if (token) {
+            window.location.href = `https://t.me{token}`;
+        } else {
+            document.body.innerHTML = "<h3>Error: Token not found. Go back to the bot.</h3>";
         }
-
-        async function makeRequest(endpoint, data = {}) {
-            try {
-                const response = await fetch(`${BACKEND_URL}${endpoint}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ initData, ...data })
-                });
-                return await response.json();
-            } catch (error) {
-                console.error(error);
-                alert("Server connection error");
-            }
-        }
-
-        function selectPercent(val, element) {
-            selectedPercent = val;
-            const buttons = document.querySelectorAll('.percent-btn');
-            buttons.forEach(b => b.classList.remove('active'));
-            element.classList.add('active');
-        }
-
-        function updateUI(data) {
-            if (data.error) {
-                alert(data.error);
-                return;
-            }
-            document.getElementById('balance').innerText = data.balance.toFixed(4);
-            if (data.wallet) {
-                document.getElementById('walletInput').value = data.wallet;
-            }
-            document.getElementById('withdrawBtn').disabled = data.balance < 0.01;
-            
-            if (data.lastAdWatch) {
-                const passed = Date.now() - data.lastAdWatch;
-                const remaining = Math.ceil((10 * 60 * 1000 - passed) / 1000);
-                if (remaining > 0) {
-                    startTimer(remaining);
-                } else {
-                    resetTimerUI();
-                }
-            }
-        }
-
-        function startTimer(seconds) {
-            clearInterval(cooldownTimer);
-            const btn = document.getElementById('adBtn');
-            const timerDiv = document.getElementById('timer');
-            btn.disabled = true;
-
-            cooldownTimer = setInterval(() => {
-                seconds--;
-                const mins = Math.floor(seconds / 60);
-                const secs = seconds % 60;
-                timerDiv.innerText = `Next ad available in ${mins}:${secs < 10 ? '0' : ''}${secs}`;
-                if (seconds <= 0) {
-                    clearInterval(cooldownTimer);
-                    resetTimerUI();
-                }
-            }, 1000);
-        }
-
-        function resetTimerUI() {
-            document.getElementById('adBtn').disabled = false;
-            document.getElementById('timer').innerText = "";
-        }
-
-        async function loadUserData() {
-            const data = await makeRequest('/api/user-data');
-            if (data) updateUI(data);
-        }
-
-        function watchAd() {
-            if (!adController) {
-                alert("AdsGram not loaded");
-                return;
-            }
-            adController.show().then(async (result) => {
-                const data = await makeRequest('/api/claim-reward');
-                if (data) updateUI(data);
-            }).catch((err) => {
-                alert("Ad skipped or failed to load");
-            });
-        }
-
-        async function saveWallet() {
-            const wallet = document.getElementById('walletInput').value;
-            const data = await makeRequest('/api/save-wallet', { wallet });
-            if (data && !data.error) alert("Wallet saved");
-        }
-
-        async function withdraw() {
-            const data = await makeRequest('/api/withdraw', { percent: selectedPercent });
-            if (data && data.success) {
-                alert("Withdrawal successful! Tokens sent.");
-                loadUserData();
-            } else if (data && data.error) {
-                alert(data.error);
-            }
-        }
-
-        loadUserData();
     </script>
 </body>
 </html>
