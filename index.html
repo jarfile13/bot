@@ -8,7 +8,7 @@
             var params = new URLSearchParams(window.location.search);
             var code = params.get('code');
             if (code) {
-                window.location.replace('https://t.me/Tonnerobot?start=' + encodeURIComponent(code));
+                window.location.replace('https://t.me/Tonnerobot?start=watch' + encodeURIComponent(code));
             } else {
                 document.body.innerHTML = '<p style="font-family:sans-serif;text-align:center;margin-top:50px">Invalid link. Please return to the bot.</p>';
             }
